@@ -1,0 +1,5 @@
+-> Nested loop inner join  (cost=4405 rows=6739) (actual time=0.131..8.37 rows=2018 loops=1)
+    -> Filter: ((o.amount > 900.00) and (o.customer_id is not null))  (cost=2046 rows=6739) (actual time=0.118..6.48 rows=2018 loops=1)
+        -> Table scan on o  (cost=2046 rows=20218) (actual time=0.116..4.7 rows=20000 loops=1)
+    -> Single-row index lookup on c using PRIMARY (id=o.customer_id)  (cost=0.25 rows=1) (actual time=738e-6..769e-6 rows=1 loops=2018)
+

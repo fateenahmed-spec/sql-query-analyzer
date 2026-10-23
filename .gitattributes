@@ -1,0 +1,2 @@
+* text=auto eol=lf
+demo/**/*.txt text eol=lf

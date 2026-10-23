@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+pytest
+httpx
+mysql-connector-python
+python-dotenv
+sqlparse
+google-genai

@@ -1,0 +1,8 @@
+-> Nested loop inner join  (cost=337034 rows=3.37e+6) (actual time=4.43..4.92 rows=165 loops=1)
+    -> Table scan on customers  (cost=50.8 rows=500) (actual time=0.0256..0.208 rows=500 loops=1)
+    -> Single-row index lookup on <subquery2> using <auto_distinct_key> (customer_id=customers.id)  (cost=2720..2720 rows=1) (actual time=0.00923..0.00928 rows=0.33 loops=500)
+        -> Materialize with deduplication  (cost=2720..2720 rows=6739) (actual time=4.4..4.4 rows=165 loops=1)
+            -> Filter: (orders.customer_id is not null)  (cost=2046 rows=6739) (actual time=0.114..4.36 rows=199 loops=1)
+                -> Filter: (orders.amount > 990.00)  (cost=2046 rows=6739) (actual time=0.114..4.34 rows=199 loops=1)
+                    -> Table scan on orders  (cost=2046 rows=20218) (actual time=0.0969..2.93 rows=20000 loops=1)
+

@@ -1,0 +1,11 @@
+[
+  {"id":"01_full_scan","title":"Full table scan","sql":"SELECT * FROM orders WHERE amount > 500;"},
+  {"id":"02_index_lookup","title":"Index lookup","sql":"SELECT * FROM orders WHERE customer_id = 7;"},
+  {"id":"03_join_no_index","title":"Join without a usable index","sql":"SELECT c.city, o.status FROM customers c JOIN orders o ON c.city = o.status LIMIT 100;"},
+  {"id":"04_group_by","title":"Group by","sql":"SELECT customer_id, SUM(amount) AS total FROM orders GROUP BY customer_id;"},
+  {"id":"05_sort_limit","title":"Sort and limit","sql":"SELECT * FROM orders ORDER BY amount DESC LIMIT 10;"},
+  {"id":"06_subquery","title":"Subquery","sql":"SELECT * FROM customers WHERE id IN (SELECT customer_id FROM orders WHERE amount > 990);"},
+  {"id":"07_zero_rows","title":"Zero rows","sql":"SELECT o.id, c.name FROM orders o JOIN customers c ON c.id = o.customer_id WHERE o.amount > 5000;"},
+  {"id":"08_full_pipeline","title":"Full pipeline","sql":"SELECT c.city, SUM(o.amount) AS total FROM orders o JOIN customers c ON c.id = o.customer_id WHERE o.amount > 100 GROUP BY c.city ORDER BY total DESC;"},
+  {"id":"09_slow_showcase","title":"Slow showcase","sql":"SELECT * FROM orders WHERE status LIKE '%deliv%' ORDER BY created_at DESC;"}
+]

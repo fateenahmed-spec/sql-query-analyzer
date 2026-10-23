@@ -1,0 +1,5 @@
+-> Limit: 100 row(s)  (cost=22480 rows=100) (actual time=8.100..8.100 rows=0 loops=1)
+    -> Inner hash join (c.city = o.status)  (cost=22480 rows=2500000) (actual time=8.090..8.090 rows=0 loops=1)
+        -> Table scan on c  (cost=51 rows=500) (actual time=0.025..0.160 rows=500 loops=1)
+        -> Hash
+            -> Table scan on o  (cost=2021 rows=20000) (actual time=0.020..4.000 rows=20000 loops=1)

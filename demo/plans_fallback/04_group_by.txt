@@ -1,0 +1,2 @@
+-> Group aggregate: sum(orders.amount)  (cost=4200 rows=500) (actual time=0.190..8.600 rows=500 loops=1)
+    -> Index scan on orders using idx_customer  (cost=4200 rows=20000) (actual time=0.100..5.700 rows=20000 loops=1)

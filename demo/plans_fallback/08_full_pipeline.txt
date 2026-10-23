@@ -1,0 +1,7 @@
+-> Sort: total DESC  (cost=4600 rows=5) (actual time=14.300..14.310 rows=5 loops=1)
+    -> Table scan on <temporary>  (actual time=14.250..14.260 rows=5 loops=1)
+        -> Aggregate using temporary table  (actual time=14.200..14.230 rows=5 loops=1)
+            -> Nested loop inner join  (cost=4200 rows=18000) (actual time=0.180..13.200 rows=17990 loops=1)
+                -> Filter: (o.amount > 100.00)  (cost=2021 rows=18000) (actual time=0.100..5.800 rows=17990 loops=1)
+                    -> Table scan on o  (cost=2021 rows=20000) (actual time=0.080..4.100 rows=20000 loops=1)
+                -> Single-row index lookup on c using PRIMARY (id=o.customer_id)  (cost=0.25 rows=1) (actual time=0.0003..0.0004 rows=1 loops=17990)

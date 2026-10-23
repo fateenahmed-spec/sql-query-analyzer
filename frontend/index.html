@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AI-Assisted SQL Query Analyzer</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main class="shell">
+    <header><p class="eyebrow">QUERY WORKBENCH</p><h1>SQL Query Analyzer</h1><p>Explore how MySQL executes a query.</p></header>
+    <section class="panel"><label for="query">SQL query</label><textarea id="query" spellcheck="false" placeholder="SELECT * FROM orders WHERE amount > 500;"></textarea><button id="analyze">Analyze query</button></section>
+    <section id="result" class="panel" aria-live="polite"><h2>Execution plan</h2><p>Choose a query to inspect its execution plan.</p></section>
+  </main>
+  <script src="app.js" defer></script>
+</body>
+</html>

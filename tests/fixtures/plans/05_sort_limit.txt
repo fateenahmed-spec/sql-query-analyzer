@@ -1,0 +1,4 @@
+-> Limit: 10 row(s)  (cost=2046 rows=10) (actual time=9.76..9.76 rows=10 loops=1)
+    -> Sort: orders.amount DESC, limit input to 10 row(s) per chunk  (cost=2046 rows=20218) (actual time=9.76..9.76 rows=10 loops=1)
+        -> Table scan on orders  (cost=2046 rows=20218) (actual time=0.213..5.92 rows=20000 loops=1)
+

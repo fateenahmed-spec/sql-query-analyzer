@@ -1,0 +1,6 @@
+-> Nested loop inner join  (cost=1050 rows=20) (actual time=4.500..5.200 rows=19 loops=1)
+    -> Table scan on <subquery2>  (cost=1030 rows=20) (actual time=4.480..4.510 rows=19 loops=1)
+        -> Materialize with deduplication  (actual time=4.470..4.480 rows=19 loops=1)
+            -> Filter: (orders.amount > 990.00)  (cost=2021 rows=200) (actual time=0.100..4.300 rows=201 loops=1)
+                -> Table scan on orders  (cost=2021 rows=20000) (actual time=0.080..3.900 rows=20000 loops=1)
+    -> Single-row index lookup on customers using PRIMARY (id=`<subquery2>`.customer_id)  (cost=0.25 rows=1) (actual time=0.020..0.025 rows=1 loops=19)

@@ -1,0 +1,4 @@
+-> Nested loop inner join  (cost=2030 rows=1) (actual time=4.250..4.250 rows=0 loops=1)
+    -> Filter: (o.amount > 5000.00)  (cost=2021 rows=1) (actual time=4.240..4.240 rows=0 loops=1)
+        -> Table scan on o  (cost=2021 rows=20000) (actual time=0.020..4.000 rows=20000 loops=1)
+    -> Single-row index lookup on c using PRIMARY (id=o.customer_id)  (cost=0.25 rows=1) (never executed)

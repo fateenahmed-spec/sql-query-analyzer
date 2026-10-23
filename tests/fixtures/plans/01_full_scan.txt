@@ -1,0 +1,3 @@
+-> Filter: (orders.amount > 500.00)  (cost=2046 rows=6739) (actual time=0.146..7.99 rows=10220 loops=1)
+    -> Table scan on orders  (cost=2046 rows=20218) (actual time=0.14..5.83 rows=20000 loops=1)
+

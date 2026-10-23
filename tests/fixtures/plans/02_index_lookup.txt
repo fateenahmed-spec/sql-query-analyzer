@@ -1,0 +1,2 @@
+-> Index lookup on orders using idx_customer (customer_id=7)  (cost=10.8 rows=31) (actual time=0.0746..0.0785 rows=31 loops=1)
+

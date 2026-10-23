@@ -1,0 +1,11 @@
+{
+  "01_full_scan": "SELECT * FROM orders WHERE amount > 500",
+  "02_index_lookup": "SELECT * FROM orders WHERE customer_id = 7",
+  "03_join_indexed": "SELECT o.id, c.name FROM orders o JOIN customers c ON c.id = o.customer_id WHERE o.amount > 900",
+  "04_group_by": "SELECT customer_id, SUM(amount) AS total FROM orders GROUP BY customer_id",
+  "05_sort_limit": "SELECT * FROM orders ORDER BY amount DESC LIMIT 10",
+  "06_subquery": "SELECT * FROM customers WHERE id IN (SELECT customer_id FROM orders WHERE amount > 990)",
+  "07_dead_end": "SELECT o.id, c.name FROM orders o JOIN customers c ON c.id = o.customer_id WHERE o.amount > 5000",
+  "08_hash_join": "SELECT o.id, c.name FROM orders o JOIN customers c ON c.city = o.status",
+  "09_full_pipeline": "SELECT c.city, SUM(o.amount) AS total FROM orders o JOIN customers c ON c.id = o.customer_id WHERE o.amount > 100 GROUP BY c.city ORDER BY total DESC"
+}

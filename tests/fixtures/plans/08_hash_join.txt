@@ -1,0 +1,5 @@
+-> Inner hash join (c.city = o.`status`)  (cost=1.01e+6 rows=1.01e+6) (actual time=5.55..5.55 rows=0 loops=1)
+    -> Table scan on o  (cost=0.509 rows=20218) (actual time=0.107..3.32 rows=20000 loops=1)
+    -> Hash
+        -> Table scan on c  (cost=50.8 rows=500) (actual time=0.0299..0.175 rows=500 loops=1)
+

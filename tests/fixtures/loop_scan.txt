@@ -1,0 +1,4 @@
+-> Nested loop inner join  (cost=100 rows=6) (actual time=0.100..2.400 rows=6 loops=1)
+    -> Table scan on customers  (cost=51 rows=3) (actual time=0.020..0.030 rows=3 loops=1)
+    -> Filter: (orders.amount > 900.00)  (cost=16 rows=2) (actual time=0.050..0.700 rows=2 loops=3)
+        -> Table scan on orders  (cost=16 rows=20) (actual time=0.040..0.650 rows=20 loops=3)
