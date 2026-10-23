@@ -31,7 +31,7 @@ $env:MYSQL_ROOT_PASSWORD = "your_mysql_root_password"
 python setup_db.py
 ```
 
-Set `GEMINI_API_KEY` in `.env` to enable Gemini insights. The default model is `gemini-2.5-flash-lite`. AI responses are cached by query, warnings, and error; the service permits at most one uncached Gemini request every six seconds. If Gemini is unavailable or rate-limited, the app returns rule-based insights. Demo-plan insights use the offline rule-based path.
+Set `GEMINI_API_KEY` in `.env` to enable Gemini insights. The default model is `gemini-3.5-flash-lite`. AI responses are cached by query, warnings, and error; the service permits at most one uncached Gemini request every six seconds. If Gemini is unavailable or rate-limited, the app returns rule-based insights. Demo-plan insights use the offline rule-based path.
 
 Start the server from the repository root:
 

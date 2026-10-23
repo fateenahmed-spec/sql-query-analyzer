@@ -32,6 +32,20 @@ class AIUnavailableError(RuntimeError):
         self.note = note
 
 
+def _safe_exception_message(error: Exception, api_key: str) -> str:
+    message = str(error)
+    if api_key:
+        message = message.replace(api_key, "[REDACTED]")
+    return re.sub(r"AIza[0-9A-Za-z_-]{20,}", "[REDACTED]", message)
+
+
+def _configured_model() -> str:
+    model = os.getenv("GEMINI_MODEL", "").strip()
+    if not model or model.casefold() in {"gemini-1.5-flash", "gemini-2.5-flash-lite"}:
+        return "gemini-3.5-flash-lite"
+    return model
+
+
 def _cache_key(query: str, warnings: list[dict], error: dict | None) -> str:
     encoded = json.dumps(
         {"query": query, "warnings": warnings, "error": error},
@@ -193,16 +207,17 @@ def get_ai_explanation(
         + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     )
 
-    from google import genai
-    from google.genai import types
-
-    client = genai.Client(
-        api_key=api_key,
-        http_options=types.HttpOptions(timeout=20_000),
-    )
+    client = None
     try:
+        from google import genai
+        from google.genai import types
+
+        client = genai.Client(
+            api_key=api_key,
+            http_options=types.HttpOptions(timeout=20_000),
+        )
         response = client.models.generate_content(
-            model=os.getenv("GEMINI_MODEL") or "gemini-2.5-flash-lite",
+            model=_configured_model(),
             contents=prompt,
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
@@ -212,21 +227,30 @@ def get_ai_explanation(
         result = _response_json(response.text or "")
         _store_cached(key, result)
         return result
-    except ValueError as exc:
+    except ValueError as e:
+        safe_error = _safe_exception_message(e, api_key)
+        print(f"DEBUG GEMINI ERROR: {safe_error}")
         raise AIUnavailableError(
-            str(exc),
+            safe_error,
             "Gemini returned an invalid response; showing rule-based insights.",
-        ) from exc
-    except Exception as exc:
-        error_code = getattr(exc, "status_code", None) or getattr(exc, "code", None)
-        message = f"{type(exc).__name__} {error_code or ''} {exc}".casefold()
+        ) from e
+    except Exception as e:
+        safe_error = _safe_exception_message(e, api_key)
+        print(f"DEBUG GEMINI ERROR: {safe_error}")
+        error_code = getattr(e, "status_code", None) or getattr(e, "code", None)
+        message = f"{type(e).__name__} {error_code or ''} {safe_error}".casefold()
         if "429" in message or "quota" in message or "resource_exhausted" in message:
             note = "Gemini rate-limited or quota exhausted; wait 60s and rerun."
         else:
             note = "Gemini request failed; showing rule-based insights."
-        raise AIUnavailableError("Gemini request failed", note) from None
+        raise AIUnavailableError(safe_error, note) from None
     finally:
-        client.close()
+        if client is not None:
+            try:
+                client.close()
+            except Exception as e:
+                safe_error = _safe_exception_message(e, api_key)
+                print(f"DEBUG GEMINI ERROR: {safe_error}")
 
 
 def _diagnostic_fix(query: str) -> str:

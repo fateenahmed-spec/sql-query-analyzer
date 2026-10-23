@@ -99,6 +99,8 @@ def main() -> int:
             timeout=25,
         )
         ai_first = ai_response.json()
+        if ai_first.get("source") == "fallback":
+            print(f"Gemini error: {ai_first.get('error', 'No error details returned.')}")
         if ai_first.get("source") == "fallback" and any(
             word in str(ai_first.get("note", "")).casefold() for word in ("429", "quota", "rate-limit", "rate limit")
         ):

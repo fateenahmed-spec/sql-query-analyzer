@@ -676,6 +676,9 @@ function renderAiExplanation(explanation) {
   const note = document.querySelector("#ai-note");
   note.textContent = explanation.note || "";
   note.hidden = !explanation.note;
+  const error = document.querySelector("#ai-error");
+  error.textContent = explanation.error || "";
+  error.hidden = !explanation.error;
 }
 
 async function loadAiInsights() {
