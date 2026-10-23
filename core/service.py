@@ -27,3 +27,21 @@ def load_plan_text(plan_id: str) -> tuple[str, str]:
         return fallback.read_text(encoding="utf-8"), "fallback"
 
     raise KeyError(f"No captured or fallback plan exists for valid plan id {plan_id!r}")
+
+
+def calculate_stats(tree: dict) -> dict:
+    nodes = []
+    def _collect(node):
+        nodes.append(node)
+        for child in node.get("children", []):
+            _collect(child)
+
+    _collect(tree)
+    hotspot_node = max(nodes, key=lambda x: x.get("self_time_pct", 0.0)) if nodes else None
+
+    return {
+        "total_time_ms": float(tree.get("time_total_ms") or 0.0),
+        "node_count": len(nodes),
+        "hotspot_node_id": str(hotspot_node["id"]) if hotspot_node else "",
+        "hotspot_pct": float(hotspot_node.get("self_time_pct") or 0.0) if hotspot_node else 0.0
+    }
