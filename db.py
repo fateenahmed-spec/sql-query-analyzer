@@ -25,11 +25,47 @@ class DatabaseUploadConfigurationError(RuntimeError):
 def get_connection():
     return mysql.connector.connect(host=os.getenv("DB_HOST", "127.0.0.1"), user=os.getenv("DB_USER", "analyzer_ro"), password=os.getenv("DB_PASS", ""), database=os.getenv("DB_NAME", "sql_analyzer_test"))
 
+
+_UPLOAD_BLOCKED_PATTERNS = (
+    re.compile(r"\bDROP\s+DATABASE\b", re.IGNORECASE),
+    re.compile(r"\bGRANT\b", re.IGNORECASE),
+    re.compile(r"\bCREATE\s+USER\b", re.IGNORECASE),
+    re.compile(r"\bLOAD\s+DATA\b", re.IGNORECASE),
+    re.compile(r"\bINTO\s+OUTFILE\b", re.IGNORECASE),
+)
+
+
+def _validate_upload_statement(statement: str) -> None:
+    upper_statement = statement.strip().upper()
+    # Check both raw SQL and comment-stripped SQL. The raw check catches
+    # executable MySQL comments; the normalized check catches comments used
+    # to split otherwise contiguous blocked keywords.
+    normalized_statement = sqlparse.format(
+        upper_statement,
+        strip_comments=True,
+        reindent=False,
+    )
+    candidates = (upper_statement, " ".join(normalized_statement.split()))
+    for pattern in _UPLOAD_BLOCKED_PATTERNS:
+        if any(pattern.search(candidate) for candidate in candidates):
+            raise ValueError(f"Disallowed SQL command: {pattern.pattern}")
+
+
 def execute_sql_file(sql_text: str) -> str:
     """Execute statements from an uploaded SQL script using the configured admin account."""
-    statements = [statement.strip() for statement in sqlparse.split(sql_text.lstrip("\ufeff")) if statement.strip()]
-    if not statements:
+    statements = sqlparse.split(sql_text.lstrip("\ufeff"))
+    if not any(statement.strip() for statement in statements):
         raise ValueError("The SQL file contains no statements.")
+    for i, statement in enumerate(statements):
+        statement = statement.strip()
+        if not statement:
+            continue
+        try:
+            _validate_upload_statement(statement)
+        except Exception as exc:
+            raise ValueError(
+                f"Failed at statement {i + 1}: {statement[:80]}... Error: {exc}"
+            ) from exc
 
     root_password = os.getenv("MYSQL_ROOT_PASSWORD", "")
     if not root_password:
@@ -44,13 +80,22 @@ def execute_sql_file(sql_text: str) -> str:
         database=os.getenv("DB_NAME") or "sql_analyzer_test",
     )
     try:
-        with closing(conn.cursor()) as cursor:
-            for statement in statements:
-                cursor.execute(statement)
+        with closing(conn.cursor(buffered=True)) as cursor:
+            for i, statement in enumerate(statements):
+                statement = statement.strip()
+                if not statement:
+                    continue
+                try:
+                    cursor.execute(statement)
+                    # Drain result rows before issuing the next statement.
+                    if cursor.with_rows:
+                        cursor.fetchall()
+                except Exception as exc:
+                    conn.rollback()
+                    raise Exception(
+                        f"Failed at statement {i + 1}: {statement[:80]}... Error: {exc}"
+                    ) from exc
         conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
     finally:
         conn.close()
 
