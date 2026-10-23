@@ -8,6 +8,7 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, constr
 
+from core.ai import get_ai_explanation
 from core.parser import parse_explain_analyze
 from core.rules import analyze_rules, annotate_tree
 from core.service import calculate_stats, load_plan_text
@@ -57,6 +58,19 @@ def get_plan(id: str):
         "stats": stats,
         "source": source,
     }
+
+
+@app.post("/api/ai/{id}")
+def get_ai_insights(id: str):
+    queries = _read_queries()
+    query = next((item for item in queries if item.get("id") == id), None)
+    if query is None:
+        raise HTTPException(status_code=404, detail="Query not found")
+
+    text, _source = load_plan_text(id)
+    tree = parse_explain_analyze(text)
+    warnings = analyze_rules(tree)
+    return get_ai_explanation(query["sql"], warnings)
 
 class AnalyzeRequest(BaseModel):
     query: constr(max_length=5000)

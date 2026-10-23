@@ -11,6 +11,7 @@
   <script src="https://cdn.jsdelivr.net/npm/cytoscape-dagre@2.5.0/cytoscape-dagre.min.js"></script>
 </head>
 <body>
+  <div class="app-frame">
   <main class="app-shell">
     <aside class="sidebar query-sidebar" aria-label="Saved queries">
       <div class="brand-lockup">
@@ -70,6 +71,18 @@
         </div>
       </section>
 
+      <section id="ai-panel" class="insight-section ai-panel">
+        <div class="section-heading compact-heading">
+          <div>
+            <p class="eyebrow">ASSISTED REVIEW</p>
+            <h2>AI Insights</h2>
+          </div>
+        </div>
+        <div id="ai-content" class="ai-content">
+          <p class="muted">Insights will appear when a query is selected.</p>
+        </div>
+      </section>
+
       <section id="node-detail-drawer" class="detail-drawer" aria-labelledby="drawer-title" hidden>
         <div class="drawer-heading">
           <div>
@@ -96,6 +109,21 @@
       </section>
     </aside>
   </main>
+  <footer id="animation-controls" aria-label="Animation controls">
+    <div class="playback-buttons">
+      <button id="btn-play" type="button">Play</button>
+      <button id="btn-pause" type="button">Pause</button>
+      <button id="btn-step-back" type="button">Step Back</button>
+      <button id="btn-step-forward" type="button">Step Forward</button>
+      <button id="btn-reset" type="button">Reset</button>
+    </div>
+    <label class="speed-control" for="speed-slider">
+      <span>Speed</span>
+      <input type="range" id="speed-slider" min="300" max="2000" value="1000" step="100">
+    </label>
+    <span id="step-status" aria-live="polite">Ready</span>
+  </footer>
+  </div>
   <script src="app.js" defer></script>
 </body>
 </html>

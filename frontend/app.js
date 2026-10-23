@@ -6,6 +6,7 @@ const queryList = document.querySelector("#query-list");
 const queryCount = document.querySelector("#query-count");
 const warningCount = document.querySelector("#warning-count");
 const warningsList = document.querySelector("#warnings-list");
+const aiContent = document.querySelector("#ai-content");
 const graphMessage = document.querySelector("#graph-message");
 const sourceBadge = document.querySelector("#source-badge");
 const detailDrawer = document.querySelector("#node-detail-drawer");
@@ -13,10 +14,15 @@ const drawerWarnings = document.querySelector("#detail-warnings");
 const planTitle = document.querySelector("#plan-title");
 const planSummary = document.querySelector("#plan-summary");
 const cyContainer = document.querySelector("#cy");
+const stepStatus = document.querySelector("#step-status");
+const speedSlider = document.querySelector("#speed-slider");
 
 let cy = null;
 let currentPlan = null;
 let loadSequence = 0;
+let animSteps = [];
+let currentIndex = -1;
+let animTimer = null;
 
 function setText(selector, value) {
   const element = document.querySelector(selector);
@@ -33,8 +39,8 @@ function hideGraphMessage() {
   graphMessage.textContent = "";
 }
 
-async function getJson(url) {
-  const response = await fetch(url);
+async function getJson(url, options = {}) {
+  const response = await fetch(url, options);
   if (!response.ok) {
     let message = `Request failed (${response.status})`;
     try {
@@ -149,6 +155,43 @@ function renderWarnings(warnings) {
   for (const warning of warnings) warningsList.append(warningCard(warning));
 }
 
+function renderAiExplanation(explanation) {
+  aiContent.replaceChildren();
+  const summary = document.createElement("p");
+  summary.textContent = explanation.summary;
+  aiContent.append(summary);
+
+  if (explanation.suggestions.length > 0) {
+    const suggestions = document.createElement("ol");
+    for (const suggestion of explanation.suggestions) {
+      const item = document.createElement("li");
+      item.textContent = suggestion;
+      suggestions.append(item);
+    }
+    aiContent.append(suggestions);
+  }
+}
+
+async function loadAiExplanation(id, requestNumber) {
+  aiContent.replaceChildren();
+  const loading = document.createElement("p");
+  loading.className = "muted";
+  loading.textContent = "Preparing insights…";
+  aiContent.append(loading);
+
+  try {
+    const explanation = await getJson(`/api/ai/${encodeURIComponent(id)}`, { method: "POST" });
+    if (requestNumber !== loadSequence) return;
+    renderAiExplanation(explanation);
+  } catch (error) {
+    if (requestNumber !== loadSequence) return;
+    const message = document.createElement("p");
+    message.className = "muted";
+    message.textContent = `AI insights unavailable: ${error.message}`;
+    aiContent.replaceChildren(message);
+  }
+}
+
 function graphStyle() {
   return [
     {
@@ -186,6 +229,10 @@ function graphStyle() {
     {
       selector: "node[never_executed = true]",
       style: { opacity: 0.5, "border-style": "dashed" },
+    },
+    {
+      selector: "node.current-node",
+      style: { "border-color": "#ffd166", "border-width": "5px" },
     },
     {
       selector: "node:selected",
@@ -238,6 +285,65 @@ function buildGraph(plan) {
   cy.ready(() => cy.fit(undefined, 44));
 }
 
+function updateGraphVisuals() {
+  if (cy) cy.nodes().removeClass("current-node");
+
+  if (currentIndex >= 0 && currentIndex < animSteps.length) {
+    const step = animSteps[currentIndex];
+    if (cy) cy.$("#" + step.node_id).addClass("current-node");
+    stepStatus.textContent = `Step ${currentIndex + 1} of ${animSteps.length}: ${step.action.toUpperCase()} (${step.rows_out} rows)`;
+  } else if (currentIndex === -1) {
+    stepStatus.textContent = `Ready (0 / ${animSteps.length})`;
+  }
+}
+
+function pauseAnimation() {
+  if (animTimer !== null) {
+    clearInterval(animTimer);
+    animTimer = null;
+  }
+}
+
+function advanceAnimation() {
+  if (currentIndex < animSteps.length - 1) {
+    currentIndex += 1;
+    updateGraphVisuals();
+  }
+  if (currentIndex >= animSteps.length - 1) pauseAnimation();
+}
+
+function startAnimationTimer() {
+  pauseAnimation();
+  animTimer = setInterval(advanceAnimation, Number(speedSlider.value));
+}
+
+function playAnimation() {
+  if (currentIndex >= animSteps.length - 1) {
+    currentIndex = -1;
+    updateGraphVisuals();
+  }
+  pauseAnimation();
+  startAnimationTimer();
+}
+
+function stepForward() {
+  pauseAnimation();
+  currentIndex = Math.min(animSteps.length - 1, currentIndex + 1);
+  updateGraphVisuals();
+}
+
+function stepBack() {
+  pauseAnimation();
+  currentIndex = Math.max(-1, currentIndex - 1);
+  updateGraphVisuals();
+}
+
+function resetAnimation() {
+  pauseAnimation();
+  currentIndex = -1;
+  updateGraphVisuals();
+}
+
 function findPlanNode(node, id) {
   if (node.id === id) return node;
   for (const child of node.children || []) {
@@ -278,17 +384,22 @@ function selectQuery(id) {
 
 async function loadPlan(id) {
   const requestNumber = ++loadSequence;
+  pauseAnimation();
   if (cy) {
     cy.destroy();
     cy = null;
   }
   currentPlan = null;
+  animSteps = [];
+  currentIndex = -1;
+  updateGraphVisuals();
   closeDrawer();
   selectQuery(id);
   sourceBadge.textContent = "";
   planTitle.textContent = "Loading plan…";
   planSummary.textContent = "Fetching the selected execution plan.";
   renderWarnings([]);
+  void loadAiExplanation(id, requestNumber);
   showGraphMessage("Loading execution plan…");
 
   try {
@@ -298,7 +409,10 @@ async function loadPlan(id) {
     planSummary.textContent = `${plan.stats.node_count} operators · ${Number(plan.stats.total_time_ms).toFixed(2)} ms total`;
     sourceBadge.textContent = plan.source === "captured" ? "Captured plan" : "Fallback plan";
     renderWarnings(plan.warnings || []);
+    animSteps = plan.animation_steps || [];
+    currentIndex = -1;
     buildGraph(plan);
+    updateGraphVisuals();
   } catch (error) {
     if (requestNumber !== loadSequence) return;
     planTitle.textContent = "Could not load plan";
@@ -326,6 +440,15 @@ async function initialize() {
     showGraphMessage(error.message);
   }
 }
+
+document.querySelector("#btn-play").addEventListener("click", playAnimation);
+document.querySelector("#btn-pause").addEventListener("click", pauseAnimation);
+document.querySelector("#btn-step-back").addEventListener("click", stepBack);
+document.querySelector("#btn-step-forward").addEventListener("click", stepForward);
+document.querySelector("#btn-reset").addEventListener("click", resetAnimation);
+speedSlider.addEventListener("input", () => {
+  if (animTimer !== null) startAnimationTimer();
+});
 
 document.querySelector("#drawer-close").addEventListener("click", closeDrawer);
 initialize();
