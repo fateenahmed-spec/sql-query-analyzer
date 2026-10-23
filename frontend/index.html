@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#101318">
-  <title>SQL Plan Explorer</title>
+  <title>SQL Query Analyzer</title>
   <link rel="stylesheet" href="style.css">
   <script src="https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.28.1/cytoscape.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/dagre/0.8.5/dagre.min.js"></script>
@@ -12,117 +12,125 @@
 </head>
 <body>
   <div class="app-frame">
-  <main class="app-shell">
-    <aside class="sidebar query-sidebar" aria-label="Saved queries">
-      <div class="brand-lockup">
-        <div class="brand-mark" aria-hidden="true">Σ</div>
-        <div>
-          <p class="eyebrow">QUERY WORKBENCH</p>
-          <h1>Plan Explorer</h1>
-        </div>
-      </div>
-      <div class="section-heading">
-        <div>
-          <p class="eyebrow">LIBRARY</p>
-          <h2>Example queries</h2>
-        </div>
-        <span id="query-count" class="count-pill">0</span>
-      </div>
-      <nav id="query-list" class="query-list" aria-label="Example query plans">
-        <p class="muted loading-message">Loading queries…</p>
+    <header class="app-header">
+      <a class="brand" href="#step-1" aria-label="SQL Query Analyzer home">
+        <span class="brand-mark" aria-hidden="true">Σ</span>
+        <span><strong>Query Lens</strong><small>AI-assisted SQL analyzer</small></span>
+      </a>
+      <nav class="stepper" aria-label="Analysis steps">
+        <button class="stepper-item active" type="button" data-step="1"><span>1</span><b>Query</b></button>
+        <i aria-hidden="true"></i>
+        <button class="stepper-item" type="button" data-step="2" disabled><span>2</span><b>Plan</b></button>
+        <i aria-hidden="true"></i>
+        <button class="stepper-item" type="button" data-step="3" disabled><span>3</span><b>Data Flow</b></button>
+        <i aria-hidden="true"></i>
+        <button class="stepper-item" type="button" data-step="4" disabled><span>4</span><b>AI Insights</b></button>
       </nav>
-      <div class="sidebar-footnote">
-        <span class="status-dot" aria-hidden="true"></span>
-        <span>MySQL plan library</span>
-      </div>
-    </aside>
+      <button id="btn-start-over" class="button button-quiet" type="button" hidden>Start Over</button>
+    </header>
 
-    <section class="center-column" aria-label="Execution plan graph">
-      <header class="topbar">
-        <div class="plan-heading">
-          <p class="eyebrow">EXECUTION MAP</p>
-          <h2 id="plan-title">Choose a query</h2>
-          <p id="plan-summary" class="muted">Select an example to explore its execution plan.</p>
+    <main class="main-content">
+      <section id="step-1" class="step-view active" aria-labelledby="query-heading">
+        <div class="intro-block">
+          <p class="eyebrow">START WITH A QUERY</p>
+          <h1 id="query-heading">See what your SQL is really doing.</h1>
+          <p class="muted">Run a read-only query against MySQL to inspect its execution plan and returned data.</p>
         </div>
-        <div class="graph-legend" aria-label="Graph legend">
-          <span><i class="legend-dot heat-low"></i>Lower time</span>
-          <span><i class="legend-dot heat-high"></i>Hotspot</span>
-          <span><i class="legend-ring"></i>Warning</span>
-        </div>
-      </header>
-      <div class="center-container">
-        <div id="cy" role="img" aria-label="Interactive query execution plan"></div>
-        <div id="source-badge" class="source-badge" aria-live="polite"></div>
-        <div id="graph-message" class="graph-message" aria-live="polite">Select a query to load its plan.</div>
-      </div>
-    </section>
-
-    <aside class="sidebar insight-sidebar" aria-label="Plan insights">
-      <section id="warnings-panel" class="insight-section">
-        <div class="section-heading compact-heading">
-          <div>
-            <p class="eyebrow">REVIEW</p>
-            <h2>Warnings</h2>
+        <div class="query-card">
+          <label for="query-input">SQL query</label>
+          <textarea id="query-input" spellcheck="false" maxlength="5000" aria-describedby="query-hint">SELECT id, name FROM customers WHERE city = 'Mumbai' LIMIT 5</textarea>
+          <p id="query-hint" class="field-hint">Only read-only SELECT and WITH queries are accepted. Results are capped at 20 rows.</p>
+          <div id="query-error" class="inline-banner" role="alert" hidden></div>
+          <div class="query-actions">
+            <button id="btn-run-query" class="button button-primary" type="button"><span id="run-spinner" class="spinner" hidden></span><span id="run-label">Run Query</span></button>
+            <button id="btn-load-demo" class="button button-secondary" type="button">Load demo (offline)</button>
           </div>
-          <span id="warning-count" class="count-pill">0</span>
         </div>
-        <div id="warnings-list" class="warnings-list">
-          <p class="muted">Warnings will appear here.</p>
+        <section class="examples-section" aria-labelledby="examples-heading">
+          <div class="section-heading"><div><p class="eyebrow">TRY AN EXAMPLE</p><h2 id="examples-heading">Quick queries</h2></div></div>
+          <div class="example-grid">
+            <button class="example-card" type="button" data-example="normal"><span class="example-icon">01</span><span><strong>Filtered lookup</strong><small>Indexed customer query</small></span><span class="example-arrow">↗</span></button>
+            <button class="example-card" type="button" data-example="scan"><span class="example-icon">02</span><span><strong>Full scan</strong><small>Find a costly table read</small></span><span class="example-arrow">↗</span></button>
+            <button class="example-card" type="button" data-example="empty"><span class="example-icon">03</span><span><strong>Zero rows</strong><small>Inspect an empty result</small></span><span class="example-arrow">↗</span></button>
+          </div>
+        </section>
+        <section class="saved-examples" aria-labelledby="saved-heading">
+          <div class="section-heading"><div><p class="eyebrow">PLAN LIBRARY</p><h2 id="saved-heading">Offline examples</h2></div></div>
+          <nav id="query-list" class="query-list" aria-label="Saved demo plans"><p class="muted">Loading examples…</p></nav>
+        </section>
+      </section>
+
+      <section id="step-2" class="step-view" aria-labelledby="plan-heading" hidden>
+        <div class="step-title-row">
+          <div><p class="eyebrow">STEP 2 · EXECUTION PLAN</p><h1 id="plan-heading">Query plan</h1><p id="plan-summary" class="muted"></p></div>
+          <div class="step-actions"><button class="button button-secondary back-button" type="button" data-back="1">Back</button><button id="btn-to-flow" class="button button-primary" type="button">Explore data flow <span aria-hidden="true">→</span></button></div>
+        </div>
+        <div class="center-container">
+          <div id="cy" role="img" aria-label="Interactive query execution plan"></div>
+          <div id="source-badge" class="source-badge" aria-live="polite"></div>
+          <div id="graph-message" class="graph-message" aria-live="polite" hidden></div>
+        </div>
+        <details id="warnings-panel" class="warnings-panel" open>
+          <summary><span>Plan warnings</span><span id="warning-count" class="count-pill">0</span></summary>
+          <div id="warnings-list" class="warnings-list"><p class="muted">Warnings will appear here.</p></div>
+        </details>
+        <aside id="node-detail-drawer" class="detail-drawer" aria-labelledby="drawer-title" hidden>
+          <div class="drawer-heading"><div><p class="eyebrow">NODE INSPECTOR</p><h2 id="drawer-title">Node details</h2></div><button id="drawer-close" class="icon-button" type="button" aria-label="Close node details">×</button></div>
+          <dl class="detail-list">
+            <div><dt>Operator</dt><dd id="detail-operator">—</dd></div>
+            <div><dt>Details</dt><dd id="detail-details">—</dd></div>
+            <div><dt>Rows out</dt><dd id="detail-rows">—</dd></div>
+            <div><dt>Estimated rows</dt><dd id="detail-estimated">—</dd></div>
+            <div><dt>Loops</dt><dd id="detail-loops">—</dd></div>
+            <div><dt>Self time</dt><dd id="detail-self-time">—</dd></div>
+            <div><dt>Plan share</dt><dd id="detail-self-pct">—</dd></div>
+            <div><dt>Timing</dt><dd id="detail-timing">—</dd></div>
+            <div><dt>Execution</dt><dd id="detail-execution">—</dd></div>
+          </dl>
+          <div class="detail-warning-block"><h3>Node warnings</h3><ul id="detail-warnings"><li class="muted">None</li></ul></div>
+        </aside>
+      </section>
+
+      <section id="step-3" class="step-view" aria-labelledby="flow-heading" hidden>
+        <div class="step-title-row">
+          <div><p class="eyebrow">STEP 3 · ROW LIFECYCLE</p><h1 id="flow-heading">Follow the data</h1><p class="muted">Plan statistics and sample rows come directly from MySQL.</p></div>
+          <div class="step-actions"><button class="button button-secondary back-button" type="button" data-back="2">Back</button><button id="btn-to-ai" class="button button-primary" type="button">Get AI insights <span aria-hidden="true">→</span></button></div>
+        </div>
+        <section id="animation-controls" class="animation-panel" aria-label="Plan animation controls">
+          <div class="playback-buttons">
+            <button id="btn-play" class="button button-secondary" type="button">Play</button>
+            <button id="btn-pause" class="button button-secondary" type="button">Pause</button>
+            <button id="btn-step-back" class="button button-secondary" type="button">Step Back</button>
+            <button id="btn-step-forward" class="button button-secondary" type="button">Step Forward</button>
+            <button id="btn-reset" class="button button-quiet" type="button">Reset</button>
+          </div>
+          <label class="speed-control" for="speed-slider"><span>Speed</span><input type="range" id="speed-slider" min="300" max="2000" value="1000" step="100"></label>
+          <div class="progress-wrap"><progress id="step-progress" max="1" value="0"></progress><span id="step-status" aria-live="polite">Ready</span></div>
+        </section>
+        <div class="flow-grid">
+          <section class="flow-column" aria-labelledby="source-heading"><div class="flow-column-heading"><div><p class="eyebrow">INPUT</p><h2 id="source-heading">Source samples</h2></div><span class="column-mark source-mark">A</span></div><div id="source-tables" class="table-stack"></div></section>
+          <section class="flow-column" aria-labelledby="intermediate-heading"><div class="flow-column-heading"><div><p class="eyebrow">PROCESSING</p><h2 id="intermediate-heading">Intermediate</h2></div><span class="column-mark process-mark">B</span></div><div id="intermediate-table" class="table-stack"></div></section>
+          <section class="flow-column" aria-labelledby="results-heading"><div class="flow-column-heading"><div><p class="eyebrow">OUTPUT</p><h2 id="results-heading">Final results</h2></div><span class="column-mark result-mark">C</span></div><div id="final-results" class="table-stack final-results" aria-live="polite"></div></section>
         </div>
       </section>
 
-      <section id="ai-panel" class="insight-section ai-panel">
-        <div class="section-heading compact-heading">
-          <div>
-            <p class="eyebrow">ASSISTED REVIEW</p>
-            <h2>AI Insights</h2>
+      <section id="step-4" class="step-view" aria-labelledby="ai-heading" hidden>
+        <div class="step-title-row">
+          <div><p class="eyebrow">STEP 4 · ASSISTED REVIEW</p><h1 id="ai-heading">AI insights</h1><p class="muted">A concise review of the query, plan warnings, and execution results.</p></div>
+          <div class="step-actions"><button class="button button-secondary back-button" type="button" data-back="3">Back</button><button id="btn-ai-start-over" class="button button-primary" type="button">Start Over</button></div>
+        </div>
+        <article id="ai-panel" class="ai-card">
+          <div class="ai-card-heading"><div class="ai-icon" aria-hidden="true">✦</div><div><p class="eyebrow">QUERY REVIEW</p><h2>AI Insights</h2></div><span id="ai-source" class="ai-source">Preparing</span></div>
+          <div id="ai-loading" class="ai-loading"><span class="spinner"></span><span>Reviewing the plan and query…</span></div>
+          <div id="ai-content" hidden>
+            <section class="ai-summary-block"><h3>Summary</h3><p id="ai-summary"></p></section>
+            <section class="ai-suggestions-block"><h3>Suggestions</h3><ol id="ai-suggestions"></ol></section>
+            <section id="ai-fix-block" class="ai-fix-block" hidden><h3>Suggested fix</h3><pre id="ai-fix"></pre></section>
+            <p id="ai-note" class="ai-note" hidden></p>
           </div>
-        </div>
-        <div id="ai-content" class="ai-content">
-          <p class="muted">Insights will appear when a query is selected.</p>
-        </div>
+        </article>
       </section>
-
-      <section id="node-detail-drawer" class="detail-drawer" aria-labelledby="drawer-title" hidden>
-        <div class="drawer-heading">
-          <div>
-            <p class="eyebrow">NODE INSPECTOR</p>
-            <h2 id="drawer-title">Node details</h2>
-          </div>
-          <button id="drawer-close" class="icon-button" type="button" aria-label="Close node details">×</button>
-        </div>
-        <dl class="detail-list">
-          <div><dt>Operator</dt><dd id="detail-operator">—</dd></div>
-          <div><dt>Details</dt><dd id="detail-details">—</dd></div>
-          <div><dt>Rows out</dt><dd id="detail-rows">—</dd></div>
-          <div><dt>Estimated rows</dt><dd id="detail-estimated">—</dd></div>
-          <div><dt>Loops</dt><dd id="detail-loops">—</dd></div>
-          <div><dt>Self time</dt><dd id="detail-self-time">—</dd></div>
-          <div><dt>Plan share</dt><dd id="detail-self-pct">—</dd></div>
-          <div><dt>Timing</dt><dd id="detail-timing">—</dd></div>
-          <div><dt>Execution</dt><dd id="detail-execution">—</dd></div>
-        </dl>
-        <div class="detail-warning-block">
-          <h3>Node warnings</h3>
-          <ul id="detail-warnings"><li class="muted">None</li></ul>
-        </div>
-      </section>
-    </aside>
-  </main>
-  <footer id="animation-controls" aria-label="Animation controls">
-    <div class="playback-buttons">
-      <button id="btn-play" type="button">Play</button>
-      <button id="btn-pause" type="button">Pause</button>
-      <button id="btn-step-back" type="button">Step Back</button>
-      <button id="btn-step-forward" type="button">Step Forward</button>
-      <button id="btn-reset" type="button">Reset</button>
-    </div>
-    <label class="speed-control" for="speed-slider">
-      <span>Speed</span>
-      <input type="range" id="speed-slider" min="300" max="2000" value="1000" step="100">
-    </label>
-    <span id="step-status" aria-live="polite">Ready</span>
-  </footer>
+    </main>
   </div>
   <script src="app.js" defer></script>
 </body>

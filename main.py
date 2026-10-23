@@ -6,14 +6,14 @@ import mysql.connector
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, constr
+from pydantic import BaseModel, Field, constr
 
-from core.ai import get_ai_explanation
+from core.ai import get_ai_explanation, get_rule_based_explanation
 from core.parser import parse_explain_analyze
 from core.rules import analyze_rules, annotate_tree
 from core.service import calculate_stats, load_plan_text
 from core.steps import build_animation_steps
-from db import UnsupportedServerError, run_explain_analyze
+from db import UnsupportedServerError, run_explain_analyze, run_query_with_data
 from security import UnsafeQueryError
 
 app = FastAPI()
@@ -70,10 +70,104 @@ def get_ai_insights(id: str):
     text, _source = load_plan_text(id)
     tree = parse_explain_analyze(text)
     warnings = analyze_rules(tree)
-    return get_ai_explanation(query["sql"], warnings)
+    return get_rule_based_explanation(query["sql"], warnings)
 
 class AnalyzeRequest(BaseModel):
     query: constr(max_length=5000)
+
+
+class LiveQueryRequest(BaseModel):
+    query: constr(max_length=5000)
+
+
+class AIRequest(BaseModel):
+    query: constr(max_length=5000)
+    warnings: list[dict] = Field(default_factory=list)
+    error: dict | None = None
+    tree: dict | None = None
+
+
+@app.post("/api/run-live")
+def run_live(request: LiveQueryRequest):
+    try:
+        result = run_query_with_data(request.query)
+    except UnsafeQueryError as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+    except (mysql.connector.InterfaceError, mysql.connector.OperationalError) as exc:
+        if getattr(exc, "errno", None) in (2002, 2003, 2005, 1045, 1049, 2006, 2013, 2055):
+            return JSONResponse(status_code=503, content={"error": "db_unavailable"})
+        return {
+            "ok": False,
+            "error": {"code": str(getattr(exc, "errno", "MYSQL_ERROR")), "message": str(exc)},
+            "query": request.query,
+        }
+    except UnsupportedServerError:
+        return JSONResponse(status_code=503, content={"error": "db_unavailable"})
+    except mysql.connector.Error as exc:
+        return {
+            "ok": False,
+            "error": {"code": str(getattr(exc, "errno", "MYSQL_ERROR")), "message": str(exc)},
+            "query": request.query,
+        }
+    except OSError:
+        return JSONResponse(status_code=503, content={"error": "db_unavailable"})
+
+    tree = parse_explain_analyze(result["plan_text"])
+    warnings = analyze_rules(tree)
+
+    def mark_dead_ends(node):
+        if node.get("actual_rows") == 0:
+            node["dead_end"] = True
+            warnings.append({
+                "code": "DEAD_END",
+                "type": "DEAD_END",
+                "severity": "info",
+                "node_id": node["id"],
+                "title": "No rows produced",
+                "message": f"{node.get('operator') or 'This operator'} produced no rows.",
+                "suggestion": None,
+            })
+        for child in node.get("children", []):
+            mark_dead_ends(child)
+
+    mark_dead_ends(tree)
+    annotate_tree(tree, warnings)
+    steps = build_animation_steps(tree)
+    stats = calculate_stats(tree)
+    return {
+        "query": request.query,
+        "tree": tree,
+        "steps": steps,
+        "warnings": warnings,
+        "stats": stats,
+        "rows": result["rows"],
+        "columns": result["columns"],
+        "source_samples": result["source_samples"],
+    }
+
+
+@app.post("/api/ai")
+def get_live_ai_insights(request: AIRequest):
+    try:
+        explanation = get_ai_explanation(
+            request.query,
+            request.warnings,
+            tree_summary=request.tree,
+            error=request.error,
+        )
+        return {**explanation, "source": "gemini"}
+    except Exception as exc:
+        explanation = get_rule_based_explanation(
+            request.query,
+            request.warnings,
+            tree_summary=request.tree,
+            error=request.error,
+        )
+        return {
+            **explanation,
+            "source": "fallback",
+            "note": getattr(exc, "note", "Gemini is unavailable; showing rule-based insights."),
+        }
 
 @app.post("/api/analyze")
 def analyze(request: AnalyzeRequest):

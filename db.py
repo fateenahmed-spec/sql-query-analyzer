@@ -1,7 +1,10 @@
 import os
+import re
 import threading
 import time
 from contextlib import closing
+from datetime import date, datetime
+from decimal import Decimal
 from pathlib import Path
 
 import mysql.connector
@@ -62,3 +65,92 @@ def run_explain_analyze(raw_sql: str) -> dict:
             finally:
                 timer.cancel()
                 cursor.execute("ROLLBACK")
+
+
+def _json_safe(value):
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return value
+
+
+_TABLE_ACCESS = re.compile(
+    r"\b(?:Table scan|Index scan|Index range scan|Index lookup|"
+    r"Single-row index lookup|Covering index lookup|Covering index scan|"
+    r"Single-row covering index lookup)\s+on\s+"
+    r"(?:`?([\w$]+)`?\.)?`?([\w$]+)`?",
+    re.IGNORECASE,
+)
+
+
+def _source_table_names(plan_text: str, cursor) -> list[str]:
+    cursor.execute("SHOW TABLES")
+    existing = {str(row[0]) for row in cursor.fetchall()}
+    candidates = []
+    for match in _TABLE_ACCESS.finditer(plan_text):
+        table_name = match.group(2)
+        if table_name in existing and table_name not in candidates:
+            candidates.append(table_name)
+    return candidates
+
+
+def run_query_with_data(sql: str) -> dict:
+    """Validate and execute one read-only query, returning its real plan and rows."""
+    normalized_sql = validate_query(sql).strip().rstrip(";").rstrip()
+    plan_text = ""
+    rows = []
+    columns = []
+
+    conn = get_connection()
+    try:
+        with closing(conn.cursor()) as cursor:
+            cursor.execute("SET SESSION MAX_EXECUTION_TIME=5000")
+            cursor.execute(f"EXPLAIN ANALYZE {normalized_sql}")
+            plan_text = "\n".join(str(row[0]) for row in cursor.fetchall())
+    finally:
+        conn.close()
+
+    # Close this connection immediately after fetchmany so an unbuffered cursor
+    # does not consume and retain the rest of a potentially large result set.
+    data_conn = get_connection()
+    try:
+        cursor = data_conn.cursor()
+        cursor.execute("SET SESSION MAX_EXECUTION_TIME=5000")
+        cursor.execute(normalized_sql)
+        columns = [column[0] for column in (cursor.description or [])]
+        rows = [
+            {column: _json_safe(value) for column, value in zip(columns, row)}
+            for row in cursor.fetchmany(20)
+        ]
+    finally:
+        data_conn.close()
+
+    source_samples = {}
+    sample_conn = get_connection()
+    try:
+        with closing(sample_conn.cursor()) as cursor:
+            cursor.execute("SET SESSION MAX_EXECUTION_TIME=5000")
+            table_names = _source_table_names(plan_text, cursor)
+            for table_name in table_names:
+                escaped_table = table_name.replace("`", "``")
+                cursor.execute(f"SELECT * FROM `{escaped_table}` LIMIT 10")
+                table_columns = [column[0] for column in (cursor.description or [])]
+                source_samples[table_name] = [
+                    {
+                        column: _json_safe(value)
+                        for column, value in zip(table_columns, row)
+                    }
+                    for row in cursor.fetchmany(10)
+                ]
+    finally:
+        sample_conn.close()
+
+    return {
+        "plan_text": plan_text,
+        "rows": rows,
+        "columns": columns,
+        "source_samples": source_samples,
+    }
