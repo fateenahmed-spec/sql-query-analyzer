@@ -95,7 +95,7 @@
 
       <section id="step-3" class="step-view" aria-labelledby="flow-heading" hidden>
         <div class="step-title-row">
-          <div><p class="eyebrow">STEP 3 · ROW LIFECYCLE</p><h1 id="flow-heading">Follow the data</h1><p class="muted">Plan statistics and sample rows come directly from MySQL.</p></div>
+          <div><p class="eyebrow">STEP 3 · ROW LIFECYCLE</p><h1 id="flow-heading">Follow the data</h1><p class="muted">Real sample rows are evaluated where safe; unsupported operators are marked as scaled from plan counts.</p></div>
           <div class="step-actions"><button class="button button-secondary back-button" type="button" data-back="2">Back</button><button id="btn-to-ai" class="button button-primary" type="button">Get AI insights <span aria-hidden="true">→</span></button></div>
         </div>
         <section id="animation-controls" class="animation-panel" aria-label="Plan animation controls">
@@ -108,6 +108,11 @@
           </div>
           <label class="speed-control" for="speed-slider"><span>Speed</span><input type="range" id="speed-slider" min="300" max="2000" value="1000" step="100"></label>
           <div class="progress-wrap"><progress id="step-progress" max="1" value="0"></progress><span id="step-status" aria-live="polite">Ready</span></div>
+        </section>
+        <p id="flow-evaluation-badge" class="evaluation-badge" hidden></p>
+        <section class="process-log-panel" aria-labelledby="process-log-heading">
+          <div class="flow-column-heading"><div><p class="eyebrow">LIVE TRACE</p><h2 id="process-log-heading">Process log</h2></div></div>
+          <ol id="process-log" aria-live="polite" aria-relevant="additions"></ol>
         </section>
         <div class="flow-grid">
           <section class="flow-column" aria-labelledby="source-heading"><div class="flow-column-heading"><div><p class="eyebrow">INPUT</p><h2 id="source-heading">Source samples</h2></div><span class="column-mark source-mark">A</span></div><div id="source-tables" class="table-stack"></div></section>

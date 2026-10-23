@@ -7,7 +7,15 @@ let globalData = null;
 let currentPlan = null;
 let animSteps = [];
 let currentIndex = -1;
-let animTimer = null;
+let currentRowIndex = -1;
+let animationEvents = [];
+let animationEventIndex = -1;
+let animationRunId = 0;
+let animationRunning = false;
+let animationPaused = false;
+let animationSleepTimer = null;
+let animationSleepResolve = null;
+let pauseResolvers = [];
 let currentStep = 1;
 let maxCompleted = 1;
 let demoOffline = false;
@@ -33,6 +41,8 @@ const drawerWarnings = document.querySelector("#detail-warnings");
 const speedSlider = document.querySelector("#speed-slider");
 const stepStatus = document.querySelector("#step-status");
 const stepProgress = document.querySelector("#step-progress");
+const processLog = document.querySelector("#process-log");
+const flowEvaluationBadge = document.querySelector("#flow-evaluation-badge");
 const aiContent = document.querySelector("#ai-content");
 const aiLoading = document.querySelector("#ai-loading");
 
@@ -335,62 +345,158 @@ function renderTable(container, title, rows, options = {}) {
   container.append(card);
 }
 
-function resultSurvivorIds(sourceSamples) {
-  const tableNames = Object.keys(sourceSamples || {});
-  if (tableNames.length !== 1 || !globalData?.columns?.includes("id")) return null;
-  return new Set((globalData.rows || []).map((row) => row.id).filter((id) => id !== undefined && id !== null).map(String));
+function flowInputRids(step) {
+  if (!step) return [];
+  return step.op === "scan" ? (step.output_rids || []) : (step.input_rids || []);
+}
+
+function renderFlowRows(container, title, rids, states = {}, badge = "") {
+  container.replaceChildren();
+  if (!rids.length) {
+    appendEmpty(container, "No sample rows at this operator.");
+    return;
+  }
+
+  const records = globalData?.row_records || {};
+  const rows = rids.map((rid) => ({ rid, record: records[rid] })).filter((entry) => entry.record);
+  if (!rows.length) {
+    appendEmpty(container, "No real sampled rows are available for this operator.");
+    return;
+  }
+
+  const card = document.createElement("article");
+  card.className = "table-card";
+  const tableName = rows[0].record.table || "Sample rows";
+  card.dataset.tableName = tableName;
+  const heading = document.createElement("h3");
+  const name = document.createElement("span");
+  name.textContent = title;
+  const count = document.createElement("span");
+  count.textContent = `${rows.length} ${rows.length === 1 ? "row" : "rows"}`;
+  heading.append(name, count);
+  card.append(heading);
+
+  if (badge) {
+    const badgeNode = document.createElement("p");
+    badgeNode.className = "scaled-row-badge";
+    badgeNode.textContent = badge;
+    card.append(badgeNode);
+  }
+
+  const columns = [...new Set(rows.flatMap((entry) => Object.keys(entry.record.values || {})))];
+  const grid = document.createElement("div");
+  grid.className = "row-grid";
+  const header = document.createElement("div");
+  header.className = "flow-row flow-row-header";
+  header.style.setProperty("--column-count", String(columns.length + 1));
+  const ridHeading = document.createElement("span");
+  ridHeading.textContent = "Row ID";
+  header.append(ridHeading);
+  for (const column of columns) {
+    const cell = document.createElement("span");
+    cell.textContent = column;
+    header.append(cell);
+  }
+  grid.append(header);
+
+  for (const entry of rows) {
+    const row = document.createElement("div");
+    row.className = `flow-row row-scan${states[entry.rid] ? ` ${states[entry.rid]}` : ""}`;
+    row.dataset.rid = entry.rid;
+    row.style.setProperty("--column-count", String(columns.length + 1));
+    const ridCell = document.createElement("span");
+    ridCell.className = "flow-cell-rid";
+    ridCell.textContent = entry.rid;
+    row.append(ridCell);
+    for (const column of columns) {
+      const cell = document.createElement("span");
+      cell.textContent = displayValue(entry.record.values?.[column]);
+      cell.title = cell.textContent;
+      row.append(cell);
+    }
+    grid.append(row);
+  }
+  card.append(grid);
+  container.append(card);
+}
+
+function currentStepStates(step) {
+  const states = {};
+  if (!step || currentRowIndex < 0) return states;
+  const rids = flowInputRids(step);
+  const output = new Set(step.output_rids || []);
+  for (let index = 0; index <= Math.min(currentRowIndex, rids.length - 1); index += 1) {
+    const rid = rids[index];
+    const passed = step.row_results?.[rid] ?? output.has(rid);
+    states[rid] = index === currentRowIndex
+      ? `row-active ${passed ? "row-pass" : "row-fail"}`
+      : passed ? "row-pass" : "row-fail";
+  }
+  return states;
+}
+
+function currentIntermediateRids(step) {
+  if (!step || currentRowIndex < 0 || step.never_executed) return [];
+  const input = flowInputRids(step);
+  const processed = new Set(input.slice(0, Math.min(currentRowIndex + 1, input.length)));
+  const output = new Set(step.output_rids || []);
+  if (step.op === "sort") return (step.output_rids || []).filter((rid) => processed.has(rid));
+  return input.filter((rid) => processed.has(rid) && output.has(rid));
 }
 
 function renderSourceTables() {
   const container = document.querySelector("#source-tables");
-  container.replaceChildren();
-  const sourceSamples = globalData?.source_samples || {};
-  const survivorIds = resultSurvivorIds(sourceSamples);
-  const entries = Object.entries(sourceSamples);
-  if (!entries.length) {
-    appendEmpty(container, demoOffline ? "Offline plan examples include no live table rows." : "No source table samples were returned.");
+  const step = currentIndex >= 0 ? animSteps[currentIndex] : animSteps[0];
+  if (!step) {
+    appendEmpty(container, demoOffline ? "Offline plans have no live rows to animate." : "No real row sample was returned.");
     return;
   }
-  for (const [tableName, rows] of entries) {
-    renderTable(container, tableName, rows || [], { tableName, survivorIds });
-  }
+  const title = step.op === "scan" ? `Source scan - ${step.label}` : `Input rows - ${step.label}`;
+  renderFlowRows(container, title, flowInputRids(step), currentIndex >= 0 ? currentStepStates(step) : {});
 }
 
 function renderIntermediateStats() {
   const container = document.querySelector("#intermediate-table");
-  container.replaceChildren();
-  const nodes = planNodes(globalData?.tree);
-  if (!nodes.length) {
-    appendEmpty(container, "No per-operator MySQL statistics are available for this error response.");
+  const step = currentIndex >= 0 ? animSteps[currentIndex] : null;
+  if (!step || currentRowIndex < 0 || step.never_executed) {
+    appendEmpty(container, "Intermediate rows appear as each sample row is processed.");
     return;
   }
-  for (const node of nodes) {
-    const stat = document.createElement("article");
-    stat.className = "node-stat";
-    stat.dataset.nodeId = node.id;
-    const name = document.createElement("strong");
-    name.textContent = node.operator || "Operator";
-    name.title = node.details || "";
-    const input = document.createElement("span");
-    const inputRows = node.children?.length
-      ? node.children.reduce((sum, child) => sum + Number(child.rows_total || 0), 0)
-      : Number(node.rows_total || 0);
-    input.textContent = `${inputRows} → ${node.rows_total ?? 0} rows`;
-    input.title = "Rows examined → rows produced (from the execution plan)";
-    const loops = document.createElement("span");
-    loops.textContent = `${node.loops ?? 0} loops`;
-    const time = document.createElement("span");
-    time.textContent = timeLabel(node.self_time_ms);
-    stat.append(name, input, loops, time);
-    container.append(stat);
+
+  if (step.op === "aggregate" && step.output_rids?.length) {
+    const count = currentIntermediateRids(step).length;
+    if (!count) {
+      appendEmpty(container, "No aggregate output yet for the processed sample rows.");
+      return;
+    }
+    const tokenRid = `group:${step.node_id}`;
+    globalData.row_records[tokenRid] = {
+      table: "Aggregate token",
+      table_row_count: step.actual_rows,
+      values: { token: "Sample group token", sample_rows: count },
+    };
+    renderFlowRows(container, "Aggregate output", [tokenRid], {}, step.evaluable ? "" : "Scaled from plan counts");
+    delete globalData.row_records[tokenRid];
+    return;
   }
+
+  const badge = step.evaluable ? "" : "Scaled from plan counts";
+  renderFlowRows(container, `Output rows - ${step.label}`, currentIntermediateRids(step), {}, badge);
+}
+
+function lastEventForStep(stepIndex) {
+  for (let index = animationEvents.length - 1; index >= 0; index -= 1) {
+    if (animationEvents[index].stepIndex === stepIndex) return index;
+  }
+  return -1;
 }
 
 function renderFinalResults() {
   const container = document.querySelector("#final-results");
   container.replaceChildren();
   const rows = globalData?.rows || [];
-  const rootReached = currentPlan && currentIndex >= 0 && animSteps[currentIndex]?.node_id === currentPlan.id;
+  const rootIndex = animSteps.findIndex((step) => currentPlan && step.node_id === currentPlan.id);
+  const rootReached = rootIndex >= 0 && animationEventIndex >= lastEventForStep(rootIndex);
   if (!rootReached) {
     appendEmpty(container, "Final rows appear when the animation reaches the root operator.");
     return;
@@ -424,88 +530,248 @@ function sourceTableForNode(nodeId) {
   return match ? match[1] : "";
 }
 
+function buildAnimationEvents(steps) {
+  const events = [];
+  for (let stepIndex = 0; stepIndex < steps.length; stepIndex += 1) {
+    const step = steps[stepIndex];
+    const rids = flowInputRids(step);
+    if (step.never_executed || !rids.length) {
+      events.push({ stepIndex, rowIndex: -1 });
+      continue;
+    }
+    for (let rowIndex = 0; rowIndex < rids.length; rowIndex += 1) {
+      events.push({ stepIndex, rowIndex });
+    }
+  }
+  return events;
+}
+
+function appendProcessLog(message) {
+  if (!processLog) return;
+  const entry = document.createElement("li");
+  entry.textContent = String(message);
+  processLog.append(entry);
+  processLog.scrollTop = processLog.scrollHeight;
+}
+
+function formattedCount(value) {
+  return Number(value || 0).toLocaleString();
+}
+
+function stepSummary(step) {
+  const sampleCount = flowInputRids(step).length;
+  const outputCount = (step.output_rids || []).length;
+  const records = globalData?.row_records || {};
+  const firstRecord = [...(step.input_rids || []), ...(step.output_rids || [])]
+    .map((rid) => records[rid])
+    .find(Boolean);
+  const tableCount = step.table_row_count || firstRecord?.table_row_count || step.actual_rows || 0;
+  const scaled = step.evaluable ? "" : " Scaled from plan counts.";
+  return `${outputCount} of ${sampleCount} sample rows passed. Full run: ${formattedCount(step.actual_rows)} of ${formattedCount(tableCount)} (estimated ${formattedCount(step.est_rows)}).${scaled}`;
+}
+
+function eventRowIds(step) {
+  return flowInputRids(step);
+}
+
 function updateGraphVisuals() {
   if (cy) cy.nodes().removeClass("current-node");
   const sourceCards = document.querySelectorAll(".table-card[data-table-name]");
   for (const card of sourceCards) card.classList.remove("is-scanning");
-  for (const stat of document.querySelectorAll(".node-stat")) stat.classList.remove("current-stat");
 
   if (currentIndex >= 0 && currentIndex < animSteps.length) {
     const step = animSteps[currentIndex];
-    if (cy) {
+    if (cy && !step.never_executed) {
       const active = cy.getElementById(step.node_id);
       if (active.nonempty()) active.addClass("current-node");
     }
-    const activeStat = document.querySelector(`.node-stat[data-node-id="${CSS.escape(step.node_id)}"]`);
-    if (activeStat) activeStat.classList.add("current-stat");
-    if (step.action === "scan") {
-      const tableName = sourceTableForNode(step.node_id);
+    if (step.op === "scan") {
+      const record = (globalData?.row_records || {})[flowInputRids(step)[0]];
       for (const card of sourceCards) {
-        if (card.dataset.tableName === tableName) card.classList.add("is-scanning");
+        if (record?.table && card.dataset.tableName === record.table) card.classList.add("is-scanning");
       }
     }
-    stepStatus.textContent = `Step ${currentIndex + 1} of ${animSteps.length}: ${String(step.action || "other").toUpperCase()} (${step.rows_out ?? 0} rows)`;
-    stepProgress.max = Math.max(animSteps.length, 1);
-    stepProgress.value = currentIndex + 1;
+    if (flowEvaluationBadge) {
+      flowEvaluationBadge.hidden = Boolean(step.evaluable || step.never_executed);
+      flowEvaluationBadge.textContent = step.evaluable || step.never_executed ? "" : "Scaled from plan counts";
+    }
+    const rids = eventRowIds(step);
+    if (currentRowIndex >= 0 && currentRowIndex < rids.length) {
+      const record = (globalData?.row_records || {})[rids[currentRowIndex]];
+      const tableCount = step.table_row_count || record?.table_row_count || 0;
+      stepStatus.textContent = currentRowIndex + 1 < rids.length
+        ? `Sample row ${currentRowIndex + 1} of ${rids.length} (table has ${formattedCount(tableCount)} rows).`
+        : stepSummary(step);
+    } else {
+      stepStatus.textContent = step.never_executed ? "Never executed: upstream returned 0 rows." : step.note || "No sample rows to animate.";
+    }
   } else {
-    stepStatus.textContent = `Ready (0 / ${animSteps.length})`;
-    stepProgress.max = Math.max(animSteps.length, 1);
-    stepProgress.value = 0;
+    if (flowEvaluationBadge) {
+      flowEvaluationBadge.hidden = true;
+      flowEvaluationBadge.textContent = "";
+    }
+    stepStatus.textContent = `Ready (0 / ${animationEvents.length})`;
   }
-  renderFinalResults();
+  stepProgress.max = Math.max(animationEvents.length, 1);
+  stepProgress.value = animationEventIndex + 1;
+  renderTables();
+}
+
+function applyAnimationEvent(eventIndex, writeLog = true) {
+  const event = animationEvents[eventIndex];
+  if (!event) return;
+  animationEventIndex = eventIndex;
+  currentIndex = event.stepIndex;
+  currentRowIndex = event.rowIndex;
+  const step = animSteps[currentIndex];
+  updateGraphVisuals();
+
+  if (event.rowIndex < 0) {
+    if (writeLog) {
+      appendProcessLog(step.never_executed ? "Never executed: upstream returned 0 rows." : step.note || `${step.label}: no sample rows to animate.`);
+    }
+    return;
+  }
+
+  const rid = eventRowIds(step)[event.rowIndex];
+  const passed = step.row_results?.[rid] ?? (step.output_rids || []).includes(rid);
+  if (writeLog) {
+    if (step.op === "filter") {
+      appendProcessLog(`Filter ${step.condition || step.label}: ${rid} ${passed ? "passed" : "failed"}.`);
+    } else if (step.op === "limit") {
+      appendProcessLog(`Limit: ${rid} ${passed ? "retained" : "cut from"} the sample.`);
+    } else if (step.op === "sort") {
+      appendProcessLog(`Sort ${step.label}: placed ${rid} in the sampled order.`);
+    } else {
+      appendProcessLog(`${step.label}: processed sample row ${rid}${passed ? " into the output" : " as a failed sample"}.`);
+    }
+  }
+
+  if (event.rowIndex === eventRowIds(step).length - 1) {
+    stepStatus.textContent = stepSummary(step);
+    if (writeLog) appendProcessLog(`${step.label}: ${stepSummary(step)}`);
+  }
+}
+
+function settleAnimationSleep() {
+  if (animationSleepTimer !== null) {
+    clearTimeout(animationSleepTimer);
+    animationSleepTimer = null;
+  }
+  if (animationSleepResolve) {
+    const resolve = animationSleepResolve;
+    animationSleepResolve = null;
+    resolve();
+  }
+}
+
+function waitForPauseGate(token) {
+  if (!animationPaused || token !== animationRunId) return Promise.resolve();
+  return new Promise((resolve) => pauseResolvers.push(resolve));
+}
+
+function sleep(ms, token) {
+  return new Promise((resolve) => {
+    animationSleepResolve = resolve;
+    const speed = Math.max(Number(speedSlider.value) / 1000, 0.1);
+    animationSleepTimer = setTimeout(() => {
+      animationSleepTimer = null;
+      animationSleepResolve = null;
+      resolve();
+    }, ms / speed);
+  });
+}
+
+function resumeAnimation() {
+  animationPaused = false;
+  const waiting = pauseResolvers;
+  pauseResolvers = [];
+  for (const resolve of waiting) resolve();
+}
+
+function cancelAnimationLoop() {
+  animationRunId += 1;
+  animationRunning = false;
+  animationPaused = false;
+  settleAnimationSleep();
+  const waiting = pauseResolvers;
+  pauseResolvers = [];
+  for (const resolve of waiting) resolve();
 }
 
 function pauseAnimation() {
-  if (animTimer !== null) {
-    clearInterval(animTimer);
-    animTimer = null;
-  }
+  if (!animationRunning) return;
+  animationPaused = true;
+  settleAnimationSleep();
 }
 
-function advanceAnimation() {
-  if (currentIndex < animSteps.length - 1) {
-    currentIndex += 1;
-    updateGraphVisuals();
+async function runAnimation(token) {
+  try {
+    while (token === animationRunId && animationEventIndex < animationEvents.length - 1) {
+      await waitForPauseGate(token);
+      if (token !== animationRunId) break;
+      const nextEvent = animationEvents[animationEventIndex + 1];
+      const nextStep = nextEvent ? animSteps[nextEvent.stepIndex] : null;
+      if (nextEvent?.rowIndex >= 0 && !nextStep?.never_executed) await sleep(1000, token);
+      await waitForPauseGate(token);
+      if (token !== animationRunId) break;
+      applyAnimationEvent(animationEventIndex + 1);
+    }
+  } finally {
+    if (token === animationRunId) animationRunning = false;
   }
-  if (currentIndex >= animSteps.length - 1) pauseAnimation();
-}
-
-function startAnimationTimer() {
-  pauseAnimation();
-  if (!animSteps.length) return;
-  animTimer = setInterval(advanceAnimation, Number(speedSlider.value));
 }
 
 function playAnimation() {
-  if (currentIndex >= animSteps.length - 1) {
+  if (!animationEvents.length) return;
+  if (animationRunning) {
+    if (animationPaused) resumeAnimation();
+    return;
+  }
+  if (animationEventIndex >= animationEvents.length - 1) {
+    animationEventIndex = -1;
     currentIndex = -1;
+    currentRowIndex = -1;
     updateGraphVisuals();
   }
-  startAnimationTimer();
+  animationPaused = false;
+  animationRunning = true;
+  const token = ++animationRunId;
+  void runAnimation(token);
 }
 
 function stepForward() {
-  pauseAnimation();
-  if (!animSteps.length) return;
-  currentIndex = Math.min(animSteps.length - 1, currentIndex + 1);
-  updateGraphVisuals();
+  cancelAnimationLoop();
+  if (!animationEvents.length || animationEventIndex >= animationEvents.length - 1) return;
+  const nextIndex = Math.min(animationEvents.length - 1, animationEventIndex + 1);
+  applyAnimationEvent(nextIndex);
 }
 
 function stepBack() {
-  pauseAnimation();
-  currentIndex = Math.max(-1, currentIndex - 1);
-  updateGraphVisuals();
+  cancelAnimationLoop();
+  animationEventIndex = Math.max(-1, animationEventIndex - 1);
+  if (animationEventIndex >= 0) {
+    applyAnimationEvent(animationEventIndex, false);
+  } else {
+    currentIndex = -1;
+    currentRowIndex = -1;
+    updateGraphVisuals();
+  }
 }
 
 function resetAnimation() {
-  pauseAnimation();
+  cancelAnimationLoop();
+  animationEventIndex = -1;
   currentIndex = -1;
+  currentRowIndex = -1;
   updateGraphVisuals();
+  if (processLog?.childElementCount) appendProcessLog("Animation reset to the first sample row.");
 }
 
 function goToStep(number) {
   const target = Math.min(4, Math.max(1, Number(number)));
   if (target > 1 && !globalData) return;
+  if (target !== 3) cancelAnimationLoop();
   maxCompleted = Math.max(maxCompleted, target);
   currentStep = target;
   for (let stepNumber = 1; stepNumber <= 4; stepNumber += 1) {
@@ -527,14 +793,18 @@ function goToStep(number) {
 }
 
 function resetGraphState() {
-  pauseAnimation();
+  cancelAnimationLoop();
   if (cy) {
     cy.destroy();
     cy = null;
   }
   currentPlan = null;
   animSteps = [];
+  animationEvents = [];
+  animationEventIndex = -1;
   currentIndex = -1;
+  currentRowIndex = -1;
+  processLog.replaceChildren();
   closeDrawer();
   sourceBadge.textContent = "";
   planSummary.textContent = "";
@@ -565,12 +835,17 @@ function updatePlanHeading(title, stats) {
 }
 
 function loadPlanData(data, isDemo = false, queryId = "") {
+  cancelAnimationLoop();
   globalData = data;
   demoOffline = isDemo;
   demoQueryId = queryId;
   currentPlan = data.tree || null;
-  animSteps = data.steps || data.animation_steps || [];
+  animSteps = data.row_flow || [];
+  animationEvents = buildAnimationEvents(animSteps);
+  animationEventIndex = -1;
   currentIndex = -1;
+  currentRowIndex = -1;
+  processLog.replaceChildren();
   renderWarnings(data.warnings || []);
   updatePlanHeading(data.query?.title || "Live query plan", data.stats);
   sourceBadge.textContent = isDemo ? "Offline demo plan" : data.ok === false ? "MySQL error" : "Live MySQL";
@@ -761,7 +1036,6 @@ document.querySelector("#btn-pause").addEventListener("click", pauseAnimation);
 document.querySelector("#btn-step-back").addEventListener("click", stepBack);
 document.querySelector("#btn-step-forward").addEventListener("click", stepForward);
 document.querySelector("#btn-reset").addEventListener("click", resetAnimation);
-speedSlider.addEventListener("input", () => { if (animTimer !== null) startAnimationTimer(); });
 document.querySelector("#drawer-close").addEventListener("click", closeDrawer);
 document.querySelector("#query-input").addEventListener("input", () => {
   if (!queryError.hidden) {

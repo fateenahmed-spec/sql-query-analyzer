@@ -16,7 +16,9 @@ from core.steps import build_animation_steps
 from db import (
     DatabaseUploadConfigurationError,
     UnsupportedServerError,
+    build_row_flow,
     execute_sql_file,
+    get_connection,
     run_explain_analyze,
     run_query_with_data,
 )
@@ -146,6 +148,17 @@ def run_live(request: LiveQueryRequest):
         return JSONResponse(status_code=503, content={"error": "db_unavailable"})
 
     tree = parse_explain_analyze(result["plan_text"])
+    tree["_flow_query"] = request.query
+    flow_conn = get_connection()
+    try:
+        row_flow = build_row_flow(tree, flow_conn)
+    finally:
+        flow_conn.close()
+        tree.pop("_flow_query", None)
+
+    row_records = {}
+    for flow_step in row_flow:
+        row_records.update(flow_step.pop("row_data", {}))
     warnings = analyze_rules(tree)
 
     def mark_dead_ends(node):
@@ -171,6 +184,8 @@ def run_live(request: LiveQueryRequest):
         "query": request.query,
         "tree": tree,
         "steps": steps,
+        "row_flow": row_flow,
+        "row_records": row_records,
         "warnings": warnings,
         "stats": stats,
         "rows": result["rows"],
