@@ -33,6 +33,8 @@ python setup_db.py
 
 Set `GEMINI_API_KEY` in `.env` to enable Gemini insights. The default model is `gemini-3.5-flash-lite`. AI responses are cached by query, warnings, and error; the service permits at most one uncached Gemini request every six seconds. If Gemini is unavailable or rate-limited, the app returns rule-based insights. Demo-plan insights use the offline rule-based path.
 
+To enable SQL file uploads, set `MYSQL_ROOT_PASSWORD` in `.env` for the local MySQL root account. The upload endpoint uses `DB_ADMIN_USER` (default `root`) because the query analyzer account is read-only.
+
 Start the server from the repository root:
 
 ```powershell

@@ -3,7 +3,7 @@ import json
 from pathlib import Path
 
 import mysql.connector
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, constr
@@ -13,13 +13,20 @@ from core.parser import parse_explain_analyze
 from core.rules import analyze_rules, annotate_tree
 from core.service import calculate_stats, load_plan_text
 from core.steps import build_animation_steps
-from db import UnsupportedServerError, run_explain_analyze, run_query_with_data
+from db import (
+    DatabaseUploadConfigurationError,
+    UnsupportedServerError,
+    execute_sql_file,
+    run_explain_analyze,
+    run_query_with_data,
+)
 from security import UnsafeQueryError
 
 app = FastAPI()
 _slots = threading.BoundedSemaphore(5)
 _PROJECT_ROOT = Path(__file__).resolve().parent
 _QUERIES_FILE = _PROJECT_ROOT / "demo" / "queries.json"
+_MAX_SQL_FILE_BYTES = 10_000_000
 
 
 def _read_queries():
@@ -30,6 +37,32 @@ def _read_queries():
 @app.get("/api/health")
 def health():
     return {"status": "ok"}
+
+
+@app.post("/api/upload-sql")
+async def upload_sql_file(file: UploadFile = File(...)):
+    filename = file.filename or ""
+    if Path(filename).suffix.casefold() not in {".sql", ".txt"}:
+        raise HTTPException(status_code=400, detail="Choose a .sql or .txt file.")
+
+    content = await file.read(_MAX_SQL_FILE_BYTES + 1)
+    if len(content) > _MAX_SQL_FILE_BYTES:
+        raise HTTPException(status_code=413, detail="SQL files must be 10 MB or smaller.")
+    try:
+        sql_text = content.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise HTTPException(status_code=400, detail="The SQL file must use UTF-8 encoding.") from exc
+
+    try:
+        execute_sql_file(sql_text)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except DatabaseUploadConfigurationError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except mysql.connector.Error as exc:
+        raise HTTPException(status_code=400, detail=f"SQL upload failed: {exc.msg}") from exc
+
+    return {"ok": True, "message": "Database updated successfully"}
 
 
 @app.get("/api/queries")

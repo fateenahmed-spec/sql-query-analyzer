@@ -8,6 +8,7 @@ from decimal import Decimal
 from pathlib import Path
 
 import mysql.connector
+import sqlparse
 from dotenv import load_dotenv
 
 from security import validate_query
@@ -17,8 +18,42 @@ load_dotenv(Path(__file__).resolve().with_name(".env"))
 class UnsupportedServerError(Exception):
     pass
 
+class DatabaseUploadConfigurationError(RuntimeError):
+    pass
+
 def get_connection():
     return mysql.connector.connect(host=os.getenv("DB_HOST", "127.0.0.1"), user=os.getenv("DB_USER", "analyzer_ro"), password=os.getenv("DB_PASS", ""), database=os.getenv("DB_NAME", "sql_analyzer_test"))
+
+def execute_sql_file(sql_text: str) -> str:
+    """Execute statements from an uploaded SQL script using the configured admin account."""
+    statements = [statement.strip() for statement in sqlparse.split(sql_text.lstrip("\ufeff")) if statement.strip()]
+    if not statements:
+        raise ValueError("The SQL file contains no statements.")
+
+    root_password = os.getenv("MYSQL_ROOT_PASSWORD", "")
+    if not root_password:
+        raise DatabaseUploadConfigurationError(
+            "SQL file uploads require MYSQL_ROOT_PASSWORD to be configured."
+        )
+
+    conn = mysql.connector.connect(
+        host=os.getenv("DB_HOST") or "127.0.0.1",
+        user=os.getenv("DB_ADMIN_USER") or "root",
+        password=root_password,
+        database=os.getenv("DB_NAME") or "sql_analyzer_test",
+    )
+    try:
+        with closing(conn.cursor()) as cursor:
+            for statement in statements:
+                cursor.execute(statement)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+    return f"Executed {len(statements)} SQL statements successfully."
 
 def kill_query(conn_id, fired_event):
     conn = None

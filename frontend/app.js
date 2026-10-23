@@ -20,6 +20,8 @@ const queryError = document.querySelector("#query-error");
 const runButton = document.querySelector("#btn-run-query");
 const runSpinner = document.querySelector("#run-spinner");
 const runLabel = document.querySelector("#run-label");
+const uploadButton = document.querySelector("#btn-upload-sql");
+const sqlFileInput = document.querySelector("#sql-file-input");
 const queryList = document.querySelector("#query-list");
 const planSummary = document.querySelector("#plan-summary");
 const sourceBadge = document.querySelector("#source-badge");
@@ -726,6 +728,26 @@ for (const button of document.querySelectorAll(".example-card")) {
 
 runButton.addEventListener("click", runLiveQuery);
 document.querySelector("#btn-load-demo").addEventListener("click", () => loadOfflineDemo());
+uploadButton.addEventListener("click", () => sqlFileInput.click());
+sqlFileInput.addEventListener("change", async () => {
+  const file = sqlFileInput.files?.[0];
+  if (!file) return;
+
+  uploadButton.disabled = true;
+  uploadButton.textContent = "Uploading...";
+  const formData = new FormData();
+  formData.append("file", file);
+  try {
+    await getJson("/api/upload-sql", { method: "POST", body: formData });
+    window.alert("✅ Database populated successfully! You can now type a query and click Run Query.");
+  } catch (error) {
+    window.alert(`Upload failed: ${error.message}`);
+  } finally {
+    uploadButton.disabled = false;
+    uploadButton.textContent = "Upload .sql File";
+    sqlFileInput.value = "";
+  }
+});
 document.querySelector("#btn-to-flow").addEventListener("click", () => {
   renderTables();
   goToStep(3);
