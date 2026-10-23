@@ -1,6 +1,8 @@
 "use strict";
 
-cytoscape.use(cytoscapeDagre);
+if (typeof cytoscape !== "undefined" && typeof cytoscapeDagre !== "undefined") {
+  cytoscape.use(cytoscapeDagre);
+}
 
 let cy = null;
 let globalData = null;
@@ -20,17 +22,23 @@ let currentStep = 1;
 let maxCompleted = 1;
 let demoOffline = false;
 let demoQueryId = "";
-let queryLibrary = [];
+let selectedDemoQueryId = "";
+const presentationDemo = new URLSearchParams(window.location.search).get("demo") === "1";
 
 const cyContainer = document.querySelector("#cy");
 const queryInput = document.querySelector("#query-input");
 const queryError = document.querySelector("#query-error");
+const queryErrorMessage = document.querySelector("#query-error-message");
+const queryErrorDismiss = document.querySelector("#query-error-dismiss");
+const toastRegion = document.querySelector("#toast-region");
+const queryCounter = document.querySelector("#query-counter");
 const runButton = document.querySelector("#btn-run-query");
 const runSpinner = document.querySelector("#run-spinner");
 const runLabel = document.querySelector("#run-label");
 const uploadButton = document.querySelector("#btn-upload-sql");
+const uploadLabel = document.querySelector("#upload-label");
 const sqlFileInput = document.querySelector("#sql-file-input");
-const queryList = document.querySelector("#query-list");
+const examplesSelect = document.querySelector("#examples-select");
 const planSummary = document.querySelector("#plan-summary");
 const sourceBadge = document.querySelector("#source-badge");
 const graphMessage = document.querySelector("#graph-message");
@@ -46,11 +54,18 @@ const flowEvaluationBadge = document.querySelector("#flow-evaluation-badge");
 const aiContent = document.querySelector("#ai-content");
 const aiLoading = document.querySelector("#ai-loading");
 
-const examples = {
-  normal: "SELECT id, name FROM customers WHERE city = 'Mumbai' LIMIT 5",
-  scan: "SELECT id, customer_id, amount FROM orders WHERE amount > 500",
-  empty: "SELECT id, name FROM customers WHERE city = 'Atlantis' LIMIT 5",
-};
+const examples = [
+  { id: "01_full_scan", title: "01 · Full table scan", sql: "SELECT * FROM orders WHERE amount > 500;" },
+  { id: "02_index_lookup", title: "02 · Index lookup", sql: "SELECT * FROM orders WHERE customer_id = 7;" },
+  { id: "03_join_no_index", title: "03 · Join without a usable index", sql: "SELECT c.city, o.status FROM customers c JOIN orders o ON c.city = o.status LIMIT 100;" },
+  { id: "04_group_by", title: "04 · Group by", sql: "SELECT customer_id, SUM(amount) AS total FROM orders GROUP BY customer_id;" },
+  { id: "05_sort_limit", title: "05 · Sort and limit", sql: "SELECT * FROM orders ORDER BY amount DESC LIMIT 10;" },
+  { id: "06_subquery", title: "06 · Subquery", sql: "SELECT * FROM customers WHERE id IN (SELECT customer_id FROM orders WHERE amount > 990);" },
+  { id: "07_zero_rows", title: "07 · Zero rows", sql: "SELECT o.id, c.name FROM orders o JOIN customers c ON c.id = o.customer_id WHERE o.amount > 5000;" },
+  { id: "08_full_pipeline", title: "08 · Full pipeline", sql: "SELECT c.city, SUM(o.amount) AS total FROM orders o JOIN customers c ON c.id = o.customer_id WHERE o.amount > 100 GROUP BY c.city ORDER BY total DESC;" },
+  { id: "09_slow_showcase", title: "09 · Slow showcase", sql: "SELECT * FROM orders WHERE status LIKE '%deliv%' ORDER BY created_at DESC;" },
+];
+const examplesById = new Map(examples.map((example) => [example.id, example]));
 
 async function getJson(url, options = {}) {
   const response = await fetch(url, options);
@@ -63,6 +78,49 @@ async function getJson(url, options = {}) {
     throw error;
   }
   return payload;
+}
+
+function listen(selector, eventName, handler) {
+  const element = document.querySelector(selector);
+  if (element) element.addEventListener(eventName, handler);
+  return element;
+}
+
+function showErrorBanner(message) {
+  if (!queryError || !queryErrorMessage) return;
+  queryErrorMessage.textContent = String(message || "Something went wrong.");
+  queryError.hidden = false;
+}
+
+function clearErrorBanner() {
+  if (queryError) queryError.hidden = true;
+  if (queryErrorMessage) queryErrorMessage.textContent = "";
+}
+
+function showToast(message, variant = "success") {
+  if (!toastRegion) return;
+  const toast = document.createElement("div");
+  toast.className = `toast${variant === "warning" ? " warning" : ""}`;
+  toast.setAttribute("role", "status");
+  const text = document.createElement("span");
+  text.textContent = String(message);
+  const dismiss = document.createElement("button");
+  dismiss.type = "button";
+  dismiss.className = "icon-button";
+  dismiss.setAttribute("aria-label", "Dismiss notification");
+  dismiss.textContent = "×";
+  dismiss.addEventListener("click", () => toast.remove());
+  toast.append(text, dismiss);
+  toastRegion.append(toast);
+  window.setTimeout(() => toast.remove(), 5000);
+}
+
+function updateQueryCounter() {
+  if (!queryInput || !queryCounter) return;
+  const length = queryInput.value.length;
+  queryCounter.hidden = length < 4500;
+  queryCounter.textContent = length.toLocaleString() + " / 5,000 characters";
+  queryCounter.classList.toggle("near-limit", length >= 4800);
 }
 
 function setText(selector, value) {
@@ -128,10 +186,10 @@ function graphStyle() {
       selector: "node",
       style: {
         label: "data(label)",
-        color: "#f5f7fb",
+        color: "#ededed",
         "font-size": 11,
         "font-weight": 600,
-        "font-family": "Inter, sans-serif",
+        "font-family": "system-ui, sans-serif",
         "text-valign": "center",
         "text-halign": "center",
         "text-wrap": "wrap",
@@ -142,30 +200,30 @@ function graphStyle() {
         shape: "round-rectangle",
         "background-color": (element) => {
           const percentage = Number(element.data("self_time_pct") || 0);
-          if (percentage >= 40) return "#a6323e";
-          if (percentage >= 20) return "#9b5a24";
-          return "#303844";
+          if (percentage >= 40) return "#7f1d1d";
+          if (percentage >= 20) return "#7c2d12";
+          return "#262626";
         },
         "border-width": 1,
-        "border-color": "#485363",
+        "border-color": "#525252",
         opacity: 1,
         "overlay-opacity": 0,
       },
     },
-    { selector: "node[has_warnings = true]", style: { "border-width": 3, "border-color": "#e63946" } },
+    { selector: "node[has_warnings = true]", style: { "border-width": 3, "border-color": "#ef4444" } },
     { selector: "node[never_executed = true]", style: { opacity: 0.5, "border-style": "dashed" } },
-    { selector: "node[dead_end = true]", style: { "border-width": 3, "border-color": "#b38af2", "border-style": "dashed" } },
-    { selector: "node.error-node", style: { label: "data(label)", "background-color": "#862c39", "border-color": "#ff596d", "border-width": 3, width: 300, height: 100, "text-wrap": "wrap", "text-max-width": 260 } },
-    { selector: "node.current-node", style: { "border-color": "#ffd166", "border-width": "5px" } },
-    { selector: "node:selected", style: { "border-color": "#9bc0ff", "border-width": 3 } },
+    { selector: "node[dead_end = true]", style: { "border-width": 3, "border-color": "#c084fc", "border-style": "dashed" } },
+    { selector: "node.error-node", style: { label: "data(label)", "background-color": "#7f1d1d", "border-color": "#ef4444", "border-width": 3, width: 300, height: 100, "text-wrap": "wrap", "text-max-width": 260 } },
+    { selector: "node.current-node", style: { "border-color": "#fbbf24", "border-width": "5px" } },
+    { selector: "node:selected", style: { "border-color": "#3b82f6", "border-width": 3 } },
     {
       selector: "edge",
       style: {
         width: "mapData(rows_total, 0, 10000, 2, 8)",
         "curve-style": "bezier",
-        "line-color": "#4a5568",
+        "line-color": "#52525b",
         "source-arrow-shape": "triangle",
-        "source-arrow-color": "#4a5568",
+        "source-arrow-color": "#52525b",
         "target-arrow-shape": "none",
         "target-distance-from-node": 4,
         "source-distance-from-node": 4,
@@ -176,7 +234,7 @@ function graphStyle() {
 }
 
 function closeDrawer() {
-  detailDrawer.hidden = true;
+  if (detailDrawer) detailDrawer.hidden = true;
 }
 
 function showNodeDetails(node) {
@@ -214,7 +272,7 @@ function buildGraph() {
     cy = null;
   }
   closeDrawer();
-  graphMessage.hidden = true;
+  if (graphMessage) graphMessage.hidden = true;
 
   let elements;
   if (globalData?.ok === false) {
@@ -226,6 +284,10 @@ function buildGraph() {
   }
   if (!elements.length) {
     showGraphMessage("No execution plan was returned.");
+    return;
+  }
+  if (!cyContainer || typeof cytoscape === "undefined" || typeof cytoscapeDagre === "undefined") {
+    showGraphMessage("The graph viewer is unavailable because its local dependencies could not be loaded.");
     return;
   }
   cy = cytoscape({
@@ -251,6 +313,7 @@ function buildGraph() {
 }
 
 function showGraphMessage(message) {
+  if (!graphMessage) return;
   graphMessage.textContent = message;
   graphMessage.hidden = false;
 }
@@ -261,7 +324,9 @@ function warningCard(warning) {
   card.className = `warning-card severity-${warning.severity || "info"}${code === "DEAD_END" ? " dead-end-warning" : ""}`;
   const title = document.createElement("h3");
   title.className = "warning-title";
-  title.textContent = warning.title || code;
+  const severity = String(warning.severity || "info").toLowerCase();
+  const severityLabel = severity === "high" ? "Error" : severity === "low" ? "Note" : severity === "info" ? "Info" : "Warning";
+  title.textContent = severityLabel + ": " + (warning.title || code);
   const message = document.createElement("p");
   message.className = "warning-message";
   message.textContent = warning.message || "";
@@ -388,7 +453,10 @@ function renderFlowRows(container, title, rids, states = {}, badge = "") {
   grid.className = "row-grid";
   const header = document.createElement("div");
   header.className = "flow-row flow-row-header";
-  header.style.setProperty("--column-count", String(columns.length + 1));
+  header.style.setProperty("--column-count", String(columns.length + 2));
+  const stateHeading = document.createElement("span");
+  stateHeading.textContent = "State";
+  header.append(stateHeading);
   const ridHeading = document.createElement("span");
   ridHeading.textContent = "Row ID";
   header.append(ridHeading);
@@ -403,7 +471,19 @@ function renderFlowRows(container, title, rids, states = {}, badge = "") {
     const row = document.createElement("div");
     row.className = `flow-row row-scan${states[entry.rid] ? ` ${states[entry.rid]}` : ""}`;
     row.dataset.rid = entry.rid;
-    row.style.setProperty("--column-count", String(columns.length + 1));
+    row.style.setProperty("--column-count", String(columns.length + 2));
+    const stateClasses = String(states[entry.rid] || "").split(/\s+/);
+    const stateLabel = stateClasses.includes("row-pass")
+      ? "PASS"
+      : stateClasses.includes("row-fail")
+        ? "FAIL"
+        : stateClasses.includes("row-move")
+          ? "MOVED"
+          : "SAMPLE";
+    const stateCell = document.createElement("span");
+    stateCell.className = "flow-state-label " + stateLabel.toLowerCase();
+    stateCell.textContent = stateLabel === "PASS" ? "✓ PASS" : stateLabel === "FAIL" ? "× FAIL" : stateLabel;
+    row.append(stateCell);
     const ridCell = document.createElement("span");
     ridCell.className = "flow-cell-rid";
     ridCell.textContent = entry.rid;
@@ -804,13 +884,12 @@ function resetGraphState() {
   animationEventIndex = -1;
   currentIndex = -1;
   currentRowIndex = -1;
-  processLog.replaceChildren();
+  if (processLog) processLog.replaceChildren();
   closeDrawer();
-  sourceBadge.textContent = "";
-  planSummary.textContent = "";
+  if (sourceBadge) sourceBadge.textContent = "";
+  if (planSummary) planSummary.textContent = "";
   renderWarnings([]);
-  queryError.hidden = true;
-  queryError.textContent = "";
+  clearErrorBanner();
 }
 
 function startOver() {
@@ -818,6 +897,7 @@ function startOver() {
   globalData = null;
   demoOffline = false;
   demoQueryId = "";
+  selectedDemoQueryId = "";
   maxCompleted = 1;
   goToStep(1);
 }
@@ -862,17 +942,15 @@ function loadPlanData(data, isDemo = false, queryId = "") {
 }
 
 async function runLiveQuery() {
-  const query = queryInput.value.trim();
-  queryError.hidden = true;
-  queryError.textContent = "";
+  const query = queryInput?.value.trim() || "";
+  clearErrorBanner();
   if (!query) {
-    queryError.textContent = "Enter a SQL query first.";
-    queryError.hidden = false;
+    showErrorBanner("Enter a SQL query first.");
     return;
   }
-  runButton.disabled = true;
-  runSpinner.hidden = false;
-  runLabel.textContent = "Running query…";
+  if (runButton) runButton.disabled = true;
+  if (runSpinner) runSpinner.hidden = false;
+  if (runLabel) runLabel.textContent = "Running query…";
   try {
     const result = await getJson("/api/run-live", {
       method: "POST",
@@ -880,48 +958,49 @@ async function runLiveQuery() {
       body: JSON.stringify({ query }),
     });
     result.query = query;
-    if (result.ok === false) result.error = result.error || { message: "MySQL could not execute the query." };
+    if (result.ok === false) {
+      const message = result.error?.message || "MySQL could not execute the query.";
+      showErrorBanner("MySQL error: " + message);
+      return;
+    }
     loadPlanData(result, false);
   } catch (error) {
+    const unavailable = error.status === 503 || error.status >= 500 || !Number.isInteger(error.status);
+    if (presentationDemo && unavailable) {
+      await loadOfflineDemo(selectedDemoQueryId || "08_full_pipeline");
+      if (demoOffline && globalData) {
+        showToast("Live database unavailable. Showing the offline demo plan.", "warning");
+      }
+      return;
+    }
     const prefix = error.status === 400 ? "Security check: " : error.status === 503 ? "Database unavailable: " : "Could not run query: ";
-    queryError.textContent = prefix + error.message;
-    queryError.hidden = false;
+    showErrorBanner(prefix + error.message);
   } finally {
-    runButton.disabled = false;
-    runSpinner.hidden = true;
-    runLabel.textContent = "Run Query";
+    if (runButton) runButton.disabled = false;
+    if (runSpinner) runSpinner.hidden = true;
+    if (runLabel) runLabel.textContent = "Run Query";
   }
 }
 
 async function loadOfflineDemo(id = "08_full_pipeline") {
   resetGraphState();
-  queryError.hidden = true;
+  clearErrorBanner();
   try {
     const plan = await getJson(`/api/plan/${encodeURIComponent(id)}`);
-    const query = plan.query || queryLibrary.find((item) => item.id === id) || { id, title: id, sql: "" };
+    const query = plan.query || examplesById.get(id) || { id, title: id, sql: "" };
     loadPlanData({ ...plan, query, rows: [], columns: [], source_samples: [] }, true, id);
   } catch (error) {
-    queryError.textContent = `Could not load offline example: ${error.message}`;
-    queryError.hidden = false;
+    showErrorBanner("Could not load offline example: " + error.message);
   }
 }
 
-function populateQueries(queries) {
-  queryLibrary = queries;
-  queryList.replaceChildren();
-  for (const query of queries) {
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = "query-item";
-    const title = document.createElement("span");
-    title.className = "query-item-title";
-    title.textContent = query.title;
-    const sql = document.createElement("span");
-    sql.className = "query-item-sql";
-    sql.textContent = query.sql;
-    button.append(title, sql);
-    button.addEventListener("click", () => loadOfflineDemo(query.id));
-    queryList.append(button);
+function populateExamples() {
+  if (!examplesSelect) return;
+  for (const example of examples) {
+    const option = document.createElement("option");
+    option.value = example.id;
+    option.textContent = example.title;
+    examplesSelect.append(option);
   }
 }
 
@@ -997,65 +1076,69 @@ for (const button of document.querySelectorAll(".stepper-item")) {
 for (const button of document.querySelectorAll(".back-button")) {
   button.addEventListener("click", () => goToStep(Number(button.dataset.back)));
 }
-for (const button of document.querySelectorAll(".example-card")) {
-  button.addEventListener("click", () => { queryInput.value = examples[button.dataset.example] || ""; queryInput.focus(); });
-}
-
-runButton.addEventListener("click", runLiveQuery);
-document.querySelector("#btn-load-demo").addEventListener("click", () => loadOfflineDemo());
-uploadButton.addEventListener("click", () => sqlFileInput.click());
-sqlFileInput.addEventListener("change", async () => {
-  const file = sqlFileInput.files?.[0];
+listen("#btn-run-query", "click", runLiveQuery);
+listen("#btn-upload-sql", "click", () => sqlFileInput?.click());
+listen("#sql-file-input", "change", async () => {
+  const file = sqlFileInput?.files?.[0];
   if (!file) return;
 
-  uploadButton.disabled = true;
-  uploadButton.textContent = "Uploading...";
+  clearErrorBanner();
+  if (uploadButton) uploadButton.disabled = true;
+  if (uploadLabel) uploadLabel.textContent = "Uploading…";
   const formData = new FormData();
   formData.append("file", file);
   try {
     await getJson("/api/upload-sql", { method: "POST", body: formData });
-    window.alert("✅ Database populated successfully! You can now type a query and click Run Query.");
+    showToast("Database populated successfully. You can now type a query and click Run Query.");
   } catch (error) {
-    window.alert(`Upload failed: ${error.message}`);
+    showErrorBanner("Upload failed: " + error.message);
   } finally {
-    uploadButton.disabled = false;
-    uploadButton.textContent = "Upload .sql File";
-    sqlFileInput.value = "";
+    if (uploadButton) uploadButton.disabled = false;
+    if (uploadLabel) uploadLabel.textContent = "Upload .sql";
+    if (sqlFileInput) sqlFileInput.value = "";
   }
 });
-document.querySelector("#btn-to-flow").addEventListener("click", () => {
+listen("#examples-select", "change", () => {
+  const example = examplesById.get(examplesSelect?.value);
+  if (!example || !queryInput) return;
+  queryInput.value = example.sql;
+  selectedDemoQueryId = example.id;
+  updateQueryCounter();
+  examplesSelect.value = "";
+  queryInput.focus();
+});
+listen("#query-error-dismiss", "click", clearErrorBanner);
+listen("#query-input", "input", () => {
+  updateQueryCounter();
+  selectedDemoQueryId = examples.find((example) => example.sql.trim() === queryInput.value.trim())?.id || "";
+  clearErrorBanner();
+});
+listen("#query-input", "keydown", (event) => {
+  if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
+    event.preventDefault();
+    runLiveQuery();
+  }
+});
+listen("#btn-to-flow", "click", () => {
   renderTables();
   goToStep(3);
   updateGraphVisuals();
 });
-document.querySelector("#btn-to-ai").addEventListener("click", loadAiInsights);
-document.querySelector("#btn-start-over").addEventListener("click", startOver);
-document.querySelector("#btn-ai-start-over").addEventListener("click", startOver);
-document.querySelector("#btn-play").addEventListener("click", playAnimation);
-document.querySelector("#btn-pause").addEventListener("click", pauseAnimation);
-document.querySelector("#btn-step-back").addEventListener("click", stepBack);
-document.querySelector("#btn-step-forward").addEventListener("click", stepForward);
-document.querySelector("#btn-reset").addEventListener("click", resetAnimation);
-document.querySelector("#drawer-close").addEventListener("click", closeDrawer);
-document.querySelector("#query-input").addEventListener("input", () => {
-  if (!queryError.hidden) {
-    queryError.hidden = true;
-    queryError.textContent = "";
-  }
-});
+listen("#btn-to-ai", "click", loadAiInsights);
+listen("#btn-start-over", "click", startOver);
+listen("#btn-ai-start-over", "click", startOver);
+listen("#btn-play", "click", playAnimation);
+listen("#btn-pause", "click", pauseAnimation);
+listen("#btn-step-back", "click", stepBack);
+listen("#btn-step-forward", "click", stepForward);
+listen("#btn-reset", "click", resetAnimation);
+listen("#drawer-close", "click", closeDrawer);
 
 async function initialize() {
-  try {
-    const queries = await getJson("/api/queries");
-    populateQueries(queries);
-  } catch (error) {
-    queryList.replaceChildren();
-    const message = document.createElement("p");
-    message.className = "muted";
-    message.textContent = error.message;
-    queryList.append(message);
-  }
+  populateExamples();
   goToStep(1);
+  updateQueryCounter();
+  if (queryInput) queryInput.focus();
 }
 
 initialize();

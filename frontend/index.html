@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="theme-color" content="#101318">
+  <meta name="theme-color" content="#0a0a0a">
   <title>SQL Query Analyzer</title>
   <link rel="stylesheet" href="style.css">
   <script src="https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.28.1/cytoscape.min.js"></script>
@@ -40,26 +40,26 @@
           <label for="query-input">SQL query</label>
           <textarea id="query-input" spellcheck="false" maxlength="5000" aria-describedby="query-hint">SELECT id, name FROM customers WHERE city = 'Mumbai' LIMIT 5</textarea>
           <p id="query-hint" class="field-hint">Only read-only SELECT and WITH queries are accepted. Results are capped at 20 rows.</p>
-          <div id="query-error" class="inline-banner" role="alert" hidden></div>
+          <div id="query-error" class="inline-banner" role="alert" hidden>
+            <span id="query-error-message"></span>
+            <button id="query-error-dismiss" class="icon-button banner-dismiss" type="button" aria-label="Dismiss error">×</button>
+          </div>
           <div class="query-actions">
             <button id="btn-run-query" class="button button-primary" type="button"><span id="run-spinner" class="spinner" hidden></span><span id="run-label">Run Query</span></button>
-            <button id="btn-load-demo" class="button button-secondary" type="button">Load demo (offline)</button>
-            <button id="btn-upload-sql" class="button button-secondary" type="button">Upload .sql File</button>
+            <button id="btn-upload-sql" class="button button-secondary" type="button">
+              <svg class="upload-icon" viewBox="0 0 20 20" aria-hidden="true" focusable="false">
+                <path d="M10 13V3m0 0L6.5 6.5M10 3l3.5 3.5M4 12.5v3A1.5 1.5 0 0 0 5.5 17h9a1.5 1.5 0 0 0 1.5-1.5v-3" />
+              </svg>
+              <span id="upload-label">Upload .sql</span>
+            </button>
+            <label class="sr-only" for="examples-select">Choose an example query</label>
+            <select id="examples-select" class="button button-secondary" aria-label="Choose an example query">
+              <option value="" selected>Examples</option>
+            </select>
             <input type="file" id="sql-file-input" accept=".sql,.txt" style="display:none;">
           </div>
+          <output id="query-counter" class="query-counter" for="query-input" aria-live="polite" hidden></output>
         </div>
-        <section class="examples-section" aria-labelledby="examples-heading">
-          <div class="section-heading"><div><p class="eyebrow">TRY AN EXAMPLE</p><h2 id="examples-heading">Quick queries</h2></div></div>
-          <div class="example-grid">
-            <button class="example-card" type="button" data-example="normal"><span class="example-icon">01</span><span><strong>Filtered lookup</strong><small>Indexed customer query</small></span><span class="example-arrow">↗</span></button>
-            <button class="example-card" type="button" data-example="scan"><span class="example-icon">02</span><span><strong>Full scan</strong><small>Find a costly table read</small></span><span class="example-arrow">↗</span></button>
-            <button class="example-card" type="button" data-example="empty"><span class="example-icon">03</span><span><strong>Zero rows</strong><small>Inspect an empty result</small></span><span class="example-arrow">↗</span></button>
-          </div>
-        </section>
-        <section class="saved-examples" aria-labelledby="saved-heading">
-          <div class="section-heading"><div><p class="eyebrow">PLAN LIBRARY</p><h2 id="saved-heading">Offline examples</h2></div></div>
-          <nav id="query-list" class="query-list" aria-label="Saved demo plans"><p class="muted">Loading examples…</p></nav>
-        </section>
       </section>
 
       <section id="step-2" class="step-view" aria-labelledby="plan-heading" hidden>
@@ -140,6 +140,7 @@
       </section>
     </main>
   </div>
+  <div id="toast-region" class="toast-region" aria-live="polite" aria-atomic="false"></div>
   <script src="app.js" defer></script>
 </body>
 </html>
