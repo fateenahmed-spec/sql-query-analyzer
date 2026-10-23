@@ -210,8 +210,13 @@ def get_live_ai_insights(request: AIRequest):
                 tree_summary=request.tree,
                 error=request.error,
             )["fix"]
-        return {**explanation, "source": "gemini"}
-    except Exception as exc:
+        is_live = explanation.get("ai_status") == "success"
+        return {
+            **explanation,
+            "source": "gemini" if is_live else "fallback",
+            "note": "" if is_live else explanation.get("reason", "Gemini unavailable; using rule-based insights."),
+        }
+    except Exception:
         explanation = get_rule_based_explanation(
             request.query,
             request.warnings,
@@ -220,9 +225,10 @@ def get_live_ai_insights(request: AIRequest):
         )
         return {
             **explanation,
+            "ai_status": "fallback",
             "source": "fallback",
-            "note": getattr(exc, "note", "Gemini is unavailable; showing rule-based insights."),
-            "error": str(exc),
+            "note": "Gemini unavailable; using rule-based insights.",
+            "reason": "Gemini request failed",
         }
 
 @app.post("/api/analyze")
