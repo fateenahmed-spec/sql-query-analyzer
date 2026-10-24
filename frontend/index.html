@@ -65,20 +65,19 @@
                   <h2 id="csv-upload-heading">Upload CSV</h2>
                   <p class="csv-panel-hint">Create a table in your isolated uploads schema.</p>
                 </div>
-                <label class="csv-table-name" for="csv-table-name">
-                  <span class="csv-table-name-label">Table name <small>optional</small></span>
-                  <input id="csv-table-name" type="text" maxlength="60" placeholder="Use file name">
-                </label>
               </div>
-              <input id="csv-file-input" class="sr-only" type="file" accept=".csv,text/csv">
-              <div id="csv-drop-zone" class="csv-drop-zone" role="button" tabindex="0" aria-label="Choose a CSV file or drop one here">
+              <input id="csv-file-input" class="hidden-file-input" type="file" accept=".csv">
+              <label id="csv-drop-zone" for="csv-file-input" class="drop-zone" tabindex="0">
                 <svg class="csv-upload-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
                   <path d="M12 16V4m0 0L8 8m4-4 4 4M5 14v4a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-4" />
                 </svg>
-                <span><strong>Drop a CSV file here</strong><small>or click to browse · CSV up to 5 MB</small></span>
-              </div>
+                <span><strong id="csv-drop-zone-text">Drop a CSV file here or click to browse</strong><small>CSV up to 5 MB</small></span>
+              </label>
               <div class="csv-upload-row">
                 <span id="csv-file-name" class="csv-file-name" aria-live="polite">No file selected</span>
+                <label class="csv-table-name" for="csv-table-name">
+                  <input id="csv-table-name" type="text" maxlength="60" placeholder="Table name (optional)" aria-label="Table name (optional)">
+                </label>
                 <button id="btn-upload-csv" class="button button-primary" type="button" disabled>
                   <span id="csv-upload-spinner" class="spinner" hidden></span>
                   <span id="csv-upload-label">Upload CSV</span>

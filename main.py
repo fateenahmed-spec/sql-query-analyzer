@@ -9,7 +9,7 @@ from datetime import date, datetime
 from pathlib import Path
 
 import mysql.connector
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, constr
@@ -109,22 +109,30 @@ def _csv_date(value: str) -> bool:
 
 
 def _infer_csv_type(values: list[str | None]) -> str:
-    nonempty = [value.strip() for value in values if value is not None and value.strip()]
+    nonempty = [value for value in values if value is not None and value.strip()]
     if not nonempty:
-        return "TEXT"
-    if all(re.fullmatch(r"[+-]?\d+", value) for value in nonempty):
-        integers = [int(value) for value in nonempty]
+        return "VARCHAR(32)"
+    stripped = [value.strip() for value in nonempty]
+    if all(re.fullmatch(r"[+-]?\d+", value) for value in stripped):
+        integers = [int(value) for value in stripped]
         if all(-(2**31) <= value <= (2**31 - 1) for value in integers):
             return "INT"
-        return "TEXT"
-    if all(_csv_date(value) for value in nonempty):
+        return _infer_csv_string_type(nonempty)
+    if all(_csv_date(value) for value in stripped):
         return "DATE"
     try:
-        if all(math.isfinite(float(value)) for value in nonempty):
+        if all(math.isfinite(float(value)) for value in stripped):
             return "DOUBLE"
     except ValueError:
         pass
-    return "TEXT"
+    return _infer_csv_string_type(nonempty)
+
+
+def _infer_csv_string_type(values: list[str]) -> str:
+    longest = max((len(value) for value in values), default=0)
+    if longest > 255:
+        return "TEXT"
+    return f"VARCHAR({max(32, longest)})"
 
 
 def _upload_table_identifier(table: str) -> str:
@@ -133,8 +141,8 @@ def _upload_table_identifier(table: str) -> str:
     return f"`analyzer_uploads`.`{table}`"
 
 
-def _csv_upload_name(filename: str) -> str:
-    stem = Path(filename).stem.casefold()
+def _csv_upload_name(filename: str, table_name: str | None = None) -> str:
+    stem = Path(table_name or filename).stem.casefold()
     sanitized = re.sub(r"[^a-z0-9]+", "_", stem).strip("_")
     if not sanitized:
         sanitized = "upload"
@@ -178,7 +186,7 @@ async def upload_sql_file(file: UploadFile = File(...)):
 
 
 @app.post("/api/upload-csv")
-async def upload_csv_file(file: UploadFile = File(...)):
+async def upload_csv_file(file: UploadFile = File(...), table_name: str = Form("")):
     filename = file.filename or ""
     if Path(filename).suffix.casefold() != ".csv":
         raise HTTPException(status_code=400, detail="Choose a .csv file.")
@@ -208,11 +216,16 @@ async def upload_csv_file(file: UploadFile = File(...)):
             raise HTTPException(status_code=400, detail="CSV files may contain at most 50 columns.")
         used_headers: set[str] = set()
         columns = [
-            {"name": _sanitize_csv_header(header, index, used_headers), "type": ""}
+            {
+                "name": _sanitize_csv_header(header, index, used_headers),
+                "original_name": header,
+                "type": "",
+            }
             for index, header in enumerate(headers)
         ]
         data_rows: list[list[str | None]] = []
         seen_rows = 0
+        skipped_rows = 0
         for row in reader:
             seen_rows += 1
             if seen_rows > _MAX_CSV_ROWS:
@@ -220,6 +233,7 @@ async def upload_csv_file(file: UploadFile = File(...)):
             if len(row) > _MAX_CSV_COLUMNS:
                 raise HTTPException(status_code=400, detail="CSV files may contain at most 50 columns.")
             if len(row) != len(headers):
+                skipped_rows += 1
                 continue
             data_rows.append([None if not value.strip() else value for value in row])
     except csv.Error as exc:
@@ -228,7 +242,7 @@ async def upload_csv_file(file: UploadFile = File(...)):
     for index, column in enumerate(columns):
         column["type"] = _infer_csv_type([row[index] for row in data_rows])
 
-    table = _csv_upload_name(filename)
+    table = _csv_upload_name(filename, table_name.strip() or None)
     qualified_table = _upload_table_identifier(table)
     definitions = ", ".join(
         f"`{column['name']}` {column['type']}" for column in columns
@@ -261,7 +275,7 @@ async def upload_csv_file(file: UploadFile = File(...)):
                     except mysql.connector.Error:
                         conn.rollback()
                 if getattr(exc, "errno", None) == 1050:
-                    raise HTTPException(status_code=400, detail="An upload with this filename already exists.") from exc
+                    raise HTTPException(status_code=400, detail="An upload with this table name already exists.") from exc
                 raise HTTPException(status_code=500, detail="Could not create the upload table.") from exc
     finally:
         conn.close()
@@ -271,6 +285,7 @@ async def upload_csv_file(file: UploadFile = File(...)):
         "table": table,
         "qualified_name": f"analyzer_uploads.{table}",
         "row_count": len(data_rows),
+        "skipped_rows": skipped_rows,
         "columns": columns,
         "sample_query": f"SELECT * FROM {qualified_table} LIMIT 10",
     }

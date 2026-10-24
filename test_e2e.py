@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import sys
 import io
+import os
 import time
 
 import requests
 
 
-BASE_URL = "http://127.0.0.1:8000"
+BASE_URL = os.environ.get("SQL_ANALYZER_BASE_URL", "http://127.0.0.1:8000")
 TIMEOUT_SECONDS = 30
 failures = 0
 
@@ -180,7 +181,7 @@ def run_csv_checks() -> None:
             and list_response.status_code == 200
             and listed_table
             and [(column.get("name"), column.get("type")) for column in columns]
-            == [("id", "INT"), ("select_", "TEXT"), ("col_4_status", "TEXT"), ("created", "DATE"), ("score", "DOUBLE")]
+            == [("id", "INT"), ("select_", "VARCHAR(32)"), ("col_4_status", "VARCHAR(32)"), ("created", "DATE"), ("score", "DOUBLE")]
         )
         report("7. CSV upload creates a separate-schema table with inferred columns and row count", passed)
     except (requests.RequestException, ValueError) as exc:
@@ -257,6 +258,39 @@ def run_csv_checks() -> None:
         if uploaded_table:
             try:
                 requests.delete(f"{BASE_URL}/api/uploads/{uploaded_table}", timeout=TIMEOUT_SECONDS)
+            except requests.RequestException:
+                pass
+
+    explicit_table = "up_test_explicit_name"
+    explicit_table_created = False
+    try:
+        explicit_upload = requests.post(
+            f"{BASE_URL}/api/upload-csv",
+            files={"file": ("explicit.csv", b"city\nPune\nMumbai\n", "text/csv")},
+            data={"table_name": "test_explicit_name"},
+            timeout=TIMEOUT_SECONDS,
+        )
+        explicit_data = explicit_upload.json()
+        explicit_table_created = explicit_upload.status_code == 200 and explicit_data.get("table") == explicit_table
+        city_column = next(
+            (column for column in explicit_data.get("columns", []) if column.get("name") == "city"),
+            {},
+        )
+        passed = (
+            explicit_table_created
+            and explicit_data.get("row_count") == 2
+            and explicit_data.get("skipped_rows") == 0
+            and city_column.get("original_name") == "city"
+            and str(city_column.get("type", "")).startswith("VARCHAR(")
+            and city_column.get("type") != "TEXT"
+        )
+        report("12. Explicit CSV table name is honored and short string columns use VARCHAR", passed)
+    except (requests.RequestException, ValueError) as exc:
+        report("12. Explicit CSV table name is honored and short string columns use VARCHAR", False, str(exc))
+    finally:
+        if explicit_table_created:
+            try:
+                requests.delete(f"{BASE_URL}/api/uploads/{explicit_table}", timeout=TIMEOUT_SECONDS)
             except requests.RequestException:
                 pass
 

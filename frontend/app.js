@@ -42,6 +42,7 @@ const sqlFileInput = document.querySelector("#sql-file-input");
 const csvFileInput = document.querySelector("#csv-file-input");
 const csvTableNameInput = document.querySelector("#csv-table-name");
 const csvDropZone = document.querySelector("#csv-drop-zone");
+const csvDropZoneText = document.querySelector("#csv-drop-zone-text");
 const csvFileName = document.querySelector("#csv-file-name");
 const csvUploadButton = document.querySelector("#btn-upload-csv");
 const csvUploadSpinner = document.querySelector("#csv-upload-spinner");
@@ -1135,6 +1136,7 @@ function selectCsvFile(file) {
     selectedCsvFile = null;
     if (csvFileInput) csvFileInput.value = "";
     if (csvFileName) csvFileName.textContent = "No file selected";
+    if (csvDropZoneText) csvDropZoneText.textContent = "Drop a CSV file here or click to browse";
     if (csvUploadButton) csvUploadButton.disabled = true;
     showCsvBanner("Choose a .csv file.");
     return;
@@ -1143,12 +1145,14 @@ function selectCsvFile(file) {
     selectedCsvFile = null;
     if (csvFileInput) csvFileInput.value = "";
     if (csvFileName) csvFileName.textContent = "No file selected";
+    if (csvDropZoneText) csvDropZoneText.textContent = "Drop a CSV file here or click to browse";
     if (csvUploadButton) csvUploadButton.disabled = true;
     showCsvBanner("CSV files must be 5 MB or smaller.");
     return;
   }
   selectedCsvFile = file;
   if (csvFileName) csvFileName.textContent = file.name;
+  if (csvDropZoneText) csvDropZoneText.textContent = file.name;
   if (csvUploadButton) csvUploadButton.disabled = false;
   clearCsvBanner();
 }
@@ -1174,7 +1178,7 @@ function renderUploadedTables(uploads) {
   if (!tables.length) {
     const empty = document.createElement("p");
     empty.className = "csv-empty-state";
-    empty.textContent = "No uploaded tables yet.";
+    empty.textContent = "No tables uploaded yet.";
     uploadedTableList.append(empty);
     return;
   }
@@ -1209,16 +1213,20 @@ function renderUploadedTables(uploads) {
   }
 }
 
-async function refreshUploadedTables() {
+async function fetchUploads() {
   if (!uploadedTableList) return;
+  const controller = new AbortController();
+  const timeoutId = window.setTimeout(() => controller.abort(), 10000);
   try {
-    const payload = await getJson("/api/uploads");
+    const payload = await getJson("/api/uploads", { signal: controller.signal });
     renderUploadedTables(payload?.uploads);
   } catch (_error) {
     const message = document.createElement("p");
     message.className = "csv-empty-state";
-    message.textContent = "Uploaded tables could not be loaded.";
+    message.textContent = "Failed to load tables.";
     uploadedTableList.replaceChildren(message);
+  } finally {
+    window.clearTimeout(timeoutId);
   }
 }
 
@@ -1241,7 +1249,8 @@ async function submitCsvUpload() {
   if (csvUploadLabel) csvUploadLabel.textContent = "Uploading...";
   const formData = new FormData();
   const tableName = csvTableNameInput?.value.trim().replace(/\.csv$/i, "");
-  formData.append("file", selectedCsvFile, tableName ? `${tableName}.csv` : selectedCsvFile.name);
+  formData.append("file", selectedCsvFile);
+  if (tableName) formData.append("table_name", tableName);
   try {
     const payload = await getJson("/api/upload-csv", { method: "POST", body: formData });
     const table = String(payload?.table || "");
@@ -1255,8 +1264,9 @@ async function submitCsvUpload() {
     selectedCsvFile = null;
     if (csvFileInput) csvFileInput.value = "";
     if (csvFileName) csvFileName.textContent = "No file selected";
+    if (csvDropZoneText) csvDropZoneText.textContent = "Drop a CSV file here or click to browse";
     if (csvTableNameInput) csvTableNameInput.value = "";
-    await refreshUploadedTables();
+    await fetchUploads();
   } catch (error) {
     showCsvBanner(`Upload failed: ${error.message}`);
   } finally {
@@ -1269,7 +1279,6 @@ async function submitCsvUpload() {
 listen("#csv-file-input", "change", () => selectCsvFile(csvFileInput?.files?.[0]));
 listen("#btn-upload-csv", "click", submitCsvUpload);
 listen("#btn-use-sample-query", "click", () => injectUploadQuery(csvSampleQueryButton?.dataset.table));
-csvDropZone?.addEventListener("click", () => csvFileInput?.click());
 csvDropZone?.addEventListener("keydown", (event) => {
   if (event.key === "Enter" || event.key === " ") {
     event.preventDefault();
@@ -1303,7 +1312,7 @@ uploadedTableList?.addEventListener("click", async (event) => {
   try {
     await getJson(`/api/uploads/${encodeURIComponent(table)}`, { method: "DELETE" });
     showCsvBanner(`Deleted ${table}.`, true);
-    await refreshUploadedTables();
+    await fetchUploads();
   } catch (error) {
     showCsvBanner(`Could not delete ${table}: ${error.message}`);
     button.disabled = false;
@@ -1349,7 +1358,7 @@ async function initialize() {
   populateExamples();
   goToStep(1);
   updateQueryCounter();
-  refreshUploadedTables();
+  fetchUploads();
   if (queryInput) queryInput.focus();
 }
 
