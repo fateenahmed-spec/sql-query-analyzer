@@ -179,24 +179,22 @@ function timeLabel(value) {
 
 function flattenTree(node, parentId = null) {
   const elements = [];
-  const warnings = Array.isArray(node.warnings) ? node.warnings : [];
   const operator = String(node.operator || "Operator");
   const operatorName = operator.toLowerCase();
   let nodeColor = { bg: "#f1f5f9", border: "#cbd5e1", text: "#000000" };
   if (operatorName.includes("scan") || operatorName.includes("filter")) {
-    nodeColor = { bg: "#ffe5d9", border: "#ffb703", text: "#000000" };
+    nodeColor = { bg: "#fff3e0", border: "#ffb74d", text: "#000000" };
   } else if (operatorName.includes("join") || operatorName.includes("hash")) {
-    nodeColor = { bg: "#d8f3dc", border: "#52b788", text: "#000000" };
+    nodeColor = { bg: "#e8f5e9", border: "#81c784", text: "#000000" };
   } else if (["sort", "limit", "aggregate", "result"].some((name) => operatorName.includes(name))) {
-    nodeColor = { bg: "#e0fbfc", border: "#00b4d8", text: "#000000" };
+    nodeColor = { bg: "#e3f2fd", border: "#64b5f6", text: "#000000" };
   }
   elements.push({
     data: {
       id: node.id,
-      label: `${operator}\ncost=${node.estimated_cost || "0.0"} rows=${node.estimated_rows || "0"}`,
+      label: `${operator}\ncost=${node.estimated_cost || "0.0"} rows=${node.estimated_rows || "0"}\nactual: ${node.time_total_ms ?? 0}ms`,
       nodeColor,
       self_time_pct: node.self_time_pct,
-      has_warnings: warnings.length > 0,
       never_executed: node.never_executed,
       dead_end: Boolean(node.dead_end),
       operator: node.operator,
@@ -209,9 +207,18 @@ function flattenTree(node, parentId = null) {
     elements.push({
       data: {
         id: `e_${parentId}_${node.id}`,
+        source: node.id,
+        target: parentId,
+      },
+      classes: "plan-edge",
+    });
+    elements.push({
+      data: {
+        id: `layout_${parentId}_${node.id}`,
         source: parentId,
         target: node.id,
       },
+      classes: "layout-edge",
     });
   }
   for (const child of node.children || []) elements.push(...flattenTree(child, node.id));
@@ -273,6 +280,8 @@ function graphStyle() {
         opacity: 0.85,
       },
     },
+    { selector: "edge.path-highlight", style: { width: 3, "line-color": "#2563eb", "target-arrow-color": "#2563eb", opacity: 1 } },
+    { selector: "edge.layout-edge", style: { display: "none" } },
   ];
 }
 
@@ -283,7 +292,7 @@ function closeDrawer() {
 function showNodeDetails(node) {
   setText("#detail-operator", node.operator);
   setText("#detail-details", node.details);
-  setText("#detail-rows", node.rows_total);
+  setText("#detail-rows", node.actual_rows);
   setText("#detail-estimated", node.estimated_rows);
   setText("#detail-loops", node.loops);
   setText("#detail-self-time", timeLabel(node.self_time_ms));
@@ -336,23 +345,48 @@ function buildGraph() {
   cy = cytoscape({
     container: cyContainer,
     elements,
-    layout: { name: "dagre", rankDir: "TB", nodeSep: 45, rankSep: 75, edgeSep: 20 },
+    layout: { name: "preset" },
     style: graphStyle(),
     minZoom: 0.25,
     maxZoom: 2,
     wheelSensitivity: 0.2,
+    userZoomingEnabled: true,
+    userPanningEnabled: true,
   });
   cy.on("tap", "node", (event) => {
     const node = currentPlan && findPlanNode(currentPlan, event.target.id());
     if (node) showNodeDetails(node);
   });
+  cy.on("mouseover", "node", (event) => {
+    cy.edges(".path-highlight").removeClass("path-highlight");
+    let currentNode = event.target;
+    while (currentNode && currentNode.length) {
+      const parentEdge = currentNode.outgoers("edge.plan-edge");
+      if (!parentEdge.length) break;
+      parentEdge.addClass("path-highlight");
+      currentNode = parentEdge.target();
+    }
+  });
+  cy.on("mouseout", "node", () => {
+    cy.edges(".path-highlight").removeClass("path-highlight");
+  });
   cy.on("tap", (event) => {
     if (event.target === cy) closeDrawer();
   });
-  cy.ready(() => {
+
+  const dagreLayout = cy.nodes().union(cy.edges(".layout-edge")).layout({
+    name: "dagre",
+    rankDir: "TB",
+    nodeSep: 45,
+    rankSep: 75,
+    edgeSep: 20,
+  });
+  dagreLayout.one("layoutstop", () => {
+    cy.edges(".layout-edge").remove();
     cy.resize();
     cy.fit(undefined, 42);
   });
+  dagreLayout.run();
 }
 
 function showGraphMessage(message) {
