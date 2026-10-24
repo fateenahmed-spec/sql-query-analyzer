@@ -210,7 +210,6 @@ function cleanPredicate(text) {
   };
 
   while (isWrappedByOnePair(cleaned)) cleaned = cleaned.slice(1, -1).trim();
-  if (cleaned.length > 50) cleaned = `${cleaned.slice(0, 47).trimEnd()}...`;
   return cleaned;
 }
 
@@ -221,12 +220,16 @@ function flattenTree(node, parentId = null) {
   const details = cleanPredicate(node.details);
   const rows = node.rows_total ?? 0;
   const totalTime = node.time_total_ms ?? node.self_time_ms ?? 0;
+  const isHotspot = warnings.length > 0 || Number(node.self_time_pct || 0) > 40;
   elements.push({
     data: {
       id: node.id,
-      label: `${operator}\n${details}\nRows: ${rows} | Time: ${totalTime}ms`,
+      label: details
+        ? `${operator}\n${details}\nRows: ${rows} | Time: ${totalTime}ms`
+        : `${operator}\nRows: ${rows} | Time: ${totalTime}ms`,
       self_time_pct: node.self_time_pct,
       has_warnings: warnings.length > 0,
+      hotspot: isHotspot,
       never_executed: node.never_executed,
       dead_end: Boolean(node.dead_end),
       operator: node.operator,
@@ -267,15 +270,10 @@ function graphStyle() {
       selector: "node",
       style: {
         label: "data(label)",
-        color: (element) => {
-          const percentage = Number(element.data("self_time_pct") || 0);
-          const isHotspot = percentage >= 40 || Boolean(element.data("has_warnings"));
-          if (lightTheme && isHotspot) return "#991b1b";
-          return lightTheme ? "#0f172a" : "#ededed";
-        },
-        "font-size": "11px",
+        color: lightTheme ? "#0f172a" : "#ededed",
+        "font-size": "13px",
         "font-weight": 600,
-        "font-family": "ui-monospace, SFMono-Regular, Menlo, monospace",
+        "font-family": "Inter, system-ui, sans-serif",
         "text-valign": "center",
         "text-halign": "center",
         "text-wrap": "wrap",
@@ -284,42 +282,28 @@ function graphStyle() {
         height: "label",
         padding: "16px",
         shape: "round-rectangle",
-        "background-color": (element) => {
-          const percentage = Number(element.data("self_time_pct") || 0);
-          const isHotspot = percentage >= 40 || Boolean(element.data("has_warnings"));
-          if (isHotspot) return lightTheme ? "#fee2e2" : "#7f1d1d";
-          if (lightTheme) {
-            return "#ffffff";
-          }
-          if (percentage >= 20) return "#7c2d12";
-          return "#171717";
-        },
+        "background-color": lightTheme ? "#ffffff" : "#171717",
         "border-width": lightTheme ? 2 : 1,
-        "border-color": (element) => {
-          const percentage = Number(element.data("self_time_pct") || 0);
-          const isHotspot = percentage >= 40 || Boolean(element.data("has_warnings"));
-          if (lightTheme && isHotspot) return "#ef4444";
-          return lightTheme ? "#94a3b8" : "#3b82f6";
-        },
+        "border-color": lightTheme ? "#cbd5e1" : "#3b82f6",
         opacity: 1,
         "overlay-opacity": 0,
       },
     },
-    { selector: "node[has_warnings = true]", style: { "border-width": 3, "border-color": "#ef4444", color: lightTheme ? "#991b1b" : "#ededed", "background-color": lightTheme ? "#fee2e2" : "#7f1d1d" } },
     { selector: "node[never_executed = true]", style: { opacity: 0.5, "border-style": "dashed" } },
-    { selector: "node[dead_end = true]", style: { "border-width": 3, "border-color": (element) => lightTheme && (Number(element.data("self_time_pct") || 0) >= 40 || Boolean(element.data("has_warnings"))) ? "#ef4444" : "#c084fc", "border-style": "dashed" } },
-    { selector: "node.error-node", style: { label: "data(label)", color: lightTheme ? "#991b1b" : "#ededed", "background-color": lightTheme ? "#fee2e2" : "#7f1d1d", "border-color": "#ef4444", "border-width": 3, "text-wrap": "wrap" } },
-    { selector: "node.current-node", style: { "border-color": (element) => lightTheme && (Number(element.data("self_time_pct") || 0) >= 40 || Boolean(element.data("has_warnings"))) ? "#ef4444" : "#fbbf24", "border-width": "5px" } },
-    { selector: "node:selected", style: { "border-color": (element) => lightTheme && (Number(element.data("self_time_pct") || 0) >= 40 || Boolean(element.data("has_warnings"))) ? "#ef4444" : lightTheme ? "#2563eb" : "#3b82f6", "border-width": 3 } },
+    { selector: "node[dead_end = true]", style: { "border-width": 3, "border-color": "#c084fc", "border-style": "dashed" } },
+    { selector: "node.error-node", style: { label: "data(label)", "border-width": 3, "text-wrap": "wrap" } },
+    { selector: "node.current-node", style: { "border-color": "#fbbf24", "border-width": "5px" } },
+    { selector: "node:selected", style: { "border-color": lightTheme ? "#2563eb" : "#3b82f6", "border-width": 3 } },
+    { selector: "node[hotspot = true]", style: { "background-color": lightTheme ? "#fee2e2" : "#7f1d1d", "border-color": "#ef4444", "border-width": 3, color: lightTheme ? "#991b1b" : "#ededed" } },
     {
       selector: "edge",
       style: {
-        width: "mapData(rows_total, 0, 10000, 2, 8)",
+        width: 2,
         "curve-style": "bezier",
-        "line-color": lightTheme ? "#64748b" : "#3b82f6",
-        "source-arrow-shape": "triangle",
-        "source-arrow-color": lightTheme ? "#64748b" : "#3b82f6",
-        "target-arrow-shape": "none",
+        "line-color": "#94a3b8",
+        "source-arrow-shape": "none",
+        "target-arrow-shape": "triangle",
+        "target-arrow-color": "#94a3b8",
         "target-distance-from-node": 4,
         "source-distance-from-node": 4,
         opacity: 0.85,
