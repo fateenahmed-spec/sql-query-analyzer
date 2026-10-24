@@ -1,4 +1,4 @@
-"""Live MySQL and Gemini smoke checks. Run separately from pytest."""
+﻿"""Live MySQL and Gemini smoke checks. Run separately from pytest."""
 
 from __future__ import annotations
 
@@ -15,8 +15,8 @@ failures = 0
 
 def report(label: str, passed: bool, detail: str = "") -> None:
     global failures
-    marker = "✅" if passed else "❌"
-    suffix = f" — {detail}" if detail else ""
+    marker = "âœ…" if passed else "âŒ"
+    suffix = f" â€” {detail}" if detail else ""
     print(f"{marker} {label}{suffix}")
     if not passed:
         failures += 1
@@ -36,10 +36,10 @@ def main() -> int:
         if health.status_code != 200:
             raise requests.RequestException(f"health endpoint returned {health.status_code}")
     except requests.RequestException:
-        print("❌ Server is not reachable. Start it with: uvicorn main:app --reload")
+        print("âŒ Server is not reachable. Start it with: uvicorn main:app --reload")
         return 1
 
-    query = "SELECT id, name FROM customers WHERE city = 'Mumbai' LIMIT 5"
+    query = "SELECT id, name FROM customers WHERE city = 'Pune' LIMIT 5"
     first_response = None
     first_data = None
     try:
@@ -105,7 +105,7 @@ def main() -> int:
             word in str(ai_first.get("note", "")).casefold() for word in ("429", "quota", "rate-limit", "rate limit")
         ):
             report("5. Gemini returns a real explanation", False, "Gemini rate-limited or quota exhausted")
-            print("⚠ Gemini rate-limited, wait 60s and rerun")
+            print("âš  Gemini rate-limited, wait 60s and rerun")
             return 1
         passed = (
             ai_response.status_code == 200
@@ -135,9 +135,9 @@ def main() -> int:
         report("6. AI response for a MySQL error includes a suggested fix", False, str(exc))
 
     if failures:
-        print(f"❌ E2E TEST FAILED: {failures} check(s) failed.")
+        print(f"âŒ E2E TEST FAILED: {failures} check(s) failed.")
         return 1
-    print("✅ E2E TEST PASSED: Live DB and real Gemini AI are fully functional.")
+    print("âœ… E2E TEST PASSED: Live DB and real Gemini AI are fully functional.")
     return 0
 
 
