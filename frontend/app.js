@@ -180,10 +180,22 @@ function timeLabel(value) {
 function flattenTree(node, parentId = null) {
   const elements = [];
   const warnings = Array.isArray(node.warnings) ? node.warnings : [];
+  const operator = String(node.operator || "Operator");
+  const details = String(node.details || "").trim();
+  let description = operator;
+  if (operator.toLowerCase() === "filter") {
+    description = details ? `Filter: ${details}` : "Filter";
+  } else if (operator.toLowerCase() === "table scan") {
+    description = details ? `Table scan: ${details}` : "Table scan";
+  } else if (details) {
+    description = `${operator}: ${details}`;
+  }
+  const rows = node.rows_total ?? 0;
+  const totalTime = node.time_total_ms ?? node.self_time_ms ?? 0;
   elements.push({
     data: {
       id: node.id,
-      label: `${node.operator || "Operator"}\n${node.rows_total ?? 0} rows`,
+      label: `${description}\n${rows} rows, ${totalTime}ms`,
       self_time_pct: node.self_time_pct,
       has_warnings: warnings.length > 0,
       never_executed: node.never_executed,
@@ -191,6 +203,7 @@ function flattenTree(node, parentId = null) {
       operator: node.operator,
       details: node.details,
       rows_total: node.rows_total,
+      time_total_ms: node.time_total_ms,
     },
   });
   if (parentId !== null) {
@@ -228,46 +241,46 @@ function graphStyle() {
         color: lightTheme ? "#0f172a" : "#ededed",
         "font-size": 11,
         "font-weight": 600,
-        "font-family": "system-ui, sans-serif",
+        "font-family": "monospace",
         "text-valign": "center",
         "text-halign": "center",
         "text-wrap": "wrap",
-        "text-max-width": 170,
-        width: 190,
-        height: 66,
-        padding: 8,
+        "text-max-width": 200,
+        width: "label",
+        height: "label",
+        padding: "12px",
         shape: "round-rectangle",
         "background-color": (element) => {
           const percentage = Number(element.data("self_time_pct") || 0);
+          const isHotspot = percentage >= 40 || Boolean(element.data("has_warnings"));
+          if (isHotspot) return lightTheme ? "#fecaca" : "#7f1d1d";
           if (lightTheme) {
-            if (percentage >= 40) return "#fee2e2";
             if (percentage >= 20) return "#ffedd5";
-            return "#e2e8f0";
+            return "#f8fafc";
           }
-          if (percentage >= 40) return "#7f1d1d";
           if (percentage >= 20) return "#7c2d12";
-          return "#262626";
+          return "#171717";
         },
         "border-width": 1,
-        "border-color": lightTheme ? "#94a3b8" : "#525252",
+        "border-color": lightTheme ? "#2563eb" : "#3b82f6",
         opacity: 1,
         "overlay-opacity": 0,
       },
     },
-    { selector: "node[has_warnings = true]", style: { "border-width": 3, "border-color": "#ef4444" } },
+    { selector: "node[has_warnings = true]", style: { "border-width": 3, "border-color": lightTheme ? "#dc2626" : "#ef4444" } },
     { selector: "node[never_executed = true]", style: { opacity: 0.5, "border-style": "dashed" } },
     { selector: "node[dead_end = true]", style: { "border-width": 3, "border-color": "#c084fc", "border-style": "dashed" } },
     { selector: "node.error-node", style: { label: "data(label)", "background-color": lightTheme ? "#fee2e2" : "#7f1d1d", "border-color": "#ef4444", "border-width": 3, width: 300, height: 100, "text-wrap": "wrap", "text-max-width": 260 } },
     { selector: "node.current-node", style: { "border-color": "#fbbf24", "border-width": "5px" } },
-    { selector: "node:selected", style: { "border-color": "#3b82f6", "border-width": 3 } },
+    { selector: "node:selected", style: { "border-color": lightTheme ? "#2563eb" : "#3b82f6", "border-width": 3 } },
     {
       selector: "edge",
       style: {
         width: "mapData(rows_total, 0, 10000, 2, 8)",
         "curve-style": "bezier",
-        "line-color": lightTheme ? "#94a3b8" : "#52525b",
+        "line-color": lightTheme ? "#2563eb" : "#3b82f6",
         "source-arrow-shape": "triangle",
-        "source-arrow-color": lightTheme ? "#94a3b8" : "#52525b",
+        "source-arrow-color": lightTheme ? "#2563eb" : "#3b82f6",
         "target-arrow-shape": "none",
         "target-distance-from-node": 4,
         "source-distance-from-node": 4,
