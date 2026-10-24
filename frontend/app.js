@@ -177,25 +177,54 @@ function timeLabel(value) {
   return `${Number(value).toFixed(2)} ms`;
 }
 
+function cleanPredicate(text) {
+  let cleaned = String(text || "")
+    .trim()
+    .replace(/(?<![\w.$'"])(?:`?[A-Za-z_][\w$]*`?\s*\.\s*)+`?([A-Za-z_][\w$]*)`?/g, "$1")
+    .replace(/\s+/g, " ");
+
+  const isWrappedByOnePair = (value) => {
+    if (value.length < 2 || value[0] !== "(" || value[value.length - 1] !== ")") return false;
+    let depth = 0;
+    let quote = "";
+    let escaped = false;
+    for (let index = 0; index < value.length; index += 1) {
+      const character = value[index];
+      if (quote) {
+        if (escaped) escaped = false;
+        else if (character === "\\") escaped = true;
+        else if (character === quote) {
+          if (value[index + 1] === quote) index += 1;
+          else quote = "";
+        }
+        continue;
+      }
+      if (character === "'" || character === '"' || character === "`") quote = character;
+      else if (character === "(") depth += 1;
+      else if (character === ")") {
+        depth -= 1;
+        if (depth === 0 && index < value.length - 1) return false;
+      }
+    }
+    return depth === 0;
+  };
+
+  while (isWrappedByOnePair(cleaned)) cleaned = cleaned.slice(1, -1).trim();
+  if (cleaned.length > 50) cleaned = `${cleaned.slice(0, 47).trimEnd()}...`;
+  return cleaned;
+}
+
 function flattenTree(node, parentId = null) {
   const elements = [];
   const warnings = Array.isArray(node.warnings) ? node.warnings : [];
   const operator = String(node.operator || "Operator");
-  const details = String(node.details || "").trim();
-  let description = operator;
-  if (operator.toLowerCase() === "filter") {
-    description = details ? `Filter: ${details}` : "Filter";
-  } else if (operator.toLowerCase() === "table scan") {
-    description = details ? `Table scan: ${details}` : "Table scan";
-  } else if (details) {
-    description = `${operator}: ${details}`;
-  }
+  const details = cleanPredicate(node.details);
   const rows = node.rows_total ?? 0;
   const totalTime = node.time_total_ms ?? node.self_time_ms ?? 0;
   elements.push({
     data: {
       id: node.id,
-      label: `${description}\n${rows} rows, ${totalTime}ms`,
+      label: `${operator}\n${details}\nRows: ${rows} | Time: ${totalTime}ms`,
       self_time_pct: node.self_time_pct,
       has_warnings: warnings.length > 0,
       never_executed: node.never_executed,
@@ -238,49 +267,58 @@ function graphStyle() {
       selector: "node",
       style: {
         label: "data(label)",
-        color: lightTheme ? "#0f172a" : "#ededed",
-        "font-size": 11,
+        color: (element) => {
+          const percentage = Number(element.data("self_time_pct") || 0);
+          const isHotspot = percentage >= 40 || Boolean(element.data("has_warnings"));
+          if (lightTheme && isHotspot) return "#991b1b";
+          return lightTheme ? "#0f172a" : "#ededed";
+        },
+        "font-size": "11px",
         "font-weight": 600,
-        "font-family": "monospace",
+        "font-family": "ui-monospace, SFMono-Regular, Menlo, monospace",
         "text-valign": "center",
         "text-halign": "center",
         "text-wrap": "wrap",
-        "text-max-width": 200,
+        "text-max-width": "180px",
         width: "label",
         height: "label",
-        padding: "12px",
+        padding: "16px",
         shape: "round-rectangle",
         "background-color": (element) => {
           const percentage = Number(element.data("self_time_pct") || 0);
           const isHotspot = percentage >= 40 || Boolean(element.data("has_warnings"));
-          if (isHotspot) return lightTheme ? "#fecaca" : "#7f1d1d";
+          if (isHotspot) return lightTheme ? "#fee2e2" : "#7f1d1d";
           if (lightTheme) {
-            if (percentage >= 20) return "#ffedd5";
-            return "#f8fafc";
+            return "#ffffff";
           }
           if (percentage >= 20) return "#7c2d12";
           return "#171717";
         },
-        "border-width": 1,
-        "border-color": lightTheme ? "#2563eb" : "#3b82f6",
+        "border-width": lightTheme ? 2 : 1,
+        "border-color": (element) => {
+          const percentage = Number(element.data("self_time_pct") || 0);
+          const isHotspot = percentage >= 40 || Boolean(element.data("has_warnings"));
+          if (lightTheme && isHotspot) return "#ef4444";
+          return lightTheme ? "#94a3b8" : "#3b82f6";
+        },
         opacity: 1,
         "overlay-opacity": 0,
       },
     },
-    { selector: "node[has_warnings = true]", style: { "border-width": 3, "border-color": lightTheme ? "#dc2626" : "#ef4444" } },
+    { selector: "node[has_warnings = true]", style: { "border-width": 3, "border-color": "#ef4444", color: lightTheme ? "#991b1b" : "#ededed", "background-color": lightTheme ? "#fee2e2" : "#7f1d1d" } },
     { selector: "node[never_executed = true]", style: { opacity: 0.5, "border-style": "dashed" } },
-    { selector: "node[dead_end = true]", style: { "border-width": 3, "border-color": "#c084fc", "border-style": "dashed" } },
-    { selector: "node.error-node", style: { label: "data(label)", "background-color": lightTheme ? "#fee2e2" : "#7f1d1d", "border-color": "#ef4444", "border-width": 3, width: 300, height: 100, "text-wrap": "wrap", "text-max-width": 260 } },
-    { selector: "node.current-node", style: { "border-color": "#fbbf24", "border-width": "5px" } },
-    { selector: "node:selected", style: { "border-color": lightTheme ? "#2563eb" : "#3b82f6", "border-width": 3 } },
+    { selector: "node[dead_end = true]", style: { "border-width": 3, "border-color": (element) => lightTheme && (Number(element.data("self_time_pct") || 0) >= 40 || Boolean(element.data("has_warnings"))) ? "#ef4444" : "#c084fc", "border-style": "dashed" } },
+    { selector: "node.error-node", style: { label: "data(label)", color: lightTheme ? "#991b1b" : "#ededed", "background-color": lightTheme ? "#fee2e2" : "#7f1d1d", "border-color": "#ef4444", "border-width": 3, "text-wrap": "wrap" } },
+    { selector: "node.current-node", style: { "border-color": (element) => lightTheme && (Number(element.data("self_time_pct") || 0) >= 40 || Boolean(element.data("has_warnings"))) ? "#ef4444" : "#fbbf24", "border-width": "5px" } },
+    { selector: "node:selected", style: { "border-color": (element) => lightTheme && (Number(element.data("self_time_pct") || 0) >= 40 || Boolean(element.data("has_warnings"))) ? "#ef4444" : lightTheme ? "#2563eb" : "#3b82f6", "border-width": 3 } },
     {
       selector: "edge",
       style: {
         width: "mapData(rows_total, 0, 10000, 2, 8)",
         "curve-style": "bezier",
-        "line-color": lightTheme ? "#2563eb" : "#3b82f6",
+        "line-color": lightTheme ? "#64748b" : "#3b82f6",
         "source-arrow-shape": "triangle",
-        "source-arrow-color": lightTheme ? "#2563eb" : "#3b82f6",
+        "source-arrow-color": lightTheme ? "#64748b" : "#3b82f6",
         "target-arrow-shape": "none",
         "target-distance-from-node": 4,
         "source-distance-from-node": 4,
