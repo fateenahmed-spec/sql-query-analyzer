@@ -456,24 +456,31 @@ function flowInputRids(step) {
   return step.op === "scan" ? (step.output_rids || []) : (step.input_rids || []);
 }
 
-function renderFlowRows(container, title, rids, states = {}, badge = "") {
-  container.replaceChildren();
+function renderFlowRows(container, title, rids, states = {}, badge = "", options = {}) {
+  if (!options.append) container.replaceChildren();
   if (!rids.length) {
-    appendEmpty(container, noSampleRowsMessage);
+    const empty = document.createElement("p");
+    empty.className = "empty-state";
+    empty.textContent = options.emptyMessage || noSampleRowsMessage;
+    container.append(empty);
     return;
   }
 
   const records = globalData?.row_records || {};
   const rows = rids.map((rid) => ({ rid, record: records[rid] })).filter((entry) => entry.record);
   if (!rows.length) {
-    appendEmpty(container, noSampleRowsMessage);
+    const empty = document.createElement("p");
+    empty.className = "empty-state";
+    empty.textContent = options.emptyMessage || noSampleRowsMessage;
+    container.append(empty);
     return;
   }
 
   const card = document.createElement("article");
-  card.className = "table-card";
+  card.className = `table-card${options.className ? ` ${options.className}` : ""}`;
   const tableName = rows[0].record.table || "Sample rows";
   card.dataset.tableName = tableName;
+  card.dataset.alias = String(options.alias || rows[0].record.alias || "");
   const heading = document.createElement("h3");
   const name = document.createElement("span");
   name.textContent = title;
@@ -527,7 +534,8 @@ function renderFlowRows(container, title, rids, states = {}, badge = "") {
     row.append(stateCell);
     const ridCell = document.createElement("span");
     ridCell.className = "flow-cell-rid";
-    ridCell.textContent = entry.rid;
+    ridCell.textContent = entry.record.display_id || entry.rid;
+    ridCell.title = entry.rid;
     row.append(ridCell);
     for (const column of columns) {
       const cell = document.createElement("span");
@@ -565,6 +573,153 @@ function currentIntermediateRids(step) {
   return input.filter((rid) => processed.has(rid) && output.has(rid));
 }
 
+function sourceScanGroups() {
+  const groups = [];
+  const byAlias = new Map();
+  const records = globalData?.row_records || {};
+  animSteps.forEach((step, scanIndex) => {
+    if (step.op !== "scan") return;
+    const rids = (step.output_rids || []).filter((rid) => records[rid]);
+    const rowRecord = records[rids[0]] || Object.values(step.row_data || {})[0] || null;
+    if (!rowRecord) return;
+    const alias = String(rowRecord.alias || rowRecord.table || `table_${groups.length + 1}`);
+    const key = alias.toLowerCase();
+    let group = byAlias.get(key);
+    if (!group) {
+      group = { alias, table: rowRecord.table || alias, rids: [], scanIndex, scanStep: step };
+      byAlias.set(key, group);
+      groups.push(group);
+    }
+    group.rids.push(...rids.filter((rid) => !group.rids.includes(rid)));
+  });
+  return groups;
+}
+
+function joinEqualityPredicates() {
+  const query = String(globalData?.query || "");
+  const clauses = [...query.matchAll(/\bon\b([\s\S]*?)(?=\b(?:(?:left|right|inner|full|cross|natural)\s+)?join\b|\bwhere\b|\bgroup\s+by\b|\border\s+by\b|\bhaving\b|\blimit\b|;|$)/gi)];
+  const predicates = [];
+  const qualifiedEquality = /((?:`?[\w$]+`?\s*\.\s*)+`?[\w$]+`?)\s*=\s*((?:`?[\w$]+`?\s*\.\s*)+`?[\w$]+`?)/gi;
+  for (const clause of clauses) {
+    for (const match of clause[1].matchAll(qualifiedEquality)) {
+      const parseColumn = (reference) => {
+        const parts = reference.replace(/`/g, "").split(".").map((part) => part.trim());
+        if (parts.length < 2) return null;
+        return { alias: parts[parts.length - 2].toLowerCase(), column: parts[parts.length - 1] };
+      };
+      const left = parseColumn(match[1]);
+      const right = parseColumn(match[2]);
+      if (left && right) predicates.push({ left, right });
+    }
+  }
+  if (!predicates.length) {
+    const groups = sourceScanGroups();
+    const usingClauses = [...query.matchAll(/\busing\s*\(([^)]+)\)/gi)];
+    if (groups.length === 2) {
+      for (const usingClause of usingClauses) {
+        for (const column of usingClause[1].split(",").map((item) => item.trim().replace(/`/g, "")).filter(Boolean)) {
+          predicates.push({
+            left: { alias: groups[0].alias.toLowerCase(), column },
+            right: { alias: groups[1].alias.toLowerCase(), column },
+          });
+        }
+      }
+    }
+  }
+  return predicates;
+}
+
+function joinValuesEqual(left, right) {
+  if (left === null || left === undefined || right === null || right === undefined) return false;
+  if (typeof left === "number" || typeof right === "number") {
+    if (String(left).trim() !== "" && String(right).trim() !== "" && Number.isFinite(Number(left)) && Number.isFinite(Number(right))) {
+      return Number(left) === Number(right);
+    }
+    return false;
+  }
+  return String(left).trim().toLocaleLowerCase() === String(right).trim().toLocaleLowerCase();
+}
+
+function currentJoinComparison(step) {
+  if (!step || currentIndex !== animSteps.indexOf(step) || currentRowIndex < 0) return null;
+  const rid = flowInputRids(step)[currentRowIndex];
+  const currentRecord = (globalData?.row_records || {})[rid];
+  if (!currentRecord) return null;
+  const groups = sourceScanGroups();
+  const currentAlias = String(currentRecord.alias || currentRecord.table || "").toLowerCase();
+  const predicates = joinEqualityPredicates();
+  const matchesByAlias = new Map();
+  const reasons = [];
+  let comparable = false;
+
+  for (const group of groups) {
+    const candidateAlias = String(group.alias).toLowerCase();
+    if (candidateAlias === currentAlias) continue;
+    const conditions = predicates.filter(({ left, right }) =>
+      (left.alias === currentAlias && right.alias === candidateAlias)
+      || (right.alias === currentAlias && left.alias === candidateAlias));
+    if (!conditions.length) continue;
+    comparable = true;
+    const matchingRids = group.rids.filter((candidateRid) => {
+      const candidate = globalData.row_records[candidateRid];
+      return conditions.every(({ left, right }) => {
+        const currentColumn = left.alias === currentAlias ? left.column : right.column;
+        const candidateColumn = left.alias === candidateAlias ? left.column : right.column;
+        const currentKey = Object.keys(currentRecord.values || {}).find((key) => key.toLowerCase() === currentColumn.toLowerCase());
+        const candidateKey = Object.keys(candidate?.values || {}).find((key) => key.toLowerCase() === candidateColumn.toLowerCase());
+        return currentKey && candidateKey && joinValuesEqual(currentRecord.values[currentKey], candidate.values[candidateKey]);
+      });
+    });
+    matchesByAlias.set(candidateAlias, matchingRids);
+    reasons.push(...conditions.map(({ left, right }) => `${left.alias}.${left.column} = ${right.alias}.${right.column}`));
+  }
+
+  const matchingRids = [...matchesByAlias.values()].flat();
+  return {
+    rid,
+    currentRecord,
+    currentAlias,
+    groups,
+    matchesByAlias,
+    matchingRids,
+    matched: matchingRids.length > 0,
+    evaluable: comparable,
+    condition: [...new Set(reasons)].join(" AND "),
+  };
+}
+
+function joinStatesForGroup(group, comparison) {
+  const states = {};
+  if (comparison) {
+    if (!comparison.evaluable) {
+      if (group.alias.toLowerCase() === comparison.currentAlias) states[comparison.rid] = "row-active";
+      return states;
+    }
+    const isCurrent = group.alias.toLowerCase() === comparison.currentAlias;
+    const matches = comparison.matchesByAlias.get(group.alias.toLowerCase()) || [];
+    if (isCurrent) {
+      for (const rid of group.rids) states[rid] = rid === comparison.rid
+        ? `row-active ${comparison.matched ? "row-pass row-move" : "row-fail"}`
+        : "row-dim";
+    } else {
+      for (const rid of group.rids) states[rid] = matches.includes(rid)
+        ? "row-active row-pass row-move"
+        : "row-dim";
+    }
+    return states;
+  }
+
+  if (currentIndex >= group.scanIndex) {
+    for (const rid of group.rids) states[rid] = "row-pass";
+  }
+  const currentStep = currentIndex >= 0 ? animSteps[currentIndex] : null;
+  if (currentStep) {
+    const currentStates = currentStepStates(currentStep);
+    for (const rid of group.rids) if (currentStates[rid]) states[rid] = currentStates[rid];
+  }
+  return states;
+}
+
 function renderSourceTables() {
   const container = document.querySelector("#source-tables");
   const step = currentIndex >= 0 ? animSteps[currentIndex] : animSteps[0];
@@ -572,8 +727,38 @@ function renderSourceTables() {
     appendEmpty(container, demoOffline ? "Offline plans have no live rows to animate." : "No real row sample was returned.");
     return;
   }
-  const title = step.op === "scan" ? `Source scan - ${step.label}` : `Input rows - ${step.label}`;
+
+  const groups = sourceScanGroups();
+  const showJoinSources = /\bjoin\b/i.test(String(globalData?.query || "")) && groups.length > 1;
+  if (showJoinSources) {
+    container.replaceChildren();
+    const comparison = step.op === "join" ? currentJoinComparison(step) : null;
+    groups.forEach((group, index) => {
+      if (index > 0) {
+        const badge = document.createElement("div");
+        badge.className = "join-source-badge";
+        badge.textContent = "JOIN";
+        container.append(badge);
+      }
+      const tableAlias = group.alias ? ` (${group.alias})` : "";
+      const title = `Table ${String.fromCharCode(65 + index)}: ${group.table}${tableAlias}`;
+      const sourceClass = index === 0 ? "table-source-a" : "table-source-b";
+      renderFlowRows(container, title, group.rids, joinStatesForGroup(group, comparison), "", {
+        append: true,
+        className: sourceClass,
+        alias: group.alias,
+        emptyMessage: `${noSampleRowsMessage} Source ${group.alias} has no sampled rows.`,
+      });
+    });
+    return;
+  }
+
   const rids = flowInputRids(step);
+  const firstRecord = (globalData?.row_records || {})[rids[0]];
+  const sourceAlias = firstRecord?.alias ? ` (${firstRecord.alias})` : "";
+  const title = firstRecord?.table
+    ? `Source table: ${firstRecord.table}${sourceAlias}`
+    : step.op === "scan" ? `Source scan - ${step.label}` : `Input rows - ${step.label}`;
   if (!rids.length && !step.never_executed) {
     appendEmpty(container, `${noSampleRowsMessage} Full run reported ${formattedCount(step.actual_rows)} rows.`);
     return;
@@ -584,6 +769,10 @@ function renderSourceTables() {
 function renderIntermediateStats() {
   const container = document.querySelector("#intermediate-table");
   const step = currentIndex >= 0 ? animSteps[currentIndex] : null;
+  if (step?.op === "join") {
+    renderJoinIntermediate(container, step);
+    return;
+  }
   if (step && !step.never_executed && !flowInputRids(step).length) {
     appendEmpty(container, `${noSampleRowsMessage} Full run reported ${formattedCount(step.actual_rows)} rows.`);
     return;
@@ -612,6 +801,60 @@ function renderIntermediateStats() {
 
   const badge = step.evaluable ? "" : "Scaled from plan counts";
   renderFlowRows(container, `Output rows - ${step.label}`, currentIntermediateRids(step), {}, badge);
+}
+
+function renderJoinIntermediate(container, step) {
+  const comparison = currentJoinComparison(step);
+  if (!comparison) {
+    appendEmpty(container, step.never_executed
+      ? "JOIN did not run because an upstream input returned 0 rows."
+      : "Select a join sample row to compare the two inputs.");
+    return;
+  }
+  if (!comparison.evaluable) {
+    appendEmpty(container, `Could not evaluate the JOIN condition for ${comparison.currentAlias}: ${step.note || "no supported alias equality was found in the query."}`);
+    return;
+  }
+  if (!comparison.matched) {
+    const rowNumber = String(comparison.rid).match(/#(\d+)$/)?.[1] || "?";
+    appendEmpty(container, `No matching row for ${comparison.currentAlias}#${rowNumber} on ${comparison.condition}. The input row is marked red.`);
+    return;
+  }
+
+  const records = globalData.row_records;
+  const currentGroupIndex = comparison.groups.findIndex((group) => group.alias.toLowerCase() === comparison.currentAlias);
+  const partners = [];
+  for (const group of comparison.groups) {
+    const partnerRids = comparison.matchesByAlias.get(group.alias.toLowerCase()) || [];
+    for (const rid of partnerRids) partners.push({ group, rid, record: records[rid] });
+  }
+  container.replaceChildren();
+  partners.forEach((partner, index) => {
+    const sides = [
+      { alias: comparison.currentAlias, rid: comparison.rid, record: comparison.currentRecord, groupIndex: currentGroupIndex },
+      { alias: partner.group.alias, rid: partner.rid, record: partner.record, groupIndex: comparison.groups.indexOf(partner.group) },
+    ].sort((left, right) => left.groupIndex - right.groupIndex);
+    const values = {};
+    for (const side of sides) {
+      for (const [column, value] of Object.entries(side.record.values || {})) {
+        values[`${side.alias}.${column}`] = value;
+      }
+    }
+    const rowId = `__ui_join_${String(step.node_id || "join").replace(/[^\w-]/g, "_")}_${animationEventIndex}_${index}`;
+    records[rowId] = {
+      table: "Joined rows",
+      alias: sides.map((side) => side.alias).join("+"),
+      display_id: sides.map((side) => {
+        const number = String(side.rid).match(/#(\d+)$/)?.[1] || "?";
+        return `${side.alias}#${number}`;
+      }).join(" + "),
+      values,
+    };
+    renderFlowRows(container, `Joined pair - ${sides.map((side) => side.alias).join(" + ")}`, [rowId], {
+      [rowId]: "row-active row-pass row-move",
+    }, "Matched by JOIN condition", { append: index > 0 });
+    delete records[rowId];
+  });
 }
 
 function lastEventForStep(stepIndex) {
@@ -1076,7 +1319,10 @@ function updateGraphVisuals() {
     if (step.op === "scan") {
       const record = (globalData?.row_records || {})[flowInputRids(step)[0]];
       for (const card of sourceCards) {
-        if (record?.table && card.dataset.tableName === record.table) card.classList.add("is-scanning");
+        const sameAlias = record?.alias && card.dataset.alias
+          ? card.dataset.alias.toLowerCase() === String(record.alias).toLowerCase()
+          : card.dataset.tableName === record?.table;
+        if (record && sameAlias) card.classList.add("is-scanning");
       }
     }
     if (flowEvaluationBadge) {
@@ -1133,7 +1379,17 @@ function applyAnimationEvent(eventIndex, writeLog = true) {
   const rid = eventRowIds(step)[event.rowIndex];
   const passed = step.row_results?.[rid] ?? (step.output_rids || []).includes(rid);
   if (writeLog) {
-    if (step.op === "filter") {
+    if (step.op === "join") {
+      const comparison = currentJoinComparison(step);
+      if (comparison?.evaluable) {
+        const rowNumber = String(comparison.rid).match(/#(\d+)$/)?.[1] || "?";
+        appendProcessLog(comparison.matched
+          ? `JOIN matched ${comparison.currentAlias}#${rowNumber} on ${comparison.condition}.`
+          : `JOIN found no match for ${comparison.currentAlias}#${rowNumber} on ${comparison.condition}.`);
+      } else {
+        appendProcessLog(`${step.label}: ${step.note || "JOIN matching could not be inferred from the query."}`);
+      }
+    } else if (step.op === "filter") {
       appendProcessLog(`Filter ${step.condition || step.label}: ${rid} ${passed ? "passed" : "failed"}.`);
     } else if (step.op === "limit") {
       appendProcessLog(`Limit: ${rid} ${passed ? "retained" : "cut from"} the sample.`);
