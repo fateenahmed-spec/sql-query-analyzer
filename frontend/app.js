@@ -463,7 +463,7 @@ function renderFlowRows(container, title, rids, states = {}, badge = "") {
     card.append(badgeNode);
   }
 
-  const columns = [...new Set(rows.flatMap((entry) => Object.keys(entry.record.values || {})))];
+  const columns = Object.keys(rows[0].record.values || {});
   const grid = document.createElement("div");
   grid.className = "row-grid";
   const header = document.createElement("div");

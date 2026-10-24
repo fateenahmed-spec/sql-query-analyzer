@@ -48,6 +48,31 @@ def _quote(value: str) -> str:
     return "`" + value.replace("`", "``") + "`"
 
 
+def _bare_column_name(label) -> str:
+    text = str(label).strip()
+    parts, current, quoted, index = [], [], False, 0
+    while index < len(text):
+        char = text[index]
+        if char == "`":
+            if quoted and index + 1 < len(text) and text[index + 1] == "`":
+                current.append("`")
+                index += 2
+                continue
+            quoted = not quoted
+        elif char == "." and not quoted:
+            parts.append("".join(current))
+            current = []
+        else:
+            current.append(char)
+        index += 1
+    parts.append("".join(current))
+    return parts[-1].strip()
+
+
+def _bare_row(row: dict) -> dict:
+    return {_bare_column_name(key): value for key, value in row.items()}
+
+
 def _action(operator: str) -> str:
     if operator in _SCAN_OPERATORS:
         return "scan"
@@ -146,7 +171,7 @@ def _source_rows(samples: dict, schema: str, table: str, alias: str, default_sch
 
 
 def _rows_from_cursor(cursor, rows):
-    columns = [str(column[0]) for column in (cursor.description or [])]
+    columns = [_bare_column_name(column[0]) for column in (cursor.description or [])]
     return [
         {column: value.isoformat() if hasattr(value, "isoformat") else float(value) if isinstance(value, Decimal) else value for column, value in zip(columns, row)}
         for row in rows
@@ -302,7 +327,7 @@ def _metadata(cursor, ref, cache, samples, default_schema, conditions):
         cursor.execute(f"SELECT * FROM {_quote(schema)}.{_quote(table)} LIMIT 10")
         rows = _rows_from_cursor(cursor, cursor.fetchmany(10))
     else:
-        rows = [dict(row) for row in rows[:10]]
+        rows = [_bare_row(row) for row in rows[:10]]
     columns = list(rows[0]) if rows else []
     if not columns:
         cursor.execute(
@@ -322,7 +347,7 @@ def _metadata(cursor, ref, cache, samples, default_schema, conditions):
     if conditions:
         rows = _balanced_sample(cursor, metadata, rows, conditions[0])
     for index, row in enumerate(rows[:10]):
-        metadata["sample"].append({"rid": f"{schema}.{table}:{alias}:{index}", "values": row})
+        metadata["sample"].append({"rid": f"{alias}#{index + 1}", "values": _bare_row(row)})
     cache[cache_key] = metadata
     return metadata
 

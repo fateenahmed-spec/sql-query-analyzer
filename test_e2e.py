@@ -423,10 +423,67 @@ def run_csv_checks() -> None:
                 and {"a", "b"}.issubset(aliases_present)
             )
         report("17. Aliased uploaded-table self-join preserves row samples for both aliases", self_join_ok)
+
+        mapping_ok = False
+        if flow_table_created:
+            sample_response = post_live(
+                f"SELECT id, city, score FROM analyzer_uploads.{flow_table} WHERE city = 'Pune'"
+            )
+            sample_data = sample_response.json()
+            records = sample_data.get("row_records") or {}
+            source_samples = sample_data.get("source_samples") or {}
+            sampled_ids = [
+                str(record.get("values", {}).get("id"))
+                for record in records.values()
+                if record.get("values", {}).get("id") is not None
+            ]
+            ids_are_safe = bool(sampled_ids) and all(value.isdigit() for value in sampled_ids)
+            if ids_are_safe:
+                id_list = ", ".join(sampled_ids)
+                actual_response = post_live(
+                    f"SELECT id, city, score FROM analyzer_uploads.{flow_table} WHERE id IN ({id_list})"
+                )
+                actual_data = actual_response.json()
+                actual_by_id = {str(row["id"]): row for row in actual_data.get("rows", [])}
+                cells_match = all(
+                    str(record.get("values", {}).get("id")) in actual_by_id
+                    and all(
+                        value in (None, "")
+                        or column in actual_by_id[str(record["values"]["id"])]
+                        and actual_by_id[str(record["values"]["id"])][column] == value
+                        for column, value in record.get("values", {}).items()
+                    )
+                    for record in records.values()
+                )
+                bare_record_keys = all(
+                    "." not in column
+                    for record in records.values()
+                    for column in record.get("values", {})
+                )
+                bare_source_keys = all(
+                    "." not in column
+                    for rows in source_samples.values()
+                    for row in rows
+                    for column in row
+                )
+                clean_ids = all(
+                    rid.startswith(f"{flow_table}#") and rid.rsplit("#", 1)[1].isdigit()
+                    for rid in records
+                )
+                mapping_ok = (
+                    sample_response.status_code == 200
+                    and actual_response.status_code == 200
+                    and cells_match
+                    and bare_record_keys
+                    and bare_source_keys
+                    and clean_ids
+                )
+        report("18. Sample values match MySQL, columns are bare, and row IDs are clean", mapping_ok)
     except (requests.RequestException, ValueError) as exc:
         report("15. Uploaded-table filter has evaluable, balanced row samples", False, str(exc))
         report("16. Filter, ORDER BY, and LIMIT on an uploaded table return row-flow records", False, str(exc))
         report("17. Aliased uploaded-table self-join preserves row samples for both aliases", False, str(exc))
+        report("18. Sample values match MySQL, columns are bare, and row IDs are clean", False, str(exc))
     finally:
         if flow_table_created:
             try:

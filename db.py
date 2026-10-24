@@ -169,6 +169,31 @@ def _json_safe(value):
     return value
 
 
+def _bare_column_name(label) -> str:
+    """Return the final identifier from a bare or schema-qualified column label."""
+    text = str(label).strip()
+    parts = []
+    current = []
+    quoted = False
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if char == "`":
+            if quoted and index + 1 < len(text) and text[index + 1] == "`":
+                current.append("`")
+                index += 2
+                continue
+            quoted = not quoted
+        elif char == "." and not quoted:
+            parts.append("".join(current))
+            current = []
+        else:
+            current.append(char)
+        index += 1
+    parts.append("".join(current))
+    return parts[-1].strip()
+
+
 _TABLE_ACCESS = re.compile(
     r"\b(?:Table scan|Index scan|Index range scan|Index lookup|"
     r"Single-row index lookup|Covering index lookup|Covering index scan|"
@@ -325,7 +350,7 @@ def run_query_with_data(sql: str) -> dict:
         cursor = data_conn.cursor()
         cursor.execute("SET SESSION MAX_EXECUTION_TIME=5000")
         cursor.execute(normalized_sql)
-        columns = [column[0] for column in (cursor.description or [])]
+        columns = [_bare_column_name(column[0]) for column in (cursor.description or [])]
         rows = [
             {column: _json_safe(value) for column, value in zip(columns, row)}
             for row in cursor.fetchmany(20)
@@ -343,7 +368,7 @@ def run_query_with_data(sql: str) -> dict:
                 escaped_schema = schema_name.replace("`", "``")
                 escaped_table = table_name.replace("`", "``")
                 cursor.execute(f"SELECT * FROM `{escaped_schema}`.`{escaped_table}` LIMIT 10")
-                table_columns = [column[0] for column in (cursor.description or [])]
+                table_columns = [_bare_column_name(column[0]) for column in (cursor.description or [])]
                 if alias:
                     sample_key = f"{alias} ({schema_name}.{table_name})"
                 else:
