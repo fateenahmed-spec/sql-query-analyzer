@@ -1,16 +1,11 @@
-import os
-
 import mysql.connector
 import pytest
 
-from db import run_explain_analyze
+from db import get_connection, run_explain_analyze
 
 
 def _connection():
-    return mysql.connector.connect(
-        host=os.getenv("DB_HOST", "127.0.0.1"), user=os.getenv("DB_USER", "analyzer_ro"),
-        password=os.getenv("DB_PASS", ""), database=os.getenv("DB_NAME", "sql_analyzer_test"),
-    )
+    return get_connection()
 
 
 @pytest.fixture(scope="module")

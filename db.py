@@ -10,6 +10,7 @@ from pathlib import Path
 
 import mysql.connector
 import sqlparse
+from mysql.connector.constants import ClientFlag
 from sqlparse import tokens as sql_tokens
 from sqlparse.sql import Identifier, IdentifierList, Parenthesis
 from dotenv import load_dotenv
@@ -18,6 +19,12 @@ from core.parser import parse_explain_analyze
 from security import validate_live_query, validate_query
 
 load_dotenv(Path(__file__).resolve().with_name(".env"))
+
+UPLOAD_SCHEMA = "analyzer_uploads"
+_INDEX_SIMULATION_LOCK = "sql_analyzer_index_simulation"
+_INDEX_SIMULATION_CLONE = "up_temp_clone"
+_PUBLIC_UPLOAD_TABLE = re.compile(r"up_[a-z0-9_]{1,61}\Z")
+
 
 class UnsupportedServerError(Exception):
     pass
@@ -37,13 +44,74 @@ class UploadTableNotFoundError(LookupError):
 class UploadColumnNotFoundError(LookupError):
     pass
 
-def get_connection():
-    return mysql.connector.connect(host=os.getenv("DB_HOST", "127.0.0.1"), user=os.getenv("DB_USER", "analyzer_ro"), password=os.getenv("DB_PASS", ""), database=os.getenv("DB_NAME", "sql_analyzer_test"))
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().casefold() in {"1", "true", "yes", "on"}
 
 
-UPLOAD_SCHEMA = "analyzer_uploads"
-_INDEX_SIMULATION_LOCK = "sql_analyzer_index_simulation"
-_INDEX_SIMULATION_CLONE = "up_temp_clone"
+def _mysql_connection_options(include_database: bool = True, user: str | None = None, password: str | None = None) -> dict:
+    ssl_ca = os.getenv("DB_SSL_CA", "").strip()
+    ssl_enabled = _env_flag("DB_SSL") or bool(ssl_ca)
+    options = {
+        "host": os.getenv("DB_HOST") or "127.0.0.1",
+        "port": int(os.getenv("DB_PORT") or "3306"),
+        "user": user if user is not None else (os.getenv("DB_USER") or "analyzer_ro"),
+        "password": password if password is not None else (os.getenv("DB_PASS") or ""),
+        "ssl_disabled": not ssl_enabled,
+    }
+    if include_database:
+        options["database"] = os.getenv("DB_NAME") or "sql_analyzer_test"
+    if ssl_enabled:
+        # Require TLS when enabled so a server without SSL cannot cause a plaintext fallback.
+        options["client_flags"] = [ClientFlag.SSL]
+        if ssl_ca:
+            options["ssl_ca"] = ssl_ca
+            options["ssl_verify_cert"] = True
+            options["ssl_verify_identity"] = True
+    return options
+
+
+def get_connection(include_database: bool = True):
+    return mysql.connector.connect(**_mysql_connection_options(include_database=include_database))
+
+
+def ensure_upload_schema() -> None:
+    """Create the isolated upload schema when the configured account permits it."""
+    conn = get_connection(include_database=False)
+    try:
+        with closing(conn.cursor()) as cursor:
+            cursor.execute(f"CREATE DATABASE IF NOT EXISTS `{UPLOAD_SCHEMA}`")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def cleanup_expired_uploads() -> list[str]:
+    """Drop only validated upload tables in the upload schema older than one hour."""
+    conn = get_connection(include_database=False)
+    dropped = []
+    try:
+        with closing(conn.cursor()) as cursor:
+            cursor.execute(
+                "SELECT TABLE_NAME FROM information_schema.TABLES "
+                "WHERE TABLE_SCHEMA = %s AND LEFT(TABLE_NAME, 3) = 'up_' "
+                "AND TABLE_NAME <> %s AND CREATE_TIME IS NOT NULL "
+                "AND CREATE_TIME <= NOW() - INTERVAL 60 MINUTE",
+                (UPLOAD_SCHEMA, _INDEX_SIMULATION_CLONE),
+            )
+            expired_tables = [str(row[0]) for row in cursor.fetchall()]
+            for table in expired_tables:
+                if table == _INDEX_SIMULATION_CLONE or not _PUBLIC_UPLOAD_TABLE.fullmatch(table):
+                    continue
+                escaped_table = table.replace("`", "``")
+                cursor.execute(f"DROP TABLE IF EXISTS `{UPLOAD_SCHEMA}`.`{escaped_table}`")
+                dropped.append(table)
+        conn.commit()
+        return dropped
+    finally:
+        conn.close()
 
 
 _UPLOAD_BLOCKED_PATTERNS = (
@@ -94,10 +162,11 @@ def execute_sql_file(sql_text: str) -> str:
         )
 
     conn = mysql.connector.connect(
-        host=os.getenv("DB_HOST") or "127.0.0.1",
-        user=os.getenv("DB_ADMIN_USER") or "root",
-        password=root_password,
-        database=os.getenv("DB_NAME") or "sql_analyzer_test",
+        **_mysql_connection_options(
+            include_database=True,
+            user=os.getenv("DB_ADMIN_USER") or "root",
+            password=root_password,
+        )
     )
     try:
         with closing(conn.cursor(buffered=True)) as cursor:

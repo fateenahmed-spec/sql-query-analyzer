@@ -1,15 +1,21 @@
 import csv
 import io
 import json
+import logging
 import math
+import os
 import re
 import threading
-from contextlib import closing
+import asyncio
+import ipaddress
+from contextlib import asynccontextmanager, closing, contextmanager
 from datetime import date, datetime
 from pathlib import Path
+from math import ceil
 
 import mysql.connector
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from dotenv import load_dotenv
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, constr
@@ -26,16 +32,74 @@ from db import (
     UnsupportedServerError,
     UploadColumnNotFoundError,
     UploadTableNotFoundError,
+    UPLOAD_SCHEMA,
     build_row_flow,
+    cleanup_expired_uploads,
+    ensure_upload_schema,
     execute_sql_file,
     get_connection,
     run_explain_analyze,
     run_query_with_data,
     simulate_index as run_index_simulation,
 )
+from public_safety import InMemoryRateLimiter
 from security import UnsafeQueryError
 
-app = FastAPI()
+load_dotenv(Path(__file__).resolve().with_name(".env"))
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().casefold() in {"1", "true", "yes", "on"}
+
+
+PUBLIC_MODE = _env_flag("PUBLIC_MODE")
+_LOGGER = logging.getLogger(__name__)
+_PUBLIC_RATE_LIMITER = InMemoryRateLimiter()
+_PUBLIC_LIMITS = {
+    "query": (30, 60, "queries per minute"),
+    "ai": (10, 60, "AI calls per minute"),
+    "upload": (5, 60 * 60, "uploads per hour"),
+}
+_UPLOAD_CAP_LOCK = "sql_analyzer_upload_table_cap"
+_PUBLIC_UPLOAD_TABLE_LIMIT = 5
+
+
+async def _public_upload_cleanup_loop() -> None:
+    while True:
+        try:
+            await asyncio.to_thread(cleanup_expired_uploads)
+        except mysql.connector.Error as exc:
+            _LOGGER.warning("Public upload cleanup failed (database error code %s).", getattr(exc, "errno", "unknown"))
+        except Exception as exc:
+            _LOGGER.warning("Public upload cleanup failed (%s).", type(exc).__name__)
+        await asyncio.sleep(5 * 60)
+
+
+@asynccontextmanager
+async def _lifespan(_app):
+    try:
+        ensure_upload_schema()
+    except mysql.connector.Error as exc:
+        _LOGGER.warning("Upload schema initialization failed (database error code %s).", getattr(exc, "errno", "unknown"))
+    except Exception as exc:
+        _LOGGER.warning("Upload schema initialization failed (%s).", type(exc).__name__)
+
+    cleanup_task = asyncio.create_task(_public_upload_cleanup_loop()) if PUBLIC_MODE else None
+    try:
+        yield
+    finally:
+        if cleanup_task is not None:
+            cleanup_task.cancel()
+            try:
+                await cleanup_task
+            except asyncio.CancelledError:
+                pass
+
+
+app = FastAPI(lifespan=_lifespan)
 _slots = threading.BoundedSemaphore(5)
 _PROJECT_ROOT = Path(__file__).resolve().parent
 _QUERIES_FILE = _PROJECT_ROOT / "demo" / "queries.json"
@@ -75,6 +139,74 @@ _CSV_RESERVED_WORDS = {
     "varbinary", "varchar", "varying", "virtual", "when", "where", "while", "window", "with", "write",
     "xor", "year_month", "zerofill",
 }
+
+
+def _client_ip(request: Request) -> str:
+    forwarded_for = request.headers.get("x-forwarded-for", "")
+    if forwarded_for:
+        candidate = forwarded_for.split(",", 1)[0].strip()
+        try:
+            return str(ipaddress.ip_address(candidate))
+        except ValueError:
+            pass
+    remote = request.client.host if request.client else "unknown"
+    try:
+        return str(ipaddress.ip_address(remote))
+    except ValueError:
+        return remote or "unknown"
+
+
+def _public_rate_limit(request: Request, category: str) -> JSONResponse | None:
+    if not PUBLIC_MODE:
+        return None
+    limit, window_seconds, label = _PUBLIC_LIMITS[category]
+    retry_after = _PUBLIC_RATE_LIMITER.consume(
+        _client_ip(request), category, limit, window_seconds
+    )
+    if retry_after is None:
+        return None
+    wait_seconds = max(1, ceil(retry_after))
+    return JSONResponse(
+        status_code=429,
+        headers={"Retry-After": str(wait_seconds)},
+        content={"error": f"Rate limit exceeded: maximum {limit} {label}. Try again in {wait_seconds} seconds."},
+    )
+
+
+@contextmanager
+def _upload_table_slot(cursor):
+    if not PUBLIC_MODE:
+        yield
+        return
+
+    cursor.execute("SELECT GET_LOCK(%s, 10)", (_UPLOAD_CAP_LOCK,))
+    lock_row = cursor.fetchone()
+    acquired = bool(lock_row and lock_row[0] == 1)
+    if not acquired:
+        raise HTTPException(status_code=429, detail="Upload capacity is busy. Retry shortly.")
+    try:
+        cursor.execute(
+            "SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = %s",
+            (UPLOAD_SCHEMA,),
+        )
+        existing_tables = [
+            str(row[0])
+            for row in cursor.fetchall()
+            if re.fullmatch(r"up_[a-z0-9_]{1,61}", str(row[0]))
+            and str(row[0]) != "up_temp_clone"
+        ]
+        if len(existing_tables) >= _PUBLIC_UPLOAD_TABLE_LIMIT:
+            raise HTTPException(
+                status_code=429,
+                detail="At most 5 uploaded tables can exist at once in public mode. Delete a table or wait for cleanup.",
+            )
+        yield
+    finally:
+        try:
+            cursor.execute("SELECT RELEASE_LOCK(%s)", (_UPLOAD_CAP_LOCK,))
+            cursor.fetchone()
+        except mysql.connector.Error:
+            pass
 
 
 def _sanitize_csv_header(value: str, index: int, used: set[str]) -> str:
@@ -141,7 +273,7 @@ def _infer_csv_string_type(values: list[str]) -> str:
 
 
 def _upload_table_identifier(table: str) -> str:
-    if not re.fullmatch(r"up_[a-z0-9_]{1,61}", table):
+    if not re.fullmatch(r"up_[a-z0-9_]{1,61}", table) or table == "up_temp_clone":
         raise HTTPException(status_code=400, detail="Invalid upload table name.")
     return f"`analyzer_uploads`.`{table}`"
 
@@ -161,11 +293,31 @@ def _read_queries():
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok"}
+    conn = None
+    try:
+        conn = get_connection()
+        with closing(conn.cursor()) as cursor:
+            cursor.execute("SELECT 1")
+            cursor.fetchone()
+    except (mysql.connector.Error, OSError, ValueError):
+        return JSONResponse(
+            status_code=503,
+            content={"status": "unavailable", "database": "unavailable"},
+        )
+    finally:
+        if conn is not None:
+            conn.close()
+    return {"status": "ok", "database": "connected"}
 
 
 @app.post("/api/upload-sql")
-async def upload_sql_file(file: UploadFile = File(...)):
+async def upload_sql_file(http_request: Request, file: UploadFile = File(...)):
+    limited = _public_rate_limit(http_request, "upload")
+    if limited:
+        return limited
+    if PUBLIC_MODE:
+        raise HTTPException(status_code=403, detail="SQL script uploads are disabled in public mode.")
+
     filename = file.filename or ""
     if Path(filename).suffix.casefold() not in {".sql", ".txt"}:
         raise HTTPException(status_code=400, detail="Choose a .sql or .txt file.")
@@ -191,7 +343,11 @@ async def upload_sql_file(file: UploadFile = File(...)):
 
 
 @app.post("/api/upload-csv")
-async def upload_csv_file(file: UploadFile = File(...), table_name: str = Form("")):
+async def upload_csv_file(http_request: Request, file: UploadFile = File(...), table_name: str = Form("")):
+    limited = _public_rate_limit(http_request, "upload")
+    if limited:
+        return limited
+
     filename = file.filename or ""
     if Path(filename).suffix.casefold() != ".csv":
         raise HTTPException(status_code=400, detail="Choose a .csv file.")
@@ -265,23 +421,24 @@ async def upload_csv_file(file: UploadFile = File(...), table_name: str = Form("
     table_created = False
     try:
         with closing(conn.cursor()) as cursor:
-            try:
-                cursor.execute(create_sql)
-                table_created = True
-                for offset in range(0, len(data_rows), 1000):
-                    cursor.executemany(insert_sql, data_rows[offset : offset + 1000])
-                conn.commit()
-            except mysql.connector.Error as exc:
-                conn.rollback()
-                if table_created:
-                    try:
-                        cursor.execute(f"DROP TABLE {qualified_table}")
-                        conn.commit()
-                    except mysql.connector.Error:
-                        conn.rollback()
-                if getattr(exc, "errno", None) == 1050:
-                    raise HTTPException(status_code=400, detail="An upload with this table name already exists.") from exc
-                raise HTTPException(status_code=500, detail="Could not create the upload table.") from exc
+            with _upload_table_slot(cursor):
+                try:
+                    cursor.execute(create_sql)
+                    table_created = True
+                    for offset in range(0, len(data_rows), 1000):
+                        cursor.executemany(insert_sql, data_rows[offset : offset + 1000])
+                    conn.commit()
+                except mysql.connector.Error as exc:
+                    conn.rollback()
+                    if table_created:
+                        try:
+                            cursor.execute(f"DROP TABLE {qualified_table}")
+                            conn.commit()
+                        except mysql.connector.Error:
+                            conn.rollback()
+                    if getattr(exc, "errno", None) == 1050:
+                        raise HTTPException(status_code=400, detail="An upload with this table name already exists.") from exc
+                    raise HTTPException(status_code=500, detail="Could not create the upload table.") from exc
     finally:
         conn.close()
 
@@ -306,7 +463,11 @@ def list_csv_uploads():
                 "SELECT TABLE_NAME FROM information_schema.TABLES "
                 "WHERE TABLE_SCHEMA = 'analyzer_uploads' ORDER BY TABLE_NAME"
             )
-            tables = [str(row[0]) for row in cursor.fetchall() if str(row[0]).startswith("up_")]
+            tables = [
+                str(row[0])
+                for row in cursor.fetchall()
+                if str(row[0]).startswith("up_") and str(row[0]) != "up_temp_clone"
+            ]
             for table in tables:
                 qualified_table = _upload_table_identifier(table)
                 cursor.execute(
@@ -385,7 +546,10 @@ def get_plan(id: str):
 
 
 @app.post("/api/ai/{id}")
-def get_ai_insights(id: str):
+def get_ai_insights(id: str, http_request: Request):
+    limited = _public_rate_limit(http_request, "ai")
+    if limited:
+        return limited
     queries = _read_queries()
     query = next((item for item in queries if item.get("id") == id), None)
     if query is None:
@@ -418,7 +582,10 @@ class AIRequest(BaseModel):
 
 
 @app.post("/api/run-live")
-def run_live(request: LiveQueryRequest):
+def run_live(request: LiveQueryRequest, http_request: Request):
+    limited = _public_rate_limit(http_request, "query")
+    if limited:
+        return limited
     try:
         result = run_query_with_data(request.query)
     except UnsafeQueryError as exc:
@@ -490,7 +657,10 @@ def run_live(request: LiveQueryRequest):
 
 
 @app.post("/api/simulate-index")
-def simulate_index_endpoint(request: IndexSimulationRequest):
+def simulate_index_endpoint(request: IndexSimulationRequest, http_request: Request):
+    limited = _public_rate_limit(http_request, "query")
+    if limited:
+        return limited
     if not _slots.acquire(blocking=False):
         return JSONResponse(status_code=429, content={"ok": False, "error": "Server busy"})
     try:
@@ -517,7 +687,10 @@ def simulate_index_endpoint(request: IndexSimulationRequest):
 
 
 @app.post("/api/ai")
-def get_live_ai_insights(request: AIRequest):
+def get_live_ai_insights(request: AIRequest, http_request: Request):
+    limited = _public_rate_limit(http_request, "ai")
+    if limited:
+        return limited
     try:
         explanation = get_ai_explanation(
             request.query,
@@ -554,7 +727,10 @@ def get_live_ai_insights(request: AIRequest):
         }
 
 @app.post("/api/analyze")
-def analyze(request: AnalyzeRequest):
+def analyze(request: AnalyzeRequest, http_request: Request):
+    limited = _public_rate_limit(http_request, "query")
+    if limited:
+        return limited
     if not _slots.acquire(blocking=False):
         return JSONResponse(status_code=429, content={"success": False, "error": "Server busy"})
     try:
@@ -577,3 +753,13 @@ def analyze(request: AnalyzeRequest):
         _slots.release()
 
 app.mount("/", StaticFiles(directory="frontend", html=True), name="frontend")
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=int(os.getenv("PORT") or "8000"),
+    )

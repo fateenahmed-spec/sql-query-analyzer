@@ -94,6 +94,28 @@ def test_retries_429_then_succeeds(ai_setup, mocker, caplog, capsys):
     assert ai_setup.call_count == 2
 
 
+def test_gemini_rate_limit_falls_back_after_retries(ai_setup, mocker, caplog, capsys):
+    ai_setup.side_effect = [_response(mocker, status=429) for _ in range(3)]
+
+    result = _run_and_check_secret(caplog, capsys)
+
+    assert result["ai_status"] == "fallback"
+    assert result["reason"] == "Gemini rate limited"
+    assert ai_setup.call_count == 3
+
+
+def test_missing_gemini_key_uses_rule_fallback(monkeypatch, mocker):
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    post = mocker.patch("core.ai.requests.post")
+
+    result = ai.get_ai_explanation(QUERY, WARNINGS, tree_summary=TREE)
+
+    assert result["ai_status"] == "fallback"
+    assert result["reason"] == "API key missing"
+    assert result["summary"]
+    post.assert_not_called()
+
+
 def test_retries_500_twice_then_falls_back(ai_setup, mocker, caplog, capsys):
     ai_setup.side_effect = [_response(mocker, status=500) for _ in range(3)]
 
