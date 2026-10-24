@@ -433,14 +433,14 @@ function flowInputRids(step) {
 function renderFlowRows(container, title, rids, states = {}, badge = "") {
   container.replaceChildren();
   if (!rids.length) {
-    appendEmpty(container, "No sample rows at this operator.");
+    appendEmpty(container, noSampleRowsMessage);
     return;
   }
 
   const records = globalData?.row_records || {};
   const rows = rids.map((rid) => ({ rid, record: records[rid] })).filter((entry) => entry.record);
   if (!rows.length) {
-    appendEmpty(container, "No real sampled rows are available for this operator.");
+    appendEmpty(container, noSampleRowsMessage);
     return;
   }
 

@@ -359,6 +359,81 @@ def run_csv_checks() -> None:
             except requests.RequestException:
                 pass
 
+    flow_table = f"up_rowflow_{time.time_ns()}"
+    flow_table_created = False
+    try:
+        flow_csv = "id,city,score\n" + "".join(
+            f"{row_id},{'Pune' if row_id > 133 else 'Other'},{row_id}\n"
+            for row_id in range(1, 151)
+        )
+        flow_upload = requests.post(
+            f"{BASE_URL}/api/upload-csv",
+            files={"file": ("rowflow.csv", flow_csv.encode("utf-8"), "text/csv")},
+            data={"table_name": flow_table.removeprefix("up_")},
+            timeout=TIMEOUT_SECONDS,
+        )
+        flow_upload_data = flow_upload.json()
+        flow_table_created = flow_upload.status_code == 200 and flow_upload_data.get("table") == flow_table
+
+        def row_flow_ok(data: dict) -> bool:
+            flow = data.get("row_flow") or []
+            records = data.get("row_records") or {}
+            return bool(records) and any(
+                int(step.get("table_row_count") or 0) > 0 and step.get("evaluable") is True
+                for step in flow
+            )
+
+        plain_data = {}
+        plain_ok = False
+        if flow_table_created:
+            plain_response = post_live(f"SELECT id, city FROM analyzer_uploads.{flow_table} WHERE city = 'Pune'")
+            plain_data = plain_response.json()
+            filter_steps = [step for step in plain_data.get("row_flow", []) if step.get("op") == "filter"]
+            balanced_filter = any(
+                step.get("evaluable") is True
+                and True in (step.get("row_results") or {}).values()
+                and False in (step.get("row_results") or {}).values()
+                for step in filter_steps
+            )
+            plain_ok = plain_response.status_code == 200 and row_flow_ok(plain_data) and balanced_filter
+        report("15. Uploaded-table filter has evaluable, balanced row samples", plain_ok)
+
+        ordered_ok = False
+        if flow_table_created:
+            ordered_response = post_live(
+                f"SELECT id, city, score FROM analyzer_uploads.{flow_table} "
+                "WHERE city = 'Pune' ORDER BY score DESC LIMIT 5"
+            )
+            ordered_data = ordered_response.json()
+            ordered_ok = ordered_response.status_code == 200 and row_flow_ok(ordered_data)
+        report("16. Filter, ORDER BY, and LIMIT on an uploaded table return row-flow records", ordered_ok)
+
+        self_join_ok = False
+        if flow_table_created:
+            self_join_response = post_live(
+                f"SELECT a.id AS left_id, b.id AS right_id FROM analyzer_uploads.{flow_table} AS a "
+                f"JOIN analyzer_uploads.{flow_table} AS b ON a.id = b.id WHERE a.city = 'Pune' LIMIT 5"
+            )
+            self_join_data = self_join_response.json()
+            records = self_join_data.get("row_records") or {}
+            aliases_present = {record.get("alias") for record in records.values()}
+            self_join_ok = (
+                self_join_response.status_code == 200
+                and row_flow_ok(self_join_data)
+                and {"a", "b"}.issubset(aliases_present)
+            )
+        report("17. Aliased uploaded-table self-join preserves row samples for both aliases", self_join_ok)
+    except (requests.RequestException, ValueError) as exc:
+        report("15. Uploaded-table filter has evaluable, balanced row samples", False, str(exc))
+        report("16. Filter, ORDER BY, and LIMIT on an uploaded table return row-flow records", False, str(exc))
+        report("17. Aliased uploaded-table self-join preserves row samples for both aliases", False, str(exc))
+    finally:
+        if flow_table_created:
+            try:
+                requests.delete(f"{BASE_URL}/api/uploads/{flow_table}", timeout=TIMEOUT_SECONDS)
+            except requests.RequestException:
+                pass
+
 
 if __name__ == "__main__":
     sys.exit(main())

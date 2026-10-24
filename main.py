@@ -435,7 +435,7 @@ def run_live(request: LiveQueryRequest):
     tree["_flow_query"] = request.query
     flow_conn = get_connection()
     try:
-        row_flow = build_row_flow(tree, flow_conn)
+        row_flow = build_row_flow(tree, flow_conn, result["source_samples"])
     finally:
         flow_conn.close()
         tree.pop("_flow_query", None)
