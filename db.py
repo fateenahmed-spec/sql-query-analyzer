@@ -12,7 +12,7 @@ import mysql.connector
 import sqlparse
 from dotenv import load_dotenv
 
-from security import validate_query
+from security import validate_live_query, validate_query
 
 load_dotenv(Path(__file__).resolve().with_name(".env"))
 
@@ -24,6 +24,9 @@ class DatabaseUploadConfigurationError(RuntimeError):
 
 def get_connection():
     return mysql.connector.connect(host=os.getenv("DB_HOST", "127.0.0.1"), user=os.getenv("DB_USER", "analyzer_ro"), password=os.getenv("DB_PASS", ""), database=os.getenv("DB_NAME", "sql_analyzer_test"))
+
+
+UPLOAD_SCHEMA = "analyzer_uploads"
 
 
 _UPLOAD_BLOCKED_PATTERNS = (
@@ -106,7 +109,11 @@ def kill_query(conn_id, fired_event):
     try:
         conn = get_connection()
         with closing(conn.cursor()) as cursor:
-            cursor.execute(f"KILL QUERY {int(conn_id)}")
+            try:
+                cursor.execute(f"KILL QUERY {int(conn_id)}")
+            except mysql.connector.Error:
+                # The target query may finish between the timer firing and KILL.
+                pass
     finally:
         fired_event.set()
         if conn is not None:
@@ -138,7 +145,10 @@ def run_explain_analyze(raw_sql: str) -> dict:
             try:
                 cursor.execute(f"EXPLAIN ANALYZE {normalized_sql}")
                 rows = cursor.fetchall()
-                return {"raw_plan": "\n".join(str(row[0]) for row in rows), "mysql_version": version, "elapsed_ms": round((time.perf_counter() - started) * 1000, 2)}
+                elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
+                if fired_event.is_set() or elapsed_ms >= 5000:
+                    raise TimeoutError("Query exceeded 5s limit")
+                return {"raw_plan": "\n".join(str(row[0]) for row in rows), "mysql_version": version, "elapsed_ms": elapsed_ms}
             except Exception as exc:
                 if fired_event.is_set() or getattr(exc, "errno", None) in (3024, 1317):
                     raise TimeoutError("Query exceeded 5s limit") from exc
@@ -529,19 +539,32 @@ def build_row_flow(plan_tree: dict, conn) -> list[dict]:
 
 
 def _source_table_names(plan_text: str, cursor) -> list[str]:
-    cursor.execute("SHOW TABLES")
-    existing = {str(row[0]) for row in cursor.fetchall()}
+    cursor.execute("SELECT DATABASE()")
+    default_schema_row = cursor.fetchone()
+    default_schema = str(default_schema_row[0]) if default_schema_row else "sql_analyzer_test"
     candidates = []
     for match in _TABLE_ACCESS.finditer(plan_text):
         table_name = match.group(2)
-        if table_name in existing and table_name not in candidates:
-            candidates.append(table_name)
+        schemas = [(match.group(1).strip("`"))] if match.group(1) else [default_schema, UPLOAD_SCHEMA]
+        for schema in schemas:
+            table_ref = (schema, table_name)
+            if table_ref in candidates:
+                continue
+            cursor.execute(
+                "SELECT 1 FROM information_schema.TABLES "
+                "WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s LIMIT 1",
+                table_ref,
+            )
+            if cursor.fetchone():
+                candidates.append(table_ref)
+                if not match.group(1):
+                    break
     return candidates
 
 
 def run_query_with_data(sql: str) -> dict:
     """Validate and execute one read-only query, returning its real plan and rows."""
-    normalized_sql = validate_query(sql).strip().rstrip(";").rstrip()
+    normalized_sql = validate_live_query(sql).strip().rstrip(";").rstrip()
     plan_text = ""
     rows = []
     columns = []
@@ -576,11 +599,13 @@ def run_query_with_data(sql: str) -> dict:
         with closing(sample_conn.cursor()) as cursor:
             cursor.execute("SET SESSION MAX_EXECUTION_TIME=5000")
             table_names = _source_table_names(plan_text, cursor)
-            for table_name in table_names:
+            for schema_name, table_name in table_names:
+                escaped_schema = schema_name.replace("`", "``")
                 escaped_table = table_name.replace("`", "``")
-                cursor.execute(f"SELECT * FROM `{escaped_table}` LIMIT 10")
+                cursor.execute(f"SELECT * FROM `{escaped_schema}`.`{escaped_table}` LIMIT 10")
                 table_columns = [column[0] for column in (cursor.description or [])]
-                source_samples[table_name] = [
+                sample_key = table_name if schema_name == (os.getenv("DB_NAME") or "sql_analyzer_test") else f"{schema_name}.{table_name}"
+                source_samples[sample_key] = [
                     {
                         column: _json_safe(value)
                         for column, value in zip(table_columns, row)

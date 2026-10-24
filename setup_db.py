@@ -24,11 +24,13 @@ def main():
     conn.autocommit = True
     cur = conn.cursor()
     cur.execute("CREATE DATABASE IF NOT EXISTS sql_analyzer_test")
+    cur.execute("CREATE DATABASE IF NOT EXISTS analyzer_uploads")
     for host in ("localhost", "127.0.0.1"):
         cur.execute(f"CREATE USER IF NOT EXISTS 'analyzer_ro'@'{host}' IDENTIFIED BY %s", (db_password,))
         cur.execute(f"ALTER USER 'analyzer_ro'@'{host}' IDENTIFIED BY %s", (db_password,))
         cur.execute(f"REVOKE ALL PRIVILEGES, GRANT OPTION FROM 'analyzer_ro'@'{host}'")
         cur.execute(f"GRANT SELECT ON sql_analyzer_test.* TO 'analyzer_ro'@'{host}'")
+        cur.execute(f"GRANT SELECT, INSERT, CREATE, DROP ON analyzer_uploads.* TO 'analyzer_ro'@'{host}'")
     cur.execute("USE sql_analyzer_test")
     cur.execute("CREATE TABLE IF NOT EXISTS customers (id INT PRIMARY KEY, name VARCHAR(100), city VARCHAR(50))")
     cur.execute("CREATE TABLE IF NOT EXISTS orders (id INT PRIMARY KEY, customer_id INT, amount DECIMAL(10,2), status VARCHAR(20), created_at DATETIME, INDEX idx_customer (customer_id))")

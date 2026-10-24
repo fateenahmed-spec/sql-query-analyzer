@@ -1,5 +1,11 @@
-import threading
+import csv
+import io
 import json
+import math
+import re
+import threading
+from contextlib import closing
+from datetime import date, datetime
 from pathlib import Path
 
 import mysql.connector
@@ -29,6 +35,110 @@ _slots = threading.BoundedSemaphore(5)
 _PROJECT_ROOT = Path(__file__).resolve().parent
 _QUERIES_FILE = _PROJECT_ROOT / "demo" / "queries.json"
 _MAX_SQL_FILE_BYTES = 10_000_000
+_MAX_CSV_BYTES = 5 * 1024 * 1024
+_MAX_CSV_ROWS = 50_000
+_MAX_CSV_COLUMNS = 50
+_CSV_RESERVED_WORDS = {
+    "accessible", "add", "all", "alter", "analyze", "and", "as", "asc", "asensitive",
+    "before", "between", "bigint", "binary", "blob", "both", "by", "call", "cascade",
+    "case", "change", "char", "character", "check", "collate", "column", "columns",
+    "condition", "constraint", "continue", "convert", "create", "cross", "cube", "cume_dist",
+    "current_date", "current_time", "current_timestamp", "current_user", "cursor", "database",
+    "databases", "day_hour", "day_microsecond", "day_minute", "day_second", "dec", "decimal",
+    "declare", "default", "delayed", "delete", "dense_rank", "desc", "describe", "deterministic",
+    "distinct", "distinctrow", "div", "double", "drop", "dual", "each", "else", "elseif",
+    "empty", "enclosed", "escaped", "except", "exists", "exit", "explain", "false", "fetch",
+    "first_value", "float", "for", "force", "foreign", "from", "fulltext", "function", "generated",
+    "get", "grant", "group", "groups", "having", "high_priority", "hour_microsecond", "hour_minute",
+    "hour_second", "if", "ignore", "in", "index", "infile", "inner", "inout", "insensitive",
+    "insert", "int", "integer", "intersect", "interval", "into", "io_after_gtids", "io_before_gtids",
+    "is", "iterate", "join", "json_table", "key", "keys", "kill", "lag", "last_value", "lateral",
+    "lead", "leading", "leave", "left", "like", "limit", "linear", "lines", "load", "localtime",
+    "localtimestamp", "lock", "long", "longblob", "longtext", "loop", "low_priority", "master_bind",
+    "master_ssl_verify_server_cert", "match", "maxvalue", "mediumblob", "mediumint", "mediumtext",
+    "middleint", "minute_microsecond", "minute_second", "mod", "modifies", "natural", "not", "no_write_to_binlog",
+    "nth_value", "ntile", "null", "numeric", "of", "on", "optimize", "option", "optionally", "or",
+    "order", "out", "outer", "outfile", "over", "partition", "percent_rank", "precision", "primary",
+    "procedure", "purge", "range", "rank", "read", "reads", "read_write", "real", "recursive", "references",
+    "regexp", "release", "rename", "repeat", "replace", "require", "resignal", "restrict", "return",
+    "revoke", "right", "rlike", "row", "rows", "row_number", "schema", "schemas", "second_microsecond",
+    "select", "sensitive", "separator", "set", "show", "signal", "smallint", "spatial", "specific",
+    "sql", "sqlexception", "sqlstate", "sqlwarning", "sql_big_result", "sql_calc_found_rows", "sql_small_result",
+    "ssl", "starting", "stored", "straight_join", "system", "table", "terminated", "then", "tinyblob",
+    "tinyint", "tinytext", "to", "trailing", "trigger", "true", "undo", "union", "unique", "unlock",
+    "unsigned", "update", "usage", "use", "using", "utc_date", "utc_time", "utc_timestamp", "values",
+    "varbinary", "varchar", "varying", "virtual", "when", "where", "while", "window", "with", "write",
+    "xor", "year_month", "zerofill",
+}
+
+
+def _sanitize_csv_header(value: str, index: int, used: set[str]) -> str:
+    name = re.sub(r"[^a-z0-9]+", "_", value.casefold()).strip("_")
+    if not name:
+        name = f"col_{index + 1}"
+    if name[0].isdigit():
+        name = f"col_{name}"
+    if name in _CSV_RESERVED_WORDS:
+        name += "_"
+    base = name[:64]
+    name = base
+    suffix = 2
+    while name in used:
+        suffix_text = f"_{suffix}"
+        name = f"{base[:64 - len(suffix_text)]}{suffix_text}"
+        suffix += 1
+    used.add(name)
+    return name
+
+
+def _csv_date(value: str) -> bool:
+    value = value.strip()
+    for parser in (date.fromisoformat,):
+        try:
+            parser(value)
+            return True
+        except ValueError:
+            pass
+    for pattern in ("%Y/%m/%d", "%m/%d/%Y", "%d-%m-%Y"):
+        try:
+            datetime.strptime(value, pattern)
+            return True
+        except ValueError:
+            pass
+    return False
+
+
+def _infer_csv_type(values: list[str | None]) -> str:
+    nonempty = [value.strip() for value in values if value is not None and value.strip()]
+    if not nonempty:
+        return "TEXT"
+    if all(re.fullmatch(r"[+-]?\d+", value) for value in nonempty):
+        integers = [int(value) for value in nonempty]
+        if all(-(2**31) <= value <= (2**31 - 1) for value in integers):
+            return "INT"
+        return "TEXT"
+    if all(_csv_date(value) for value in nonempty):
+        return "DATE"
+    try:
+        if all(math.isfinite(float(value)) for value in nonempty):
+            return "DOUBLE"
+    except ValueError:
+        pass
+    return "TEXT"
+
+
+def _upload_table_identifier(table: str) -> str:
+    if not re.fullmatch(r"up_[a-z0-9_]{1,61}", table):
+        raise HTTPException(status_code=400, detail="Invalid upload table name.")
+    return f"`analyzer_uploads`.`{table}`"
+
+
+def _csv_upload_name(filename: str) -> str:
+    stem = Path(filename).stem.casefold()
+    sanitized = re.sub(r"[^a-z0-9]+", "_", stem).strip("_")
+    if not sanitized:
+        sanitized = "upload"
+    return f"up_{sanitized[:61]}"
 
 
 def _read_queries():
@@ -65,6 +175,165 @@ async def upload_sql_file(file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail=f"SQL upload failed: {exc.msg}") from exc
 
     return {"ok": True, "message": "Database updated successfully"}
+
+
+@app.post("/api/upload-csv")
+async def upload_csv_file(file: UploadFile = File(...)):
+    filename = file.filename or ""
+    if Path(filename).suffix.casefold() != ".csv":
+        raise HTTPException(status_code=400, detail="Choose a .csv file.")
+
+    content = await file.read(_MAX_CSV_BYTES + 1)
+    if len(content) > _MAX_CSV_BYTES:
+        raise HTTPException(status_code=400, detail="CSV files must be 5 MB or smaller.")
+    try:
+        csv_text = content.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise HTTPException(status_code=400, detail="The CSV file must use UTF-8 encoding.") from exc
+    if not csv_text.strip():
+        raise HTTPException(status_code=400, detail="The CSV file must include a header row.")
+
+    sample = csv_text[:8192]
+    try:
+        dialect = csv.Sniffer().sniff(sample, delimiters=",;\t|")
+    except csv.Error:
+        dialect = csv.excel
+
+    reader = csv.reader(io.StringIO(csv_text, newline=""), dialect=dialect, strict=True)
+    try:
+        headers = next(reader, None)
+        if not headers:
+            raise HTTPException(status_code=400, detail="The CSV file must include a header row.")
+        if len(headers) > _MAX_CSV_COLUMNS:
+            raise HTTPException(status_code=400, detail="CSV files may contain at most 50 columns.")
+        used_headers: set[str] = set()
+        columns = [
+            {"name": _sanitize_csv_header(header, index, used_headers), "type": ""}
+            for index, header in enumerate(headers)
+        ]
+        data_rows: list[list[str | None]] = []
+        seen_rows = 0
+        for row in reader:
+            seen_rows += 1
+            if seen_rows > _MAX_CSV_ROWS:
+                raise HTTPException(status_code=400, detail="CSV files may contain at most 50,000 rows.")
+            if len(row) > _MAX_CSV_COLUMNS:
+                raise HTTPException(status_code=400, detail="CSV files may contain at most 50 columns.")
+            if len(row) != len(headers):
+                continue
+            data_rows.append([None if not value.strip() else value for value in row])
+    except csv.Error as exc:
+        raise HTTPException(status_code=400, detail="The CSV file contains malformed rows.") from exc
+
+    for index, column in enumerate(columns):
+        column["type"] = _infer_csv_type([row[index] for row in data_rows])
+
+    table = _csv_upload_name(filename)
+    qualified_table = _upload_table_identifier(table)
+    definitions = ", ".join(
+        f"`{column['name']}` {column['type']}" for column in columns
+    )
+    create_sql = f"CREATE TABLE {qualified_table} ({definitions})"
+    insert_sql = (
+        f"INSERT INTO {qualified_table} ("
+        + ", ".join(f"`{column['name']}`" for column in columns)
+        + ") VALUES ("
+        + ", ".join(["%s"] * len(columns))
+        + ")"
+    )
+
+    conn = get_connection()
+    table_created = False
+    try:
+        with closing(conn.cursor()) as cursor:
+            try:
+                cursor.execute(create_sql)
+                table_created = True
+                for offset in range(0, len(data_rows), 1000):
+                    cursor.executemany(insert_sql, data_rows[offset : offset + 1000])
+                conn.commit()
+            except mysql.connector.Error as exc:
+                conn.rollback()
+                if table_created:
+                    try:
+                        cursor.execute(f"DROP TABLE {qualified_table}")
+                        conn.commit()
+                    except mysql.connector.Error:
+                        conn.rollback()
+                if getattr(exc, "errno", None) == 1050:
+                    raise HTTPException(status_code=400, detail="An upload with this filename already exists.") from exc
+                raise HTTPException(status_code=500, detail="Could not create the upload table.") from exc
+    finally:
+        conn.close()
+
+    return {
+        "ok": True,
+        "table": table,
+        "qualified_name": f"analyzer_uploads.{table}",
+        "row_count": len(data_rows),
+        "columns": columns,
+        "sample_query": f"SELECT * FROM {qualified_table} LIMIT 10",
+    }
+
+
+@app.get("/api/uploads")
+def list_csv_uploads():
+    conn = get_connection()
+    uploads = []
+    try:
+        with closing(conn.cursor()) as cursor:
+            cursor.execute(
+                "SELECT TABLE_NAME FROM information_schema.TABLES "
+                "WHERE TABLE_SCHEMA = 'analyzer_uploads' ORDER BY TABLE_NAME"
+            )
+            tables = [str(row[0]) for row in cursor.fetchall() if str(row[0]).startswith("up_")]
+            for table in tables:
+                qualified_table = _upload_table_identifier(table)
+                cursor.execute(
+                    "SELECT COLUMN_NAME, DATA_TYPE FROM information_schema.COLUMNS "
+                    "WHERE TABLE_SCHEMA = 'analyzer_uploads' AND TABLE_NAME = %s "
+                    "ORDER BY ORDINAL_POSITION",
+                    (table,),
+                )
+                columns = [{"name": str(row[0]), "type": str(row[1]).upper()} for row in cursor.fetchall()]
+                cursor.execute(f"SELECT COUNT(*) FROM {qualified_table}")
+                row = cursor.fetchone()
+                uploads.append({
+                    "table": table,
+                    "qualified_name": f"analyzer_uploads.{table}",
+                    "row_count": int(row[0]) if row else 0,
+                    "columns": columns,
+                })
+    except mysql.connector.Error as exc:
+        raise HTTPException(status_code=503, detail="Could not list uploaded tables.") from exc
+    finally:
+        conn.close()
+    return {"uploads": uploads}
+
+
+@app.delete("/api/uploads/{table}")
+def delete_csv_upload(table: str):
+    qualified_table = _upload_table_identifier(table)
+    conn = get_connection()
+    try:
+        with closing(conn.cursor()) as cursor:
+            cursor.execute(
+                "SELECT 1 FROM information_schema.TABLES "
+                "WHERE TABLE_SCHEMA = 'analyzer_uploads' AND TABLE_NAME = %s LIMIT 1",
+                (table,),
+            )
+            if not cursor.fetchone():
+                raise HTTPException(status_code=404, detail="Upload table not found.")
+            cursor.execute(f"DROP TABLE {qualified_table}")
+            conn.commit()
+    except HTTPException:
+        raise
+    except mysql.connector.Error as exc:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail="Could not delete the uploaded table.") from exc
+    finally:
+        conn.close()
+    return {"ok": True, "table": table}
 
 
 @app.get("/api/queries")

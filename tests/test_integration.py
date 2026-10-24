@@ -36,7 +36,7 @@ def test_cross_join_times_out_under_eight_seconds(db_available):
     from db import UnsupportedServerError
     started = time.perf_counter()
     with pytest.raises(TimeoutError):
-        run_explain_analyze("SELECT COUNT(*) FROM orders a CROSS JOIN orders b CROSS JOIN orders c")
+        run_explain_analyze("SELECT SUM(a.id + b.id + c.id) FROM orders a CROSS JOIN orders b CROSS JOIN orders c")
     assert time.perf_counter() - started < 8
 
 
@@ -54,8 +54,12 @@ def test_grants_are_read_only(db_available):
     conn = _connection()
     cur = conn.cursor()
     cur.execute("SHOW GRANTS")
-    grants = " ".join(row[0].upper() for row in cur.fetchall())
-    assert "USAGE" in grants or "SELECT" in grants
-    assert "ALL PRIVILEGES" not in grants
-    assert "INSERT" not in grants and "CREATE" not in grants
+    grants = [row[0].upper() for row in cur.fetchall()]
+    joined_grants = " ".join(grants)
+    assert "USAGE" in joined_grants or "SELECT" in joined_grants
+    assert "ALL PRIVILEGES" not in joined_grants
+    assert any("SELECT ON `SQL_ANALYZER_TEST`.*" in grant for grant in grants)
+    assert any(all(privilege in grant for privilege in ("SELECT", "INSERT", "CREATE", "DROP")) and "`ANALYZER_UPLOADS`.*" in grant for grant in grants)
+    assert "INSERT ON `SQL_ANALYZER_TEST`" not in joined_grants
+    assert "CREATE ON `SQL_ANALYZER_TEST`" not in joined_grants
     cur.close(); conn.close()
