@@ -58,6 +58,55 @@
             </select>
             <input type="file" id="sql-file-input" accept=".sql,.txt" style="display:none;">
           </div>
+          <div class="csv-workspace">
+            <section class="csv-panel csv-upload-panel" aria-labelledby="csv-upload-heading">
+              <div class="csv-panel-heading">
+                <div>
+                  <h2 id="csv-upload-heading">Upload CSV</h2>
+                  <p class="csv-panel-hint">Create a table in your isolated uploads schema.</p>
+                </div>
+                <label class="csv-table-name" for="csv-table-name">
+                  <span class="csv-table-name-label">Table name <small>optional</small></span>
+                  <input id="csv-table-name" type="text" maxlength="60" placeholder="Use file name">
+                </label>
+              </div>
+              <input id="csv-file-input" class="sr-only" type="file" accept=".csv,text/csv">
+              <div id="csv-drop-zone" class="csv-drop-zone" role="button" tabindex="0" aria-label="Choose a CSV file or drop one here">
+                <svg class="csv-upload-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                  <path d="M12 16V4m0 0L8 8m4-4 4 4M5 14v4a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-4" />
+                </svg>
+                <span><strong>Drop a CSV file here</strong><small>or click to browse · CSV up to 5 MB</small></span>
+              </div>
+              <div class="csv-upload-row">
+                <span id="csv-file-name" class="csv-file-name" aria-live="polite">No file selected</span>
+                <button id="btn-upload-csv" class="button button-primary" type="button" disabled>
+                  <span id="csv-upload-spinner" class="spinner" hidden></span>
+                  <span id="csv-upload-label">Upload CSV</span>
+                </button>
+              </div>
+              <div id="csv-upload-banner" class="inline-banner csv-banner" role="status" aria-live="polite" hidden></div>
+              <div id="csv-schema-panel" class="csv-schema-panel" hidden>
+                <div class="csv-result-heading"><h3>Inferred schema</h3><button id="btn-use-sample-query" class="button button-secondary" type="button">Use sample query</button></div>
+                <div class="csv-schema-scroll">
+                  <table class="csv-schema-table">
+                    <thead><tr><th scope="col">Column Name</th><th scope="col">Type</th></tr></thead>
+                    <tbody id="csv-schema-body"></tbody>
+                  </table>
+                </div>
+              </div>
+            </section>
+            <section class="csv-panel uploaded-tables-panel" aria-labelledby="uploaded-tables-heading">
+              <div class="csv-panel-heading">
+                <div>
+                  <h2 id="uploaded-tables-heading">Uploaded tables</h2>
+                  <p class="csv-panel-hint">Select a table to query it.</p>
+                </div>
+              </div>
+              <div id="uploaded-table-list" class="uploaded-table-list" aria-live="polite">
+                <p class="csv-empty-state">Loading uploaded tables…</p>
+              </div>
+            </section>
+          </div>
           <output id="query-counter" class="query-counter" for="query-input" aria-live="polite" hidden></output>
         </div>
       </section>

@@ -23,6 +23,7 @@ let maxCompleted = 1;
 let demoOffline = false;
 let demoQueryId = "";
 let selectedDemoQueryId = "";
+let selectedCsvFile = null;
 const presentationDemo = new URLSearchParams(window.location.search).get("demo") === "1";
 
 const cyContainer = document.querySelector("#cy");
@@ -38,6 +39,18 @@ const runLabel = document.querySelector("#run-label");
 const uploadButton = document.querySelector("#btn-upload-sql");
 const uploadLabel = document.querySelector("#upload-label");
 const sqlFileInput = document.querySelector("#sql-file-input");
+const csvFileInput = document.querySelector("#csv-file-input");
+const csvTableNameInput = document.querySelector("#csv-table-name");
+const csvDropZone = document.querySelector("#csv-drop-zone");
+const csvFileName = document.querySelector("#csv-file-name");
+const csvUploadButton = document.querySelector("#btn-upload-csv");
+const csvUploadSpinner = document.querySelector("#csv-upload-spinner");
+const csvUploadLabel = document.querySelector("#csv-upload-label");
+const csvUploadBanner = document.querySelector("#csv-upload-banner");
+const csvSchemaPanel = document.querySelector("#csv-schema-panel");
+const csvSchemaBody = document.querySelector("#csv-schema-body");
+const csvSampleQueryButton = document.querySelector("#btn-use-sample-query");
+const uploadedTableList = document.querySelector("#uploaded-table-list");
 const examplesSelect = document.querySelector("#examples-select");
 const planSummary = document.querySelector("#plan-summary");
 const sourceBadge = document.querySelector("#source-badge");
@@ -1098,6 +1111,204 @@ listen("#sql-file-input", "change", async () => {
     if (sqlFileInput) sqlFileInput.value = "";
   }
 });
+
+function showCsvBanner(message, success = false) {
+  if (!csvUploadBanner) return;
+  csvUploadBanner.textContent = String(message || "Something went wrong.");
+  csvUploadBanner.classList.toggle("success", success);
+  csvUploadBanner.setAttribute("role", success ? "status" : "alert");
+  csvUploadBanner.hidden = false;
+}
+
+function clearCsvBanner() {
+  if (!csvUploadBanner) return;
+  csvUploadBanner.hidden = true;
+  csvUploadBanner.textContent = "";
+  csvUploadBanner.classList.remove("success");
+  csvUploadBanner.setAttribute("role", "status");
+}
+
+function selectCsvFile(file) {
+  if (!file) return;
+  const isCsv = file.name.toLowerCase().endsWith(".csv");
+  if (!isCsv) {
+    selectedCsvFile = null;
+    if (csvFileInput) csvFileInput.value = "";
+    if (csvFileName) csvFileName.textContent = "No file selected";
+    if (csvUploadButton) csvUploadButton.disabled = true;
+    showCsvBanner("Choose a .csv file.");
+    return;
+  }
+  if (file.size > 5 * 1024 * 1024) {
+    selectedCsvFile = null;
+    if (csvFileInput) csvFileInput.value = "";
+    if (csvFileName) csvFileName.textContent = "No file selected";
+    if (csvUploadButton) csvUploadButton.disabled = true;
+    showCsvBanner("CSV files must be 5 MB or smaller.");
+    return;
+  }
+  selectedCsvFile = file;
+  if (csvFileName) csvFileName.textContent = file.name;
+  if (csvUploadButton) csvUploadButton.disabled = false;
+  clearCsvBanner();
+}
+
+function renderCsvSchema(columns) {
+  if (!csvSchemaBody) return;
+  csvSchemaBody.replaceChildren();
+  for (const column of Array.isArray(columns) ? columns : []) {
+    const row = document.createElement("tr");
+    const nameCell = document.createElement("td");
+    const typeCell = document.createElement("td");
+    nameCell.textContent = String(column?.name || "");
+    typeCell.textContent = String(column?.type || "TEXT");
+    row.append(nameCell, typeCell);
+    csvSchemaBody.append(row);
+  }
+}
+
+function renderUploadedTables(uploads) {
+  if (!uploadedTableList) return;
+  uploadedTableList.replaceChildren();
+  const tables = (Array.isArray(uploads) ? uploads : []).filter((item) => /^up_[a-z0-9_]+$/i.test(String(item?.table || "")));
+  if (!tables.length) {
+    const empty = document.createElement("p");
+    empty.className = "csv-empty-state";
+    empty.textContent = "No uploaded tables yet.";
+    uploadedTableList.append(empty);
+    return;
+  }
+
+  for (const upload of tables) {
+    const table = String(upload.table);
+    const row = document.createElement("div");
+    row.className = "uploaded-table-row";
+    const info = document.createElement("div");
+    info.className = "uploaded-table-info";
+    const select = document.createElement("button");
+    select.type = "button";
+    select.className = "uploaded-table-select";
+    select.dataset.action = "select-table";
+    select.dataset.table = table;
+    select.title = `Query ${table}`;
+    select.textContent = table;
+    const count = document.createElement("span");
+    count.className = "uploaded-table-count";
+    count.textContent = `${Number(upload.row_count || 0).toLocaleString()} rows`;
+    info.append(select, count);
+
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "button button-secondary uploaded-table-delete";
+    remove.dataset.action = "delete-table";
+    remove.dataset.table = table;
+    remove.setAttribute("aria-label", `Delete ${table}`);
+    remove.textContent = "Delete";
+    row.append(info, remove);
+    uploadedTableList.append(row);
+  }
+}
+
+async function refreshUploadedTables() {
+  if (!uploadedTableList) return;
+  try {
+    const payload = await getJson("/api/uploads");
+    renderUploadedTables(payload?.uploads);
+  } catch (_error) {
+    const message = document.createElement("p");
+    message.className = "csv-empty-state";
+    message.textContent = "Uploaded tables could not be loaded.";
+    uploadedTableList.replaceChildren(message);
+  }
+}
+
+function injectUploadQuery(table) {
+  if (!queryInput || !/^up_[a-z0-9_]+$/i.test(String(table || ""))) return;
+  queryInput.value = `SELECT * FROM analyzer_uploads.${table} LIMIT 10;`;
+  selectedDemoQueryId = "";
+  updateQueryCounter();
+  clearErrorBanner();
+  queryInput.focus();
+}
+
+async function submitCsvUpload() {
+  if (!selectedCsvFile) {
+    showCsvBanner("Choose a CSV file before uploading.");
+    return;
+  }
+  if (csvUploadButton) csvUploadButton.disabled = true;
+  if (csvUploadSpinner) csvUploadSpinner.hidden = false;
+  if (csvUploadLabel) csvUploadLabel.textContent = "Uploading...";
+  const formData = new FormData();
+  const tableName = csvTableNameInput?.value.trim().replace(/\.csv$/i, "");
+  formData.append("file", selectedCsvFile, tableName ? `${tableName}.csv` : selectedCsvFile.name);
+  try {
+    const payload = await getJson("/api/upload-csv", { method: "POST", body: formData });
+    const table = String(payload?.table || "");
+    if (!payload?.ok || !/^up_[a-z0-9_]+$/i.test(table)) {
+      throw new Error("The server returned an invalid upload result.");
+    }
+    renderCsvSchema(payload.columns);
+    if (csvSchemaPanel) csvSchemaPanel.hidden = false;
+    if (csvSampleQueryButton) csvSampleQueryButton.dataset.table = table;
+    showCsvBanner(`Uploaded ${table} with ${Number(payload.row_count || 0).toLocaleString()} rows.`, true);
+    selectedCsvFile = null;
+    if (csvFileInput) csvFileInput.value = "";
+    if (csvFileName) csvFileName.textContent = "No file selected";
+    if (csvTableNameInput) csvTableNameInput.value = "";
+    await refreshUploadedTables();
+  } catch (error) {
+    showCsvBanner(`Upload failed: ${error.message}`);
+  } finally {
+    if (csvUploadSpinner) csvUploadSpinner.hidden = true;
+    if (csvUploadLabel) csvUploadLabel.textContent = "Upload CSV";
+    if (csvUploadButton) csvUploadButton.disabled = !selectedCsvFile;
+  }
+}
+
+listen("#csv-file-input", "change", () => selectCsvFile(csvFileInput?.files?.[0]));
+listen("#btn-upload-csv", "click", submitCsvUpload);
+listen("#btn-use-sample-query", "click", () => injectUploadQuery(csvSampleQueryButton?.dataset.table));
+csvDropZone?.addEventListener("click", () => csvFileInput?.click());
+csvDropZone?.addEventListener("keydown", (event) => {
+  if (event.key === "Enter" || event.key === " ") {
+    event.preventDefault();
+    csvFileInput?.click();
+  }
+});
+csvDropZone?.addEventListener("dragover", (event) => {
+  event.preventDefault();
+  csvDropZone.classList.add("drag-over");
+});
+csvDropZone?.addEventListener("dragleave", (event) => {
+  if (!event.relatedTarget || !csvDropZone.contains(event.relatedTarget)) {
+    csvDropZone.classList.remove("drag-over");
+  }
+});
+csvDropZone?.addEventListener("drop", (event) => {
+  event.preventDefault();
+  csvDropZone.classList.remove("drag-over");
+  selectCsvFile(event.dataTransfer?.files?.[0]);
+});
+uploadedTableList?.addEventListener("click", async (event) => {
+  const button = event.target.closest("button[data-action]");
+  if (!button) return;
+  const { action, table } = button.dataset;
+  if (action === "select-table") {
+    injectUploadQuery(table);
+    return;
+  }
+  if (action !== "delete-table" || !/^up_[a-z0-9_]+$/i.test(String(table || ""))) return;
+  button.disabled = true;
+  try {
+    await getJson(`/api/uploads/${encodeURIComponent(table)}`, { method: "DELETE" });
+    showCsvBanner(`Deleted ${table}.`, true);
+    await refreshUploadedTables();
+  } catch (error) {
+    showCsvBanner(`Could not delete ${table}: ${error.message}`);
+    button.disabled = false;
+  }
+});
 listen("#examples-select", "change", () => {
   const example = examplesById.get(examplesSelect?.value);
   if (!example || !queryInput) return;
@@ -1138,6 +1349,7 @@ async function initialize() {
   populateExamples();
   goToStep(1);
   updateQueryCounter();
+  refreshUploadedTables();
   if (queryInput) queryInput.focus();
 }
 
