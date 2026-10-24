@@ -10,9 +10,11 @@ from pathlib import Path
 
 import mysql.connector
 import sqlparse
+from sqlparse import tokens as sql_tokens
 from sqlparse.sql import Identifier, IdentifierList, Parenthesis
 from dotenv import load_dotenv
 
+from core.parser import parse_explain_analyze
 from security import validate_live_query, validate_query
 
 load_dotenv(Path(__file__).resolve().with_name(".env"))
@@ -23,11 +25,25 @@ class UnsupportedServerError(Exception):
 class DatabaseUploadConfigurationError(RuntimeError):
     pass
 
+class IndexSimulationValidationError(ValueError):
+    pass
+
+class IndexSimulationConflictError(RuntimeError):
+    pass
+
+class UploadTableNotFoundError(LookupError):
+    pass
+
+class UploadColumnNotFoundError(LookupError):
+    pass
+
 def get_connection():
     return mysql.connector.connect(host=os.getenv("DB_HOST", "127.0.0.1"), user=os.getenv("DB_USER", "analyzer_ro"), password=os.getenv("DB_PASS", ""), database=os.getenv("DB_NAME", "sql_analyzer_test"))
 
 
 UPLOAD_SCHEMA = "analyzer_uploads"
+_INDEX_SIMULATION_LOCK = "sql_analyzer_index_simulation"
+_INDEX_SIMULATION_CLONE = "up_temp_clone"
 
 
 _UPLOAD_BLOCKED_PATTERNS = (
@@ -157,6 +173,202 @@ def run_explain_analyze(raw_sql: str) -> dict:
             finally:
                 timer.cancel()
                 cursor.execute("ROLLBACK")
+
+
+_SIMULATION_SOURCE = re.compile(
+    r"\b(?:FROM|JOIN)\s+"
+    r"(?:(?:`(?P<quoted_schema>[^`]+)`|(?P<plain_schema>[\w$]+))\s*\.\s*)?"
+    r"(?:`(?P<quoted_table>[^`]+)`|(?P<plain_table>[\w$]+))",
+    re.IGNORECASE,
+)
+
+
+def _mask_sql_literals_and_comments(sql: str) -> str:
+    """Return a same-length SQL string with literals/comments hidden."""
+    pieces = []
+    for statement in sqlparse.parse(sql):
+        for token in statement.flatten():
+            value = token.value
+            if token.ttype in sql_tokens.Literal.String or token.ttype in sql_tokens.Comment:
+                value = "".join("\n" if char == "\n" else "\r" if char == "\r" else " " for char in value)
+            pieces.append(value)
+    return "".join(pieces)
+
+
+def _rewrite_query_for_simulation(query: str, table_name: str) -> str:
+    """Replace references to one uploaded table while preserving its aliases."""
+    masked = _mask_sql_literals_and_comments(query)
+    cte_names = _query_cte_names(query)
+    replacements = []
+    for match in _SIMULATION_SOURCE.finditer(masked):
+        schema = match.group("quoted_schema") or match.group("plain_schema")
+        table = match.group("quoted_table") or match.group("plain_table")
+        if table.casefold() != table_name.casefold():
+            continue
+        if schema and schema.strip("`").casefold() != UPLOAD_SCHEMA.casefold():
+            continue
+        if not schema and table.casefold() in cte_names:
+            continue
+        replacements.append((match.start(), match.end()))
+
+    if not replacements:
+        raise IndexSimulationValidationError(
+            "The query must reference the selected uploaded table in a FROM or JOIN clause."
+        )
+
+    clone_source = f"`{UPLOAD_SCHEMA}`.`{_INDEX_SIMULATION_CLONE}`"
+    rewritten = []
+    previous = 0
+    for start, end in replacements:
+        rewritten.append(query[previous:start])
+        rewritten.append(clone_source)
+        previous = end
+    rewritten.append(query[previous:])
+    return "".join(rewritten)
+
+
+def simulate_index(table_name: str, column_name: str, query: str) -> dict:
+    """Run EXPLAIN ANALYZE on a temporary copy of an uploaded table with an added index."""
+    table_name = str(table_name or "").strip()
+    column_name = str(column_name or "").strip().strip("`")
+    if not re.fullmatch(r"up_[a-z0-9_]{1,61}", table_name):
+        raise IndexSimulationValidationError("Only uploaded up_* tables can be simulated.")
+    if not column_name or len(column_name) > 64:
+        raise IndexSimulationValidationError("A valid column name is required.")
+
+    normalized_query = validate_live_query(query).strip().rstrip(";").rstrip()
+    rewritten_query = _rewrite_query_for_simulation(normalized_query, table_name)
+    escaped_table = table_name.replace("`", "``")
+    escaped_column = column_name.replace("`", "``")
+    escaped_clone = _INDEX_SIMULATION_CLONE.replace("`", "``")
+    source_table = f"`{UPLOAD_SCHEMA}`.`{escaped_table}`"
+    clone_table = f"`{UPLOAD_SCHEMA}`.`{escaped_clone}`"
+
+    conn = None
+    cursor = None
+    lock_acquired = False
+    clone_owned = False
+    try:
+        conn = get_connection()
+        cursor = conn.cursor(buffered=True)
+        cursor.execute("SELECT GET_LOCK(%s, 10)", (_INDEX_SIMULATION_LOCK,))
+        lock_result = cursor.fetchone()
+        if not lock_result or lock_result[0] != 1:
+            raise IndexSimulationConflictError("Another index simulation is running. Try again shortly.")
+        lock_acquired = True
+
+        cursor.execute(
+            "SELECT TABLE_NAME FROM information_schema.TABLES "
+            "WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s LIMIT 1",
+            (UPLOAD_SCHEMA, table_name),
+        )
+        if not cursor.fetchone():
+            raise UploadTableNotFoundError("Uploaded table not found.")
+
+        cursor.execute(
+            "SELECT COLUMN_NAME FROM information_schema.COLUMNS "
+            "WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s AND COLUMN_NAME = %s LIMIT 1",
+            (UPLOAD_SCHEMA, table_name, column_name),
+        )
+        if not cursor.fetchone():
+            raise UploadColumnNotFoundError("Column not found in the selected uploaded table.")
+
+        cursor.execute(
+            "SELECT 1 FROM information_schema.TABLES "
+            "WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s LIMIT 1",
+            (UPLOAD_SCHEMA, _INDEX_SIMULATION_CLONE),
+        )
+        if cursor.fetchone():
+            raise IndexSimulationConflictError("The temporary simulation table already exists.")
+
+        cursor.execute(
+            "SELECT INDEX_NAME FROM information_schema.STATISTICS "
+            "WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s AND INDEX_NAME = 'idx_test' LIMIT 1",
+            (UPLOAD_SCHEMA, table_name),
+        )
+        if cursor.fetchone():
+            raise IndexSimulationConflictError(
+                "The source table already has an index named idx_test; rename it before simulating."
+            )
+
+        cursor.execute("SELECT VERSION()")
+        version = str(cursor.fetchone()[0])
+        if "mariadb" in version.lower():
+            raise UnsupportedServerError()
+        try:
+            version_tuple = tuple(int(part) for part in version.split("-")[0].split(".")[:3])
+        except ValueError as exc:
+            raise UnsupportedServerError() from exc
+        if version_tuple < (8, 0, 18):
+            raise UnsupportedServerError()
+
+        # We verified under a server-wide advisory lock that this fixed name is free.
+        # Mark it owned before CREATE so finally also removes it if the DDL response fails.
+        clone_owned = True
+        cursor.execute(f"CREATE TABLE {clone_table} LIKE {source_table}")
+        cursor.execute(f"INSERT INTO {clone_table} SELECT * FROM {source_table}")
+        cursor.execute(f"ALTER TABLE {clone_table} ADD INDEX `idx_test` (`{escaped_column}`)")
+
+        cursor.execute("SET SESSION max_execution_time=5000")
+        cursor.execute("SELECT CONNECTION_ID()")
+        conn_id = cursor.fetchone()[0]
+        fired_event = threading.Event()
+        timer = threading.Timer(5.1, kill_query, args=(conn_id, fired_event))
+        timer.daemon = True
+        timer.start()
+        started = time.perf_counter()
+        try:
+            cursor.execute(f"EXPLAIN ANALYZE {rewritten_query}")
+            raw_plan = "\n".join(str(row[0]) for row in cursor.fetchall())
+            elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
+            if fired_event.is_set() or elapsed_ms >= 5000:
+                raise TimeoutError("Query exceeded 5s limit")
+        except Exception as exc:
+            if fired_event.is_set() or getattr(exc, "errno", None) in (3024, 1317):
+                raise TimeoutError("Query exceeded 5s limit") from exc
+            raise
+        finally:
+            timer.cancel()
+
+        tree = parse_explain_analyze(raw_plan)
+        plan_time = tree.get("time_total_ms")
+        execution_time_ms = round(float(plan_time), 2) if plan_time is not None else elapsed_ms
+        return {
+            "tree": tree,
+            "execution_time_ms": execution_time_ms,
+            "elapsed_ms": elapsed_ms,
+            "mysql_version": version,
+        }
+    finally:
+        if clone_owned and conn is not None:
+            try:
+                cleanup_cursor = cursor or conn.cursor()
+                cleanup_cursor.execute(f"DROP TABLE IF EXISTS {clone_table}")
+                clone_owned = False
+            except mysql.connector.Error:
+                # A failed EXPLAIN can invalidate its connection; try cleanup separately.
+                try:
+                    cleanup_conn = get_connection()
+                    try:
+                        with closing(cleanup_conn.cursor()) as cleanup_cursor:
+                            cleanup_cursor.execute(f"DROP TABLE IF EXISTS {clone_table}")
+                    finally:
+                        cleanup_conn.close()
+                except Exception:
+                    pass
+        if lock_acquired and conn is not None:
+            try:
+                with closing(conn.cursor()) as release_cursor:
+                    release_cursor.execute("SELECT RELEASE_LOCK(%s)", (_INDEX_SIMULATION_LOCK,))
+            except mysql.connector.Error:
+                pass
+        if cursor is not None:
+            try:
+                cursor.close()
+            except mysql.connector.Error:
+                pass
+        if conn is not None:
+            conn.close()
 
 
 def _json_safe(value):

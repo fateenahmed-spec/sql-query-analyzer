@@ -21,12 +21,17 @@ from core.service import calculate_stats, load_plan_text
 from core.steps import build_animation_steps
 from db import (
     DatabaseUploadConfigurationError,
+    IndexSimulationConflictError,
+    IndexSimulationValidationError,
     UnsupportedServerError,
+    UploadColumnNotFoundError,
+    UploadTableNotFoundError,
     build_row_flow,
     execute_sql_file,
     get_connection,
     run_explain_analyze,
     run_query_with_data,
+    simulate_index as run_index_simulation,
 )
 from security import UnsafeQueryError
 
@@ -399,6 +404,12 @@ class LiveQueryRequest(BaseModel):
     query: constr(max_length=5000)
 
 
+class IndexSimulationRequest(BaseModel):
+    query: constr(max_length=5000)
+    table_name: constr(min_length=1, max_length=64)
+    column_name: constr(min_length=1, max_length=64)
+
+
 class AIRequest(BaseModel):
     query: constr(max_length=5000)
     warnings: list[dict] = Field(default_factory=list)
@@ -476,6 +487,33 @@ def run_live(request: LiveQueryRequest):
         "columns": result["columns"],
         "source_samples": result["source_samples"],
     }
+
+
+@app.post("/api/simulate-index")
+def simulate_index_endpoint(request: IndexSimulationRequest):
+    if not _slots.acquire(blocking=False):
+        return JSONResponse(status_code=429, content={"ok": False, "error": "Server busy"})
+    try:
+        result = run_index_simulation(request.table_name, request.column_name, request.query)
+        return {"ok": True, **result}
+    except (UnsafeQueryError, IndexSimulationValidationError) as exc:
+        return JSONResponse(status_code=400, content={"ok": False, "error": str(exc)})
+    except (UploadTableNotFoundError, UploadColumnNotFoundError) as exc:
+        return JSONResponse(status_code=404, content={"ok": False, "error": str(exc)})
+    except IndexSimulationConflictError as exc:
+        return JSONResponse(status_code=409, content={"ok": False, "error": str(exc)})
+    except TimeoutError:
+        return JSONResponse(status_code=408, content={"ok": False, "error": "Query exceeded 5s limit"})
+    except UnsupportedServerError:
+        return JSONResponse(status_code=503, content={"ok": False, "error": "Database unsupported"})
+    except mysql.connector.Error as exc:
+        if getattr(exc, "errno", None) in (2002, 2003, 2005, 1045, 1049, 2006, 2013, 2055, 1142):
+            return JSONResponse(status_code=503, content={"ok": False, "error": "Index simulation is unavailable for this database account."})
+        return JSONResponse(status_code=500, content={"ok": False, "error": "Index simulation failed."})
+    except OSError:
+        return JSONResponse(status_code=503, content={"ok": False, "error": "Database unavailable"})
+    finally:
+        _slots.release()
 
 
 @app.post("/api/ai")

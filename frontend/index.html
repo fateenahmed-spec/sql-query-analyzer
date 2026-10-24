@@ -186,10 +186,21 @@
           <div id="ai-content" hidden>
             <section class="ai-summary-block"><h3>Summary</h3><p id="ai-summary"></p></section>
             <section class="ai-suggestions-block"><h3>Suggestions</h3><ol id="ai-suggestions"></ol></section>
+            <section id="ai-index-actions" class="ai-index-actions" hidden><h3>What-if index</h3><div id="ai-index-buttons" class="ai-index-buttons"></div></section>
             <section id="ai-fix-block" class="ai-fix-block" hidden><h3>Suggested fix</h3><pre id="ai-fix"></pre></section>
             <p id="ai-note" class="ai-note" hidden></p>
             <p id="ai-error" class="ai-error" hidden></p>
           </div>
+          <section id="index-simulation-panel" class="index-simulation-panel" aria-live="polite" hidden>
+            <div class="index-simulation-heading"><div><p class="eyebrow">WHAT-IF ANALYSIS</p><h3>Index simulation</h3></div></div>
+            <p id="index-simulation-loading" class="index-simulation-loading" hidden><span class="spinner" aria-hidden="true"></span><span>Simulating...</span></p>
+            <div id="index-simulation-comparison" class="index-simulation-comparison" hidden>
+              <p id="index-simulation-original"></p>
+              <p id="index-simulation-optimized"></p>
+            </div>
+            <p id="index-simulation-error" class="index-simulation-error" role="alert" hidden></p>
+            <div id="simulation-graph" class="simulation-graph" aria-label="Simulated execution plan" hidden></div>
+          </section>
         </article>
       </section>
     </main>

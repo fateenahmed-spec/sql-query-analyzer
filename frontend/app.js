@@ -5,6 +5,8 @@ if (typeof cytoscape !== "undefined" && typeof cytoscapeDagre !== "undefined") {
 }
 
 let cy = null;
+let simulationCy = null;
+let simulationRequestId = 0;
 let globalData = null;
 let currentPlan = null;
 let animSteps = [];
@@ -75,6 +77,13 @@ const processLog = document.querySelector("#process-log");
 const flowEvaluationBadge = document.querySelector("#flow-evaluation-badge");
 const aiContent = document.querySelector("#ai-content");
 const aiLoading = document.querySelector("#ai-loading");
+const aiIndexActions = document.querySelector("#ai-index-actions");
+const aiIndexButtons = document.querySelector("#ai-index-buttons");
+const indexSimulationPanel = document.querySelector("#index-simulation-panel");
+const indexSimulationLoading = document.querySelector("#index-simulation-loading");
+const indexSimulationComparison = document.querySelector("#index-simulation-comparison");
+const indexSimulationError = document.querySelector("#index-simulation-error");
+const simulationGraph = document.querySelector("#simulation-graph");
 
 const examples = [
   { id: "01_full_scan", title: "01 · Full table scan", sql: "SELECT * FROM orders WHERE amount > 500;" },
@@ -1723,7 +1732,184 @@ function populateExamples() {
   }
 }
 
+function resetIndexSimulation() {
+  simulationRequestId += 1;
+  if (simulationCy) {
+    simulationCy.destroy();
+    simulationCy = null;
+  }
+  if (indexSimulationPanel) indexSimulationPanel.hidden = true;
+  if (indexSimulationLoading) indexSimulationLoading.hidden = true;
+  if (indexSimulationComparison) indexSimulationComparison.hidden = true;
+  if (indexSimulationError) indexSimulationError.hidden = true;
+  if (simulationGraph) {
+    simulationGraph.hidden = true;
+    simulationGraph.replaceChildren();
+  }
+}
+
+function selectedUploadTables() {
+  return Array.from(uploadedTableList?.querySelectorAll(".uploaded-table-select") || [])
+    .map((button) => String(button.dataset.table || ""))
+    .filter((table) => /^up_[a-z0-9_]+$/i.test(table));
+}
+
+function indexSuggestions(explanation) {
+  const availableTables = selectedUploadTables();
+  if (!availableTables.length) return [];
+  const byName = new Map(availableTables.map((table) => [table.toLowerCase(), table]));
+  const query = String(globalData?.query || queryInput?.value || "");
+  const aliases = new Map();
+  const queryUploadTables = new Set();
+  const sourcePattern = /\b(?:FROM|JOIN)\s+(?:(?:`([^`]+)`|([\w$]+))\s*\.\s*)?(?:`([^`]+)`|([\w$]+))(?:\s+(?:AS\s+)?(?:`([^`]+)`|([\w$]+)))?/gi;
+  const reserved = new Set(["where", "join", "inner", "left", "right", "cross", "on", "group", "order", "having", "limit", "union", "offset", "using"]);
+  for (const match of query.matchAll(sourcePattern)) {
+    const schema = match[1] || match[2] || "";
+    const tableName = match[3] || match[4] || "";
+    const alias = match[5] || match[6] || "";
+    if (schema && schema.toLowerCase() !== "analyzer_uploads") continue;
+    const table = byName.get(tableName.toLowerCase());
+    if (table) {
+      queryUploadTables.add(table);
+      if (alias && !reserved.has(alias.toLowerCase())) aliases.set(alias.toLowerCase(), table);
+    }
+  }
+
+  function resolveTable(rawName, schema = "") {
+    const name = String(rawName || "").replace(/^[`\"]|[`\"]$/g, "");
+    if (schema && schema.toLowerCase() !== "analyzer_uploads") return null;
+    const exact = byName.get(name.toLowerCase());
+    if (exact && queryUploadTables.has(exact)) return exact;
+    const alias = aliases.get(name.toLowerCase());
+    if (alias) return alias;
+    const suffix = name.replace(/^up_/i, "").toLowerCase();
+    const suffixMatches = Array.from(queryUploadTables).filter((table) => table.replace(/^up_/i, "").toLowerCase() === suffix);
+    return suffixMatches.length === 1 ? suffixMatches[0] : null;
+  }
+
+  const body = [explanation.summary, ...(Array.isArray(explanation.suggestions) ? explanation.suggestions : []), explanation.fix]
+    .filter((value) => typeof value === "string")
+    .join("\n");
+  const parsed = [];
+  const add = (schema, table, column) => {
+    if (!column) return;
+    const resolvedTable = resolveTable(table, schema);
+    if (!resolvedTable) return;
+    const cleanColumn = String(column).replace(/^[`\"]|[`\"]$/g, "");
+    if (!/^[a-zA-Z_][\w$]{0,63}$/.test(cleanColumn)) return;
+    if (!parsed.some((item) => item.table_name === resolvedTable && item.column_name.toLowerCase() === cleanColumn.toLowerCase())) {
+      parsed.push({ table_name: resolvedTable, column_name: cleanColumn });
+    }
+  };
+
+  const indexDdl = /\b(?:index|indexed)\b[\s\S]{0,120}?\bon\s+(?:(?:`([^`]+)`|([\w$]+))\s*\.\s*)?(?:`([^`]+)`|([\w$]+))\s*\(\s*(?:`([^`]+)`|([\w$]+))/gi;
+  for (const match of body.matchAll(indexDdl)) add(match[1] || match[2], match[3] || match[4], match[5] || match[6]);
+
+  const dottedIndex = /\bindex\b[\s\S]{0,90}?\b(?:on|for)\s+(?:(?:`([^`]+)`|([\w$]+))\s*\.\s*)?(?:`([^`]+)`|([\w$]+))\s*\.\s*(?:`([^`]+)`|([\w$]+))/gi;
+  for (const match of body.matchAll(dottedIndex)) add(match[1] || match[2], match[3] || match[4], match[5] || match[6]);
+
+  const proseIndex = /\bindex\b[\s\S]{0,55}?\b(?:on|for)\s+(?:the\s+)?(?:column\s+)?`?([a-zA-Z_][\w$]*)`?(?:\s+column)?[\s\S]{0,45}?\b(?:of|in|on|for)\s+(?:the\s+)?(?:table\s+)?(?:(?:`?([\w$]+)`?)\s*\.\s*)?`?([\w$]+)`?/gi;
+  for (const match of body.matchAll(proseIndex)) add(match[2], match[3], match[1]);
+  return parsed;
+}
+
+function renderIndexSimulationActions(explanation) {
+  if (!aiIndexActions || !aiIndexButtons) return;
+  aiIndexButtons.replaceChildren();
+  const candidates = indexSuggestions(explanation);
+  aiIndexActions.hidden = candidates.length === 0;
+  for (const candidate of candidates) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "simulate-index-button";
+    button.dataset.table = candidate.table_name;
+    button.dataset.column = candidate.column_name;
+    button.textContent = `Simulate Index on ${candidate.column_name}`;
+    aiIndexButtons.append(button);
+  }
+}
+
+function simulationTime(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? `${number.toFixed(2)}ms` : "Unknown";
+}
+
+function renderSimulationGraph(tree) {
+  if (!simulationGraph || typeof cytoscape === "undefined" || typeof cytoscapeDagre === "undefined") {
+    throw new Error("The plan graph viewer is unavailable.");
+  }
+  if (simulationCy) simulationCy.destroy();
+  simulationGraph.replaceChildren();
+  simulationGraph.hidden = false;
+  const elements = flattenTree(tree);
+  if (!elements.length) throw new Error("The simulator returned an empty execution plan.");
+  const graph = cytoscape({
+    container: simulationGraph,
+    elements,
+    layout: { name: "preset" },
+    style: graphStyle(),
+    minZoom: 0.35,
+    maxZoom: 1.5,
+    userZoomingEnabled: true,
+    userPanningEnabled: true,
+  });
+  simulationCy = graph;
+  const layout = graph.nodes().union(graph.edges(".layout-edge")).layout({
+    name: "dagre",
+    rankDir: "TB",
+    nodeSep: 30,
+    rankSep: 45,
+    edgeSep: 14,
+  });
+  layout.one("layoutstop", () => {
+    if (simulationCy !== graph) return;
+    graph.edges(".layout-edge").remove();
+    graph.resize();
+    graph.fit(undefined, 20);
+  });
+  layout.run();
+}
+
+async function runIndexSimulation(candidate, button) {
+  if (!indexSimulationPanel) return;
+  resetIndexSimulation();
+  const requestId = simulationRequestId;
+  indexSimulationPanel.hidden = false;
+  indexSimulationLoading.hidden = false;
+  for (const action of aiIndexButtons.querySelectorAll(".simulate-index-button")) action.disabled = true;
+  try {
+    const result = await getJson("/api/simulate-index", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        query: globalData?.query || queryInput.value,
+        table_name: candidate.table_name,
+        column_name: candidate.column_name,
+      }),
+    });
+    if (requestId !== simulationRequestId) return;
+    const original = globalData?.tree || {};
+    const originalOperator = original.operator || "Execution plan";
+    const optimizedOperator = result.tree?.operator || "Execution plan";
+    setText("#index-simulation-original", `Original Plan: ${simulationTime(original.time_total_ms ?? globalData?.stats?.total_time_ms)} (${originalOperator})`);
+    setText("#index-simulation-optimized", `Optimized Plan: ${simulationTime(result.execution_time_ms)} (${optimizedOperator})`);
+    indexSimulationComparison.hidden = false;
+    renderSimulationGraph(result.tree);
+  } catch (error) {
+    if (requestId !== simulationRequestId) return;
+    indexSimulationError.textContent = error.message || "Index simulation failed.";
+    indexSimulationError.hidden = false;
+  } finally {
+    if (requestId === simulationRequestId) {
+      indexSimulationLoading.hidden = true;
+      for (const action of aiIndexButtons.querySelectorAll(".simulate-index-button")) action.disabled = false;
+      button.disabled = false;
+    }
+  }
+}
+
 function renderAiExplanation(explanation) {
+  resetIndexSimulation();
   aiLoading.hidden = true;
   aiContent.hidden = false;
   setText("#ai-summary", explanation.summary || "No summary was returned.");
@@ -1754,9 +1940,12 @@ function renderAiExplanation(explanation) {
   const error = document.querySelector("#ai-error");
   error.textContent = explanation.error || "";
   error.hidden = !explanation.error;
+  renderIndexSimulationActions(explanation);
 }
 
 async function loadAiInsights() {
+  resetIndexSimulation();
+  if (aiIndexActions) aiIndexActions.hidden = true;
   aiContent.hidden = true;
   aiLoading.hidden = false;
   const source = document.querySelector("#ai-source");
@@ -1785,6 +1974,12 @@ async function loadAiInsights() {
     renderAiExplanation({ summary: error.message, suggestions: [], source: "fallback" });
   }
 }
+
+aiIndexButtons?.addEventListener("click", (event) => {
+  const button = event.target.closest(".simulate-index-button");
+  if (!button || button.disabled) return;
+  runIndexSimulation({ table_name: button.dataset.table, column_name: button.dataset.column }, button);
+});
 
 for (const button of document.querySelectorAll(".stepper-item")) {
   button.addEventListener("click", () => {
