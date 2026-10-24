@@ -10,6 +10,7 @@ from pathlib import Path
 
 import mysql.connector
 import sqlparse
+from sqlparse.sql import Identifier, IdentifierList, Parenthesis
 from dotenv import load_dotenv
 
 from security import validate_live_query, validate_query
@@ -538,27 +539,114 @@ def build_row_flow(plan_tree: dict, conn) -> list[dict]:
     return steps
 
 
-def _source_table_names(plan_text: str, cursor) -> list[str]:
+def _query_cte_names(query_text: str) -> set[str]:
+    statements = sqlparse.parse(query_text or "")
+    if not statements:
+        return set()
+    tokens = [token for token in statements[0].tokens if not token.is_whitespace]
+    if not tokens or tokens[0].value.upper() != "WITH":
+        return set()
+    index = 1
+    if index < len(tokens) and tokens[index].value.upper() == "RECURSIVE":
+        index += 1
+    if index >= len(tokens):
+        return set()
+    token = tokens[index]
+    if isinstance(token, IdentifierList):
+        definitions = token.get_identifiers()
+    elif isinstance(token, Identifier):
+        definitions = [token]
+    else:
+        return set()
+    return {
+        name.casefold()
+        for definition in definitions
+        if (name := definition.get_name())
+    }
+
+
+def _query_table_aliases(query_text: str) -> dict[str, tuple[str | None, str, str]]:
+    query = sqlparse.format(query_text or "", strip_comments=True, reindent=False)
+    cte_names = _query_cte_names(query)
+    aliases = {}
+    for match in _QUERY_SOURCE.finditer(query):
+        source = match.group(1)
+        parts = [quoted or bare for quoted, bare in re.findall(r"`([^`]+)`|([\w$]+)", source)]
+        if not parts:
+            continue
+        schema = parts[-2] if len(parts) > 1 else None
+        table = parts[-1]
+        if table.casefold() in cte_names:
+            continue
+        alias = (match.group(2) or "").strip("`")
+        if not alias or alias.casefold() in _SQL_RESERVED:
+            continue
+        aliases[alias.casefold()] = (schema, table, alias)
+    return aliases
+
+
+def _query_derived_references(query_text: str) -> set[str]:
+    query = sqlparse.format(query_text or "", strip_comments=True, reindent=False)
+    derived = _query_cte_names(query)
+    for match in _QUERY_SOURCE.finditer(query):
+        source = match.group(1)
+        parts = [quoted or bare for quoted, bare in re.findall(r"`([^`]+)`|([\w$]+)", source)]
+        if not parts or parts[-1].casefold() not in derived:
+            continue
+        derived.add(parts[-1].casefold())
+        alias = (match.group(2) or "").strip("`")
+        if alias and alias.casefold() not in _SQL_RESERVED:
+            derived.add(alias.casefold())
+
+    def collect_derived_aliases(token):
+        if isinstance(token, Identifier) and any(isinstance(child, Parenthesis) for child in token.tokens):
+            alias = token.get_alias()
+            if alias:
+                derived.add(alias.casefold())
+        for child in getattr(token, "tokens", []):
+            collect_derived_aliases(child)
+
+    for statement in sqlparse.parse(query):
+        collect_derived_aliases(statement)
+    return derived
+
+
+def _source_table_names(plan_text: str, cursor, query_text: str = "") -> list[tuple[str, str, str | None]]:
     cursor.execute("SELECT DATABASE()")
     default_schema_row = cursor.fetchone()
     default_schema = str(default_schema_row[0]) if default_schema_row else "sql_analyzer_test"
+    aliases = _query_table_aliases(query_text)
+    derived_references = _query_derived_references(query_text)
     candidates = []
+    seen_references = set()
     for match in _TABLE_ACCESS.finditer(plan_text):
-        table_name = match.group(2)
-        schemas = [(match.group(1).strip("`"))] if match.group(1) else [default_schema, UPLOAD_SCHEMA]
+        plan_schema = match.group(1).strip("`") if match.group(1) else None
+        reference = match.group(2)
+        source = aliases.get(reference.casefold())
+        if source is None and reference.casefold() in derived_references:
+            continue
+        reference_identity = (reference.casefold(), source[2].casefold() if source else None)
+        if reference_identity in seen_references:
+            continue
+        seen_references.add(reference_identity)
+        if source:
+            schema_hint, table_name, alias = source
+            schemas = [schema_hint] if schema_hint else [default_schema, UPLOAD_SCHEMA]
+        else:
+            table_name = reference
+            alias = None
+            schemas = [plan_schema] if plan_schema else [default_schema, UPLOAD_SCHEMA]
         for schema in schemas:
-            table_ref = (schema, table_name)
-            if table_ref in candidates:
-                continue
             cursor.execute(
-                "SELECT 1 FROM information_schema.TABLES "
+                "SELECT TABLE_NAME FROM information_schema.TABLES "
                 "WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s LIMIT 1",
-                table_ref,
+                (schema, table_name),
             )
-            if cursor.fetchone():
-                candidates.append(table_ref)
-                if not match.group(1):
-                    break
+            table_row = cursor.fetchone()
+            if table_row:
+                resolved_table = str(table_row[0])
+                candidates.append((schema, resolved_table, alias))
+                break
     return candidates
 
 
@@ -598,13 +686,16 @@ def run_query_with_data(sql: str) -> dict:
     try:
         with closing(sample_conn.cursor()) as cursor:
             cursor.execute("SET SESSION MAX_EXECUTION_TIME=5000")
-            table_names = _source_table_names(plan_text, cursor)
-            for schema_name, table_name in table_names:
+            table_names = _source_table_names(plan_text, cursor, normalized_sql)
+            for schema_name, table_name, alias in table_names:
                 escaped_schema = schema_name.replace("`", "``")
                 escaped_table = table_name.replace("`", "``")
                 cursor.execute(f"SELECT * FROM `{escaped_schema}`.`{escaped_table}` LIMIT 10")
                 table_columns = [column[0] for column in (cursor.description or [])]
-                sample_key = table_name if schema_name == (os.getenv("DB_NAME") or "sql_analyzer_test") else f"{schema_name}.{table_name}"
+                if alias:
+                    sample_key = f"{alias} ({schema_name}.{table_name})"
+                else:
+                    sample_key = table_name if schema_name == (os.getenv("DB_NAME") or "sql_analyzer_test") else f"{schema_name}.{table_name}"
                 source_samples[sample_key] = [
                     {
                         column: _json_safe(value)

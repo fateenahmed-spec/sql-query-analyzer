@@ -209,6 +209,71 @@ def run_csv_checks() -> None:
     except (requests.RequestException, ValueError) as exc:
         report("8. Uploaded table query returns rows, tree, steps, and source samples", False, str(exc))
 
+    join_table = None
+    try:
+        if uploaded_table:
+            join_csv = "id,department\n1,Engineering\n2,Finance\n3,Research\n"
+            join_filename = f"e2e_join_{time.time_ns()}.csv"
+            join_upload = requests.post(
+                f"{BASE_URL}/api/upload-csv",
+                files={"file": (join_filename, join_csv.encode("utf-8"), "text/csv")},
+                timeout=TIMEOUT_SECONDS,
+            )
+            join_data = join_upload.json()
+            join_table = join_data.get("table") if join_data.get("ok") else None
+        if uploaded_table and join_table:
+            query = (
+                f"SELECT a.id, b.department FROM analyzer_uploads.{uploaded_table} AS a "
+                f"JOIN analyzer_uploads.{join_table} AS b ON a.id = b.id LIMIT 5"
+            )
+            response = post_live(query)
+            data = response.json()
+            samples = data.get("source_samples") or {}
+            passed = (
+                response.status_code == 200
+                and bool(samples)
+                and f"a (analyzer_uploads.{uploaded_table})" in samples
+                and f"b (analyzer_uploads.{join_table})" in samples
+                and bool(samples.get(f"a (analyzer_uploads.{uploaded_table})"))
+                and bool(samples.get(f"b (analyzer_uploads.{join_table})"))
+            )
+        else:
+            passed = False
+        report("9. Aliased join on uploaded tables returns samples keyed by each alias", passed)
+    except (requests.RequestException, ValueError) as exc:
+        report("9. Aliased join on uploaded tables returns samples keyed by each alias", False, str(exc))
+
+    try:
+        if uploaded_table:
+            query = (
+                f"SELECT a.id AS left_id, b.id AS right_id FROM analyzer_uploads.{uploaded_table} AS a "
+                f"JOIN analyzer_uploads.{uploaded_table} AS b ON a.id = b.id LIMIT 5"
+            )
+            response = post_live(query)
+            data = response.json()
+            samples = data.get("source_samples") or {}
+            alias_a = f"a (analyzer_uploads.{uploaded_table})"
+            alias_b = f"b (analyzer_uploads.{uploaded_table})"
+            passed = (
+                response.status_code == 200
+                and bool(samples)
+                and alias_a in samples
+                and alias_b in samples
+                and bool(samples[alias_a])
+                and bool(samples[alias_b])
+            )
+        else:
+            passed = False
+        report("10. Uploaded-table self-join returns distinct samples for both aliases", passed)
+    except (requests.RequestException, ValueError) as exc:
+        report("10. Uploaded-table self-join returns distinct samples for both aliases", False, str(exc))
+    finally:
+        if join_table:
+            try:
+                requests.delete(f"{BASE_URL}/api/uploads/{join_table}", timeout=TIMEOUT_SECONDS)
+            except requests.RequestException:
+                pass
+
     try:
         wrong_extension = requests.post(
             f"{BASE_URL}/api/upload-csv",
@@ -220,9 +285,9 @@ def run_csv_checks() -> None:
             files={"file": ("large.csv", b"x" * (5 * 1024 * 1024 + 1), "text/csv")},
             timeout=TIMEOUT_SECONDS,
         )
-        report("9. Wrong-extension and oversized CSV uploads return HTTP 400", wrong_extension.status_code == 400 and oversized.status_code == 400)
+        report("11. Wrong-extension and oversized CSV uploads return HTTP 400", wrong_extension.status_code == 400 and oversized.status_code == 400)
     except requests.RequestException as exc:
-        report("9. Wrong-extension and oversized CSV uploads return HTTP 400", False, str(exc))
+        report("11. Wrong-extension and oversized CSV uploads return HTTP 400", False, str(exc))
 
     try:
         if uploaded_table:
@@ -230,9 +295,9 @@ def run_csv_checks() -> None:
             passed = response.status_code == 400
         else:
             passed = False
-        report("10. INSERT on an uploaded table is rejected by the live-query guard", passed)
+        report("12. INSERT on an uploaded table is rejected by the live-query guard", passed)
     except requests.RequestException as exc:
-        report("10. INSERT on an uploaded table is rejected by the live-query guard", False, str(exc))
+        report("12. INSERT on an uploaded table is rejected by the live-query guard", False, str(exc))
 
     try:
         if uploaded_table:
@@ -251,9 +316,9 @@ def run_csv_checks() -> None:
                 uploaded_table = None
         else:
             passed = False
-        report("11. Deleted upload table is removed and can no longer be queried", passed)
+        report("13. Deleted upload table is removed and can no longer be queried", passed)
     except (requests.RequestException, ValueError) as exc:
-        report("11. Deleted upload table is removed and can no longer be queried", False, str(exc))
+        report("13. Deleted upload table is removed and can no longer be queried", False, str(exc))
     finally:
         if uploaded_table:
             try:
@@ -284,9 +349,9 @@ def run_csv_checks() -> None:
             and str(city_column.get("type", "")).startswith("VARCHAR(")
             and city_column.get("type") != "TEXT"
         )
-        report("12. Explicit CSV table name is honored and short string columns use VARCHAR", passed)
+        report("14. Explicit CSV table name is honored and short string columns use VARCHAR", passed)
     except (requests.RequestException, ValueError) as exc:
-        report("12. Explicit CSV table name is honored and short string columns use VARCHAR", False, str(exc))
+        report("14. Explicit CSV table name is honored and short string columns use VARCHAR", False, str(exc))
     finally:
         if explicit_table_created:
             try:

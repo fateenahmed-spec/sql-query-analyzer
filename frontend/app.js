@@ -24,6 +24,7 @@ let demoOffline = false;
 let demoQueryId = "";
 let selectedDemoQueryId = "";
 let selectedCsvFile = null;
+const noSampleRowsMessage = "No sample rows available for this operator (derived table or missing alias).";
 const presentationDemo = new URLSearchParams(window.location.search).get("demo") === "1";
 
 const cyContainer = document.querySelector("#cy");
@@ -546,12 +547,21 @@ function renderSourceTables() {
     return;
   }
   const title = step.op === "scan" ? `Source scan - ${step.label}` : `Input rows - ${step.label}`;
-  renderFlowRows(container, title, flowInputRids(step), currentIndex >= 0 ? currentStepStates(step) : {});
+  const rids = flowInputRids(step);
+  if (!rids.length && !step.never_executed) {
+    appendEmpty(container, `${noSampleRowsMessage} Full run reported ${formattedCount(step.actual_rows)} rows.`);
+    return;
+  }
+  renderFlowRows(container, title, rids, currentIndex >= 0 ? currentStepStates(step) : {});
 }
 
 function renderIntermediateStats() {
   const container = document.querySelector("#intermediate-table");
   const step = currentIndex >= 0 ? animSteps[currentIndex] : null;
+  if (step && !step.never_executed && !flowInputRids(step).length) {
+    appendEmpty(container, `${noSampleRowsMessage} Full run reported ${formattedCount(step.actual_rows)} rows.`);
+    return;
+  }
   if (!step || currentRowIndex < 0 || step.never_executed) {
     appendEmpty(container, "Intermediate rows appear as each sample row is processed.");
     return;
@@ -697,7 +707,11 @@ function updateGraphVisuals() {
         ? `Sample row ${currentRowIndex + 1} of ${rids.length} (table has ${formattedCount(tableCount)} rows).`
         : stepSummary(step);
     } else {
-      stepStatus.textContent = step.never_executed ? "Never executed: upstream returned 0 rows." : step.note || "No sample rows to animate.";
+      stepStatus.textContent = step.never_executed
+        ? "Never executed: upstream returned 0 rows."
+        : !flowInputRids(step).length
+          ? `${noSampleRowsMessage} Full run reported ${formattedCount(step.actual_rows)} rows.`
+          : step.note || "No sample rows to animate.";
     }
   } else {
     if (flowEvaluationBadge) {
@@ -722,7 +736,11 @@ function applyAnimationEvent(eventIndex, writeLog = true) {
 
   if (event.rowIndex < 0) {
     if (writeLog) {
-      appendProcessLog(step.never_executed ? "Never executed: upstream returned 0 rows." : step.note || `${step.label}: no sample rows to animate.`);
+      appendProcessLog(step.never_executed
+        ? "Never executed: upstream returned 0 rows."
+        : !flowInputRids(step).length
+          ? noSampleRowsMessage
+          : step.note || `${step.label}: no sample rows to animate.`);
     }
     return;
   }
