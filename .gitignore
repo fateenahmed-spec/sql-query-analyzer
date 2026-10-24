@@ -4,3 +4,5 @@ __pycache__/
 .pytest_cache/
 .DS_Store
 ai_cache.json
+diag_*.py
+sample_upload.csv
