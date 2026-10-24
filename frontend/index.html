@@ -26,7 +26,10 @@
         <i aria-hidden="true"></i>
         <button class="stepper-item" type="button" data-step="4" disabled><span>4</span><b>AI Insights</b></button>
       </nav>
-      <button id="btn-start-over" class="button button-quiet" type="button" hidden>Start Over</button>
+      <div class="header-actions">
+        <button id="btn-theme-toggle" class="button button-secondary theme-toggle" type="button" aria-label="Switch to light theme">☀️ Light</button>
+        <button id="btn-start-over" class="button button-quiet" type="button" hidden>Start Over</button>
+      </div>
     </header>
 
     <main class="main-content">
@@ -162,6 +165,7 @@
           <div class="flow-column-heading"><div><p class="eyebrow">LIVE TRACE</p><h2 id="process-log-heading">Process log</h2></div></div>
           <ol id="process-log" aria-live="polite" aria-relevant="additions"></ol>
         </section>
+        <div class="step-actions flow-view-action"><button id="btn-full-page-flow" class="button button-secondary" type="button">Open Full-Page View ↗</button></div>
         <div class="flow-grid">
           <section class="flow-column" aria-labelledby="source-heading"><div class="flow-column-heading"><div><p class="eyebrow">INPUT</p><h2 id="source-heading">Source samples</h2></div><span class="column-mark source-mark">A</span></div><div id="source-tables" class="table-stack"></div></section>
           <section class="flow-column" aria-labelledby="intermediate-heading"><div class="flow-column-heading"><div><p class="eyebrow">PROCESSING</p><h2 id="intermediate-heading">Intermediate</h2></div><span class="column-mark process-mark">B</span></div><div id="intermediate-table" class="table-stack"></div></section>
@@ -187,6 +191,7 @@
         </article>
       </section>
     </main>
+    <div id="flow-view" style="display:none;"></div>
   </div>
   <div id="toast-region" class="toast-region" aria-live="polite" aria-atomic="false"></div>
   <script src="app.js" defer></script>

@@ -24,10 +24,14 @@ let demoOffline = false;
 let demoQueryId = "";
 let selectedDemoQueryId = "";
 let selectedCsvFile = null;
+let fullFlowAutoScroll = true;
 const noSampleRowsMessage = "No sample rows available for this operator (derived table or missing alias).";
 const presentationDemo = new URLSearchParams(window.location.search).get("demo") === "1";
 
 const cyContainer = document.querySelector("#cy");
+const flowView = document.querySelector("#flow-view");
+const mainContent = document.querySelector(".main-content");
+const themeToggle = document.querySelector("#btn-theme-toggle");
 const queryInput = document.querySelector("#query-input");
 const queryError = document.querySelector("#query-error");
 const queryErrorMessage = document.querySelector("#query-error-message");
@@ -149,6 +153,22 @@ function displayValue(value) {
   return String(value);
 }
 
+function applyTheme(theme, save = false) {
+  const isLight = theme === "light";
+  document.body.classList.toggle("light-theme", isLight);
+  if (themeToggle) {
+    themeToggle.textContent = isLight ? "🌙 Dark" : "☀️ Light";
+    themeToggle.setAttribute("aria-label", isLight ? "Switch to dark theme" : "Switch to light theme");
+    themeToggle.setAttribute("aria-pressed", String(isLight));
+  }
+  const themeMeta = document.querySelector('meta[name="theme-color"]');
+  if (themeMeta) themeMeta.content = isLight ? "#f8fafc" : "#0a0a0a";
+  if (save) {
+    try { localStorage.setItem("query-lens-theme", isLight ? "light" : "dark"); } catch (_) { /* Storage may be unavailable in private browsing. */ }
+  }
+  if (cy) cy.style(graphStyle());
+}
+
 function timeLabel(value) {
   if (value === null || value === undefined) return "—";
   return `${Number(value).toFixed(2)} ms`;
@@ -196,12 +216,13 @@ function planNodes(root) {
 }
 
 function graphStyle() {
+  const lightTheme = document.body.classList.contains("light-theme");
   return [
     {
       selector: "node",
       style: {
         label: "data(label)",
-        color: "#ededed",
+        color: lightTheme ? "#0f172a" : "#ededed",
         "font-size": 11,
         "font-weight": 600,
         "font-family": "system-ui, sans-serif",
@@ -215,12 +236,17 @@ function graphStyle() {
         shape: "round-rectangle",
         "background-color": (element) => {
           const percentage = Number(element.data("self_time_pct") || 0);
+          if (lightTheme) {
+            if (percentage >= 40) return "#fee2e2";
+            if (percentage >= 20) return "#ffedd5";
+            return "#e2e8f0";
+          }
           if (percentage >= 40) return "#7f1d1d";
           if (percentage >= 20) return "#7c2d12";
           return "#262626";
         },
         "border-width": 1,
-        "border-color": "#525252",
+        "border-color": lightTheme ? "#94a3b8" : "#525252",
         opacity: 1,
         "overlay-opacity": 0,
       },
@@ -228,7 +254,7 @@ function graphStyle() {
     { selector: "node[has_warnings = true]", style: { "border-width": 3, "border-color": "#ef4444" } },
     { selector: "node[never_executed = true]", style: { opacity: 0.5, "border-style": "dashed" } },
     { selector: "node[dead_end = true]", style: { "border-width": 3, "border-color": "#c084fc", "border-style": "dashed" } },
-    { selector: "node.error-node", style: { label: "data(label)", "background-color": "#7f1d1d", "border-color": "#ef4444", "border-width": 3, width: 300, height: 100, "text-wrap": "wrap", "text-max-width": 260 } },
+    { selector: "node.error-node", style: { label: "data(label)", "background-color": lightTheme ? "#fee2e2" : "#7f1d1d", "border-color": "#ef4444", "border-width": 3, width: 300, height: 100, "text-wrap": "wrap", "text-max-width": 260 } },
     { selector: "node.current-node", style: { "border-color": "#fbbf24", "border-width": "5px" } },
     { selector: "node:selected", style: { "border-color": "#3b82f6", "border-width": 3 } },
     {
@@ -236,9 +262,9 @@ function graphStyle() {
       style: {
         width: "mapData(rows_total, 0, 10000, 2, 8)",
         "curve-style": "bezier",
-        "line-color": "#52525b",
+        "line-color": lightTheme ? "#94a3b8" : "#52525b",
         "source-arrow-shape": "triangle",
-        "source-arrow-color": "#52525b",
+        "source-arrow-color": lightTheme ? "#94a3b8" : "#52525b",
         "target-arrow-shape": "none",
         "target-distance-from-node": 4,
         "source-distance-from-node": 4,
@@ -618,6 +644,364 @@ function renderTables() {
   renderFinalResults();
 }
 
+function shortPipelineRid(rid, record, index) {
+  const match = String(rid || "").match(/#(\d+)$/);
+  if (match) {
+    const alias = record?.alias;
+    const table = String(record?.table || "row").split(".").pop();
+    return `${alias || table}#${match[1]}`;
+  }
+  const alias = record?.alias;
+  const table = String(record?.table || String(rid || "row")).split(".").pop();
+  return `${alias || table}#${index + 1}`;
+}
+
+function pipelineCell(text, classes = "", title = "") {
+  const cell = document.createElement("div");
+  cell.className = `pipeline-cell${classes ? ` ${classes}` : ""}`;
+  cell.textContent = text;
+  if (title) cell.title = title;
+  return cell;
+}
+
+function pipelineTable(title, rows, options = {}) {
+  const block = document.createElement("section");
+  block.className = `pipeline-table-block${options.result ? " pipeline-result-table" : ""}`;
+  const heading = document.createElement("div");
+  heading.className = "pipeline-table-title";
+  const headingName = document.createElement("strong");
+  headingName.textContent = title;
+  const headingCount = document.createElement("span");
+  headingCount.textContent = `${rows.length} ${rows.length === 1 ? "row" : "rows"}`;
+  heading.append(headingName, headingCount);
+  block.append(heading);
+
+  const dataRows = rows.filter((row) => row && row.record && typeof row.record === "object");
+  if (!dataRows.length) {
+    const empty = document.createElement("p");
+    empty.className = "pipeline-empty";
+    empty.textContent = options.emptyMessage || noSampleRowsMessage;
+    block.append(empty);
+    return block;
+  }
+  const columns = Object.keys(dataRows[0].record.values || {});
+  const wrap = document.createElement("div");
+  wrap.className = "pipeline-table-wrap";
+  const table = document.createElement("div");
+  table.className = `pipeline-table${columns.length > 8 ? " has-many-columns" : ""}`;
+  table.style.setProperty("--flow-column-count", String(columns.length));
+  table.setAttribute("role", "table");
+  if (!options.result) table.append(pipelineCell("State", "is-header is-state"), pipelineCell("Row ID", "is-header is-rid"));
+  for (const column of columns) table.append(pipelineCell(column, "is-header", column));
+
+  dataRows.forEach((entry, index) => {
+    const record = entry.record;
+    const values = record.values || {};
+    const state = entry.state || "sample";
+    const row = document.createElement("div");
+    row.className = `pipeline-row${state === "pass" ? " flow-pass" : ""}${state === "fail" ? " flow-fail" : ""}${entry.active ? " flow-active" : ""}${entry.collapsed ? " flow-collapsed" : ""}`;
+    row.setAttribute("role", "row");
+    const stateText = state === "pass" ? "✓ PASS" : state === "fail" ? "× FAIL" : state === "result" ? "RESULT" : "SAMPLE";
+    if (!options.result) {
+      row.append(pipelineCell(stateText, `is-state${state === "fail" ? " is-null" : ""}`));
+      row.append(pipelineCell(shortPipelineRid(entry.rid, record, index), "is-rid", String(entry.rid || "")));
+    }
+    for (const column of columns) {
+      const value = values[column];
+      const text = displayValue(value);
+      const numeric = typeof value === "number" || (typeof value === "string" && value.trim() !== "" && Number.isFinite(Number(value)));
+      const classes = `${value === null || value === undefined ? "is-null" : ""}${numeric ? " is-number" : ""}`.trim();
+      row.append(pipelineCell(text, classes, text));
+    }
+    table.append(row);
+    if (entry.reason && state === "fail") {
+      const reason = document.createElement("div");
+      reason.className = "pipeline-reason";
+      reason.textContent = entry.reason;
+      table.append(reason);
+    }
+  });
+  wrap.append(table);
+  block.append(wrap);
+  return block;
+}
+
+function pipelineConditionReason(step, record, passed) {
+  const condition = String(step.condition || step.label || "").trim();
+  const match = condition.match(/(?:`?[\w$]+`?\s*\.\s*)*`?([\w$]+)`?\s*(>=|<=|<>|!=|=|>|<)\s*(?:'([^']*)'|"([^"]*)"|(-?\d+(?:\.\d+)?))/i);
+  if (!match) return step.note || `Unsupported condition: cannot evaluate ${condition || "this operator"} from the sample values.`;
+  const column = match[1];
+  const operator = match[2];
+  const expected = match[3] ?? match[4] ?? match[5];
+  const key = Object.keys(record?.values || {}).find((candidate) => candidate.toLowerCase() === column.toLowerCase());
+  if (!key) return `Cannot explain ${condition}: column ${column} is missing from this sample row.`;
+  const actual = displayValue(record.values[key]);
+  return passed
+    ? `${column} ${actual} satisfies ${operator} ${expected}`
+    : `${column} ${actual} is not ${operator} ${expected}`;
+}
+
+function pipelineStepRows(step, stepIndex) {
+  const records = globalData?.row_records || {};
+  const outputs = new Set(step.output_rids || []);
+  return flowInputRids(step).map((rid, rowIndex) => {
+    const record = records[rid];
+    if (!record) return null;
+    const eventIndex = animationEvents.findIndex((event) => event.stepIndex === stepIndex && event.rowIndex === rowIndex);
+    const processed = eventIndex >= 0 && animationEventIndex >= eventIndex;
+    const active = processed && animationEventIndex === eventIndex;
+    const passed = step.row_results?.[rid] ?? outputs.has(rid);
+    const state = processed ? (passed ? "pass" : "fail") : "sample";
+    return {
+      rid,
+      record,
+      state,
+      active,
+      collapsed: state === "fail" && !active,
+      reason: step.op === "filter" && !passed ? pipelineConditionReason(step, record, false) : "",
+    };
+  }).filter(Boolean);
+}
+
+function pipelineCard(step, stepIndex) {
+  const card = document.createElement("article");
+  card.className = "pipeline-card";
+  card.dataset.stepIndex = String(stepIndex);
+  if (currentIndex === stepIndex) card.classList.add("is-active");
+
+  const heading = document.createElement("header");
+  heading.className = "pipeline-card-heading";
+  const titleGroup = document.createElement("div");
+  const title = document.createElement("h2");
+  title.textContent = step.label || step.op || "Query operator";
+  const detail = document.createElement("p");
+  detail.textContent = `${String(step.op || "operator").toUpperCase()}${step.condition ? ` · ${step.condition}` : ""}`;
+  titleGroup.append(title, detail);
+  const count = document.createElement("span");
+  count.className = "pipeline-count";
+  count.textContent = `${formattedCount((step.output_rids || []).length)} sample out`;
+  heading.append(titleGroup, count);
+  card.append(heading);
+
+  const body = document.createElement("div");
+  body.className = "pipeline-card-body";
+  const rids = flowInputRids(step);
+  const outputCount = (step.output_rids || []).length;
+  const record = (globalData?.row_records || {})[rids[0]];
+  const inputCount = step.op === "scan"
+    ? Number(step.table_row_count || record?.table_row_count || step.actual_rows || rids.length)
+    : Number(step.input_rids?.length || rids.length);
+  const stats = document.createElement("div");
+  stats.className = "pipeline-stat-grid";
+  for (const [label, value] of [["Input rows", inputCount], ["Sample output", outputCount], ["Plan rows", Number(step.actual_rows || 0)]]) {
+    const stat = document.createElement("div");
+    stat.className = "pipeline-stat";
+    const caption = document.createElement("span");
+    caption.textContent = label;
+    const statValue = document.createElement("strong");
+    statValue.textContent = formattedCount(value);
+    stat.append(caption, statValue);
+    stats.append(stat);
+  }
+  body.append(stats);
+
+  if (step.op === "join") {
+    const scans = animSteps.map((candidate, index) => ({ candidate, index }))
+      .filter((item) => item.candidate.op === "scan" && item.index < stepIndex)
+      .slice(-2);
+    if (scans.length) {
+      const joinInputs = document.createElement("div");
+      joinInputs.className = "pipeline-join-inputs";
+      for (const item of scans) {
+        const scanRows = pipelineStepRows(item.candidate, item.index);
+        const sample = scanRows.map((entry) => ({ ...entry, state: "sample", active: false, collapsed: false }));
+        const first = sample[0]?.record;
+        const alias = first?.alias ? ` (${first.alias})` : "";
+        const tableName = first?.table || item.candidate.label || "Join input";
+        joinInputs.append(pipelineTable(`${tableName}${alias}`, sample, { emptyMessage: item.candidate.note || noSampleRowsMessage }));
+      }
+      body.append(joinInputs);
+    }
+  }
+
+  if (rids.length) {
+    body.append(pipelineTable("Rows at this operator", pipelineStepRows(step, stepIndex), {
+      emptyMessage: step.note || noSampleRowsMessage,
+    }));
+  } else {
+    const empty = document.createElement("p");
+    empty.className = "pipeline-empty";
+    empty.textContent = step.never_executed
+      ? `Never executed: upstream returned 0 rows. Plan reports ${formattedCount(step.actual_rows)} output rows.`
+      : step.note || `${noSampleRowsMessage} Input count ${formattedCount(inputCount)}; output count ${formattedCount(step.actual_rows || outputCount)}.`;
+    body.append(empty);
+  }
+  if (step.note && rids.length) {
+    const note = document.createElement("p");
+    note.className = "pipeline-empty";
+    note.textContent = step.note;
+    body.append(note);
+  }
+  card.append(body);
+  return card;
+}
+
+function createFlowToolbar() {
+  const toolbar = document.createElement("section");
+  toolbar.className = "flow-toolbar";
+  toolbar.setAttribute("aria-label", "Full-page animation controls");
+  const buttons = document.createElement("div");
+  buttons.className = "playback-buttons";
+  const controls = [
+    ["Play", playAnimation], ["Pause", pauseAnimation], ["Step Back", stepBack],
+    ["Step Forward", stepForward], ["Reset", resetAnimation],
+    ["Skip to End", skipAnimationToEnd],
+  ];
+  for (const [label, handler] of controls) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "button button-secondary";
+    button.textContent = label;
+    button.addEventListener("click", handler);
+    buttons.append(button);
+  }
+  const exit = document.createElement("button");
+  exit.type = "button";
+  exit.className = "button button-quiet flow-exit-button";
+  exit.textContent = "Back to wizard";
+  exit.addEventListener("click", () => { window.location.hash = "#step-3"; });
+  buttons.append(exit);
+  toolbar.append(buttons);
+
+  const controlsRow = document.createElement("div");
+  controlsRow.className = "flow-toolbar-bottom";
+  const autoLabel = document.createElement("label");
+  autoLabel.className = "flow-auto-scroll";
+  const autoScroll = document.createElement("input");
+  autoScroll.type = "checkbox";
+  autoScroll.checked = fullFlowAutoScroll;
+  autoScroll.addEventListener("change", () => { fullFlowAutoScroll = autoScroll.checked; });
+  autoLabel.append(autoScroll, document.createTextNode("Auto-scroll"));
+
+  const speedLabel = document.createElement("label");
+  speedLabel.className = "flow-speed-control";
+  speedLabel.append(document.createTextNode("Speed"));
+  const flowSpeed = document.createElement("input");
+  flowSpeed.type = "range";
+  flowSpeed.min = "300";
+  flowSpeed.max = "2000";
+  flowSpeed.step = "100";
+  flowSpeed.value = speedSlider?.value || "1000";
+  flowSpeed.addEventListener("input", () => { if (speedSlider) speedSlider.value = flowSpeed.value; });
+  speedLabel.append(flowSpeed);
+
+  const progressWrap = document.createElement("div");
+  progressWrap.className = "flow-progress";
+  const progress = document.createElement("progress");
+  progress.max = Math.max(animationEvents.length, 1);
+  progress.value = animationEventIndex + 1;
+  const status = document.createElement("span");
+  status.textContent = stepStatus?.textContent || `Ready (0 / ${animationEvents.length})`;
+  progressWrap.append(progress, status);
+  controlsRow.append(autoLabel, speedLabel, progressWrap);
+  toolbar.append(controlsRow);
+  return toolbar;
+}
+
+function renderFullPageFlow() {
+  if (!flowView || flowView.style.display === "none") return;
+  const page = document.createElement("div");
+  page.className = "full-flow-page";
+  const heading = document.createElement("header");
+  heading.className = "full-flow-heading";
+  const titleGroup = document.createElement("div");
+  const eyebrow = document.createElement("p");
+  eyebrow.className = "eyebrow";
+  eyebrow.textContent = "QUERY EXECUTION";
+  const title = document.createElement("h1");
+  title.textContent = "Data flow pipeline";
+  const query = document.createElement("p");
+  query.className = "full-flow-query";
+  query.textContent = globalData?.query || "Run a query to inspect its row-by-row data flow.";
+  titleGroup.append(eyebrow, title, query);
+  heading.append(titleGroup);
+  page.append(heading);
+
+  if (!globalData) {
+    const empty = document.createElement("section");
+    empty.className = "pipeline-card";
+    const message = document.createElement("p");
+    message.className = "pipeline-empty";
+    message.textContent = "Run a query in Step 1 first. Its execution pipeline will appear here.";
+    empty.append(message);
+    page.append(empty);
+    flowView.replaceChildren(page);
+    return;
+  }
+
+  page.append(createFlowToolbar());
+  const pipeline = document.createElement("div");
+  pipeline.className = "pipeline";
+  const indexedSteps = animSteps.map((step, index) => ({ step, index }));
+  indexedSteps.sort((left, right) => Number(right.step.op === "scan") - Number(left.step.op === "scan") || left.index - right.index);
+  indexedSteps.forEach(({ step, index }, position) => {
+    pipeline.append(pipelineCard(step, index));
+    const nextCount = (step.output_rids || []).length;
+    const connector = document.createElement("div");
+    connector.className = "pipeline-connector";
+    const label = document.createElement("span");
+    label.className = "pipeline-connector-label";
+    label.textContent = `${formattedCount(nextCount)} sample ${nextCount === 1 ? "row" : "rows"} passed`;
+    const arrow = document.createElement("span");
+    arrow.className = "pipeline-connector-arrow";
+    arrow.setAttribute("aria-hidden", "true");
+    arrow.textContent = "↓";
+    connector.append(label, arrow);
+    pipeline.append(connector);
+  });
+
+  const finalCard = document.createElement("article");
+  finalCard.className = "pipeline-card pipeline-final-card";
+  if (currentIndex === -1 && animationEventIndex >= animationEvents.length - 1 && animationEvents.length) finalCard.classList.add("is-active");
+  const finalHeading = document.createElement("header");
+  finalHeading.className = "pipeline-card-heading";
+  const finalTitle = document.createElement("div");
+  const finalTitleText = document.createElement("h2");
+  finalTitleText.textContent = "Final query result";
+  const finalDetail = document.createElement("p");
+  finalDetail.textContent = "Rows returned by the executed SQL query";
+  finalTitle.append(finalTitleText, finalDetail);
+  const finalCount = document.createElement("span");
+  finalCount.className = "pipeline-count";
+  finalCount.textContent = `${formattedCount((globalData.rows || []).length)} result rows`;
+  finalHeading.append(finalTitle, finalCount);
+  finalCard.append(finalHeading);
+  const animationComplete = animationEvents.length > 0 && animationEventIndex >= animationEvents.length - 1;
+  if (animationComplete) finalCard.classList.add("is-active");
+  const finalBody = document.createElement("div");
+  finalBody.className = "pipeline-card-body";
+  const finalRows = (globalData.rows || []).map((row, index) => ({
+    rid: `result#${index + 1}`,
+    record: { values: row },
+    state: "result",
+  }));
+  finalBody.append(pipelineTable("Returned rows", finalRows, {
+    result: true,
+    emptyMessage: demoOffline ? "Offline demo plans do not include live result rows." : "The query returned 0 rows.",
+  }));
+  finalCard.append(finalBody);
+  pipeline.append(finalCard);
+  page.append(pipeline);
+  flowView.replaceChildren(page);
+
+  if (fullFlowAutoScroll && currentIndex >= 0) {
+    const activeCard = animationComplete
+      ? finalCard
+      : flowView.querySelector(`.pipeline-card[data-step-index="${currentIndex}"]`);
+    if (activeCard) requestAnimationFrame(() => activeCard.scrollIntoView({ behavior: "smooth", block: "center" }));
+  }
+}
+
 function findPlanNode(node, id) {
   if (node.id === id) return node;
   for (const child of node.children || []) {
@@ -723,6 +1107,7 @@ function updateGraphVisuals() {
   stepProgress.max = Math.max(animationEvents.length, 1);
   stepProgress.value = animationEventIndex + 1;
   renderTables();
+  renderFullPageFlow();
 }
 
 function applyAnimationEvent(eventIndex, writeLog = true) {
@@ -857,6 +1242,12 @@ function stepForward() {
   if (!animationEvents.length || animationEventIndex >= animationEvents.length - 1) return;
   const nextIndex = Math.min(animationEvents.length - 1, animationEventIndex + 1);
   applyAnimationEvent(nextIndex);
+}
+
+function skipAnimationToEnd() {
+  cancelAnimationLoop();
+  if (!animationEvents.length) return;
+  applyAnimationEvent(animationEvents.length - 1);
 }
 
 function stepBack() {
@@ -1371,10 +1762,42 @@ listen("#btn-step-back", "click", stepBack);
 listen("#btn-step-forward", "click", stepForward);
 listen("#btn-reset", "click", resetAnimation);
 listen("#drawer-close", "click", closeDrawer);
+listen("#btn-full-page-flow", "click", () => { window.location.hash = "#flow"; });
+listen("#btn-theme-toggle", "click", () => {
+  applyTheme(document.body.classList.contains("light-theme") ? "dark" : "light", true);
+});
+
+function syncHashRoute() {
+  const inFullFlow = window.location.hash === "#flow";
+  const wasInFullFlow = document.body.classList.contains("full-flow-mode");
+  document.body.classList.toggle("full-flow-mode", inFullFlow);
+  if (flowView) flowView.style.display = inFullFlow ? "block" : "none";
+  if (mainContent) mainContent.hidden = inFullFlow;
+  if (inFullFlow) {
+    renderFullPageFlow();
+    return;
+  }
+  const requestedStep = window.location.hash.match(/^#step-([1-4])$/);
+  if (requestedStep && globalData) {
+    const requested = Number(requestedStep[1]);
+    if (requested <= maxCompleted) goToStep(requested);
+  } else if (wasInFullFlow && globalData) {
+    goToStep(3);
+  }
+}
+
+window.addEventListener("hashchange", syncHashRoute);
 
 async function initialize() {
+  let savedTheme = "dark";
+  try {
+    const preference = localStorage.getItem("query-lens-theme");
+    if (preference === "light" || preference === "dark") savedTheme = preference;
+  } catch (_) { /* Storage may be unavailable in private browsing. */ }
+  applyTheme(savedTheme);
   populateExamples();
   goToStep(1);
+  syncHashRoute();
   updateQueryCounter();
   fetchUploads();
   if (queryInput) queryInput.focus();
