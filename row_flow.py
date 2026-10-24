@@ -25,6 +25,12 @@ _SOURCE = re.compile(
     r"(?:\s+(?:AS\s+)?(`?[\w$]+`?))?",
     re.I,
 )
+_JOIN_REF = r"(?:`(?:``|[^`])+`|[\w$]+)"
+_JOIN_EQUALITY = re.compile(
+    rf"(?P<left>{_JOIN_REF}(?:\s*\.\s*{_JOIN_REF})+)\s*=\s*"
+    rf"(?P<right>{_JOIN_REF}(?:\s*\.\s*{_JOIN_REF})+)",
+    re.I,
+)
 _TOKEN = re.compile(
     r"(?P<string>'(?:''|\\.|[^'])*'|\"(?:\"\"|\\.|[^\"])*\")"
     r"|(?P<backtick>`(?:``|[^`])+`)|(?P<word>[A-Za-z_$][\w$]*)"
@@ -377,6 +383,78 @@ def _sort_rids(metadata, records, rids, order_by=None, limit=None):
     return selected[:limit] if limit is not None else selected
 
 
+def _join_reference(value: str, aliases: dict):
+    parts = [_ident(part.strip()) for part in re.split(r"\s*\.\s*", value)]
+    if len(parts) < 2:
+        return None
+    qualifier, column = parts[-2], parts[-1]
+    ref = aliases.get(qualifier.casefold())
+    if ref:
+        return ref[2].casefold(), column.casefold()
+    if len(parts) >= 3:
+        table = parts[-2]
+        return table.casefold(), column.casefold()
+    return qualifier.casefold(), column.casefold()
+
+
+def _join_clauses(query: str, aliases: dict):
+    clauses = []
+    on_pattern = re.compile(
+        r"\bON\b([\s\S]*?)(?=\b(?:(?:LEFT|RIGHT|INNER|FULL|CROSS|NATURAL)\s+)?JOIN\b"
+        r"|\bWHERE\b|\bGROUP\s+BY\b|\bORDER\s+BY\b|\bHAVING\b|\bLIMIT\b|;|$)",
+        re.I,
+    )
+    for clause in on_pattern.finditer(query or ""):
+        predicates = []
+        for match in _JOIN_EQUALITY.finditer(clause.group(1)):
+            left = _join_reference(match.group("left"), aliases)
+            right = _join_reference(match.group("right"), aliases)
+            if left and right and left[0] != right[0]:
+                predicates.append((left, right))
+        if predicates:
+            clauses.append(predicates)
+    return clauses
+
+
+def _join_value_equal(left, right) -> bool:
+    if left is None or right is None:
+        return False
+    try:
+        return Decimal(str(left)) == Decimal(str(right))
+    except Exception:
+        return str(left).strip().casefold() == str(right).strip().casefold()
+
+
+def _join_sample_pairs(query: str, aliases: dict, records: dict):
+    groups = {}
+    for rid, record in records.items():
+        alias = str(record.get("alias") or record.get("table") or "").casefold()
+        if alias:
+            groups.setdefault(alias, []).append((rid, record))
+    for predicates in _join_clauses(query, aliases):
+        alias_names = {alias for predicate in predicates for alias, _ in predicate}
+        if len(alias_names) != 2 or not alias_names.issubset(groups):
+            continue
+        left_alias, right_alias = predicates[0][0][0], predicates[0][1][0]
+        relevant = [p for p in predicates if {p[0][0], p[1][0]} == alias_names]
+        pairs = []
+        for left_rid, left_record in groups[left_alias]:
+            for right_rid, right_record in groups[right_alias]:
+                matched = True
+                for (alias_a, column_a), (alias_b, column_b) in relevant:
+                    rec_a = left_record if alias_a == left_alias else right_record
+                    rec_b = left_record if alias_b == left_alias else right_record
+                    key_a = next((key for key in rec_a["values"] if key.casefold() == column_a), None)
+                    key_b = next((key for key in rec_b["values"] if key.casefold() == column_b), None)
+                    if key_a is None or key_b is None or not _join_value_equal(rec_a["values"][key_a], rec_b["values"][key_b]):
+                        matched = False
+                        break
+                if matched:
+                    pairs.append((left_rid, right_rid))
+        return pairs, True, f"Matched {len(pairs)} sampled row pairs using the JOIN equality condition."
+    return [], False, "unsupported condition: JOIN equality could not be mapped to sampled table aliases"
+
+
 def build_row_flow(plan_tree: dict, conn, source_samples: dict | None = None) -> list[dict]:
     query = str(plan_tree.get("_flow_query") or "")
     samples = source_samples or {}
@@ -464,6 +542,11 @@ def build_row_flow(plan_tree: dict, conn, source_samples: dict | None = None) ->
                         output_rids = [rid for rid in input_rids if row_results.get(rid, False)]
                         evaluable = True
                         note = f"Evaluated the condition against {len(input_rids)} sampled rows with column qualifiers resolved."
+            elif action == "join":
+                pairs, evaluable, note = _join_sample_pairs(query, aliases, records)
+                input_rids = [rid for pair in pairs for rid in pair]
+                output_rids = list(input_rids)
+                row_results = {rid: True for rid in output_rids}
             elif action == "sort" and metadata and input_rids:
                 details = str(node.get("details") or "").strip()
                 order_by = re.sub(r",\s*limit input to\b.*$", "", details, flags=re.I).strip()

@@ -348,9 +348,12 @@ button:disabled, select:disabled { cursor: not-allowed; opacity: .55; }
 .flow-state-label.pass { color: #86efac; }
 .flow-state-label.fail { color: #fca5a5; }
 .row-scan { animation: row-fade-in .24s ease-out both; }
+.row-pending { background: #262626; color: #a3a3a3; }
 .row-pass { background: #052e16; color: #bbf7d0; animation: row-fade-in .24s ease-out both, row-pass-pulse .48s ease-out both; }
 .row-fail { opacity: .3; background: #450a0a; color: #fecaca; animation: row-fade-in .24s ease-out both; }
 .row-dim { opacity: .3; }
+.row-join-highlight { background: #713f12; color: #fef08a; }
+.table-source-b .row-join-highlight { background: #581c87; color: #f3e8ff; }
 .row-pass.row-active { box-shadow: inset 0 0 0 2px #22c55e; }
 .row-fail.row-active { box-shadow: inset 0 0 0 2px #ef4444; }
 .row-move { animation: row-move .25s ease-out both; }
@@ -517,6 +520,9 @@ body.light-theme .flow-state-label.pass { color: #15803d; }
 body.light-theme .flow-state-label.fail { color: #b91c1c; }
 body.light-theme .row-pass { background: #dcfce7; color: #14532d; }
 body.light-theme .row-fail { background: #fee2e2; color: #7f1d1d; }
+body.light-theme .row-pending { background: #f1f5f9; color: #64748b; }
+body.light-theme .row-join-highlight { background: #fef3c7; color: #78350f; }
+body.light-theme .table-source-b .row-join-highlight { background: #f3e8ff; color: #6b21a8; }
 body.light-theme .table-card { border-color: #cbd5e1; background: #fff; }
 body.light-theme .table-card.table-source-a { border-color: #60a5fa; box-shadow: inset 0 0 0 1px #dbeafe; }
 body.light-theme .table-card.table-source-b { border-color: #c084fc; box-shadow: inset 0 0 0 1px #f3e8ff; }

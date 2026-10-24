@@ -17,6 +17,9 @@ let animationRunning = false;
 let animationPaused = false;
 let animationSleepTimer = null;
 let animationSleepResolve = null;
+let joinPhaseTimer = null;
+let joinPhaseResolve = null;
+let currentJoinPhase = "merge";
 let pauseResolvers = [];
 let currentStep = 1;
 let maxCompleted = 1;
@@ -517,17 +520,20 @@ function renderFlowRows(container, title, rids, states = {}, badge = "", options
 
   for (const entry of rows) {
     const row = document.createElement("div");
-    row.className = `flow-row row-scan${states[entry.rid] ? ` ${states[entry.rid]}` : ""}`;
+    const rowState = states[entry.rid] || "row-pending";
+    row.className = `flow-row row-scan ${rowState}`;
     row.dataset.rid = entry.rid;
     row.style.setProperty("--column-count", String(columns.length + 2));
-    const stateClasses = String(states[entry.rid] || "").split(/\s+/);
+    const stateClasses = String(rowState).split(/\s+/);
     const stateLabel = stateClasses.includes("row-pass")
       ? "PASS"
       : stateClasses.includes("row-fail")
         ? "FAIL"
+        : stateClasses.includes("row-join-highlight")
+          ? "MATCH"
         : stateClasses.includes("row-move")
           ? "MOVED"
-          : "SAMPLE";
+          : stateClasses.includes("row-pending") ? "PENDING" : "SAMPLE";
     const stateCell = document.createElement("span");
     stateCell.className = "flow-state-label " + stateLabel.toLowerCase();
     stateCell.textContent = stateLabel === "PASS" ? "✓ PASS" : stateLabel === "FAIL" ? "× FAIL" : stateLabel;
@@ -595,129 +601,67 @@ function sourceScanGroups() {
   return groups;
 }
 
-function joinEqualityPredicates() {
-  const query = String(globalData?.query || "");
-  const clauses = [...query.matchAll(/\bon\b([\s\S]*?)(?=\b(?:(?:left|right|inner|full|cross|natural)\s+)?join\b|\bwhere\b|\bgroup\s+by\b|\border\s+by\b|\bhaving\b|\blimit\b|;|$)/gi)];
-  const predicates = [];
-  const qualifiedEquality = /((?:`?[\w$]+`?\s*\.\s*)+`?[\w$]+`?)\s*=\s*((?:`?[\w$]+`?\s*\.\s*)+`?[\w$]+`?)/gi;
-  for (const clause of clauses) {
-    for (const match of clause[1].matchAll(qualifiedEquality)) {
-      const parseColumn = (reference) => {
-        const parts = reference.replace(/`/g, "").split(".").map((part) => part.trim());
-        if (parts.length < 2) return null;
-        return { alias: parts[parts.length - 2].toLowerCase(), column: parts[parts.length - 1] };
-      };
-      const left = parseColumn(match[1]);
-      const right = parseColumn(match[2]);
-      if (left && right) predicates.push({ left, right });
-    }
-  }
-  if (!predicates.length) {
-    const groups = sourceScanGroups();
-    const usingClauses = [...query.matchAll(/\busing\s*\(([^)]+)\)/gi)];
-    if (groups.length === 2) {
-      for (const usingClause of usingClauses) {
-        for (const column of usingClause[1].split(",").map((item) => item.trim().replace(/`/g, "")).filter(Boolean)) {
-          predicates.push({
-            left: { alias: groups[0].alias.toLowerCase(), column },
-            right: { alias: groups[1].alias.toLowerCase(), column },
-          });
-        }
-      }
-    }
-  }
-  return predicates;
-}
-
-function joinValuesEqual(left, right) {
-  if (left === null || left === undefined || right === null || right === undefined) return false;
-  if (typeof left === "number" || typeof right === "number") {
-    if (String(left).trim() !== "" && String(right).trim() !== "" && Number.isFinite(Number(left)) && Number.isFinite(Number(right))) {
-      return Number(left) === Number(right);
-    }
-    return false;
-  }
-  return String(left).trim().toLocaleLowerCase() === String(right).trim().toLocaleLowerCase();
+function joinPairRids(step, pairIndex = currentRowIndex) {
+  if (!step || pairIndex < 0) return [];
+  const input = step.input_rids || [];
+  return input.slice(pairIndex * 2, pairIndex * 2 + 2);
 }
 
 function currentJoinComparison(step) {
   if (!step || currentIndex !== animSteps.indexOf(step) || currentRowIndex < 0) return null;
-  const rid = flowInputRids(step)[currentRowIndex];
-  const currentRecord = (globalData?.row_records || {})[rid];
-  if (!currentRecord) return null;
+  const pair = joinPairRids(step);
+  if (pair.length !== 2) return null;
+  const records = globalData?.row_records || {};
+  const pairRecords = pair.map((rid) => records[rid]);
+  if (pairRecords.some((record) => !record)) return null;
   const groups = sourceScanGroups();
-  const currentAlias = String(currentRecord.alias || currentRecord.table || "").toLowerCase();
-  const predicates = joinEqualityPredicates();
-  const matchesByAlias = new Map();
-  const reasons = [];
-  let comparable = false;
-
-  for (const group of groups) {
-    const candidateAlias = String(group.alias).toLowerCase();
-    if (candidateAlias === currentAlias) continue;
-    const conditions = predicates.filter(({ left, right }) =>
-      (left.alias === currentAlias && right.alias === candidateAlias)
-      || (right.alias === currentAlias && left.alias === candidateAlias));
-    if (!conditions.length) continue;
-    comparable = true;
-    const matchingRids = group.rids.filter((candidateRid) => {
-      const candidate = globalData.row_records[candidateRid];
-      return conditions.every(({ left, right }) => {
-        const currentColumn = left.alias === currentAlias ? left.column : right.column;
-        const candidateColumn = left.alias === candidateAlias ? left.column : right.column;
-        const currentKey = Object.keys(currentRecord.values || {}).find((key) => key.toLowerCase() === currentColumn.toLowerCase());
-        const candidateKey = Object.keys(candidate?.values || {}).find((key) => key.toLowerCase() === candidateColumn.toLowerCase());
-        return currentKey && candidateKey && joinValuesEqual(currentRecord.values[currentKey], candidate.values[candidateKey]);
-      });
-    });
-    matchesByAlias.set(candidateAlias, matchingRids);
-    reasons.push(...conditions.map(({ left, right }) => `${left.alias}.${left.column} = ${right.alias}.${right.column}`));
-  }
-
-  const matchingRids = [...matchesByAlias.values()].flat();
   return {
-    rid,
-    currentRecord,
-    currentAlias,
+    pair,
+    pairRecords,
     groups,
-    matchesByAlias,
-    matchingRids,
-    matched: matchingRids.length > 0,
-    evaluable: comparable,
-    condition: [...new Set(reasons)].join(" AND "),
+    matched: true,
+    evaluable: Boolean(step.evaluable),
+    condition: String(step.note || "JOIN equality"),
   };
 }
 
-function joinStatesForGroup(group, comparison) {
+function joinStatesForGroup(group, step) {
   const states = {};
-  if (comparison) {
-    if (!comparison.evaluable) {
-      if (group.alias.toLowerCase() === comparison.currentAlias) states[comparison.rid] = "row-active";
-      return states;
-    }
-    const isCurrent = group.alias.toLowerCase() === comparison.currentAlias;
-    const matches = comparison.matchesByAlias.get(group.alias.toLowerCase()) || [];
-    if (isCurrent) {
-      for (const rid of group.rids) states[rid] = rid === comparison.rid
-        ? `row-active ${comparison.matched ? "row-pass row-move" : "row-fail"}`
-        : "row-dim";
-    } else {
-      for (const rid of group.rids) states[rid] = matches.includes(rid)
-        ? "row-active row-pass row-move"
-        : "row-dim";
-    }
-    return states;
+  if (!step || currentIndex < animSteps.indexOf(step) || !step.evaluable) return states;
+  const matchedRids = new Set(step.input_rids || []);
+  const completedRids = new Set();
+  const activePair = currentIndex === animSteps.indexOf(step) ? joinPairRids(step) : [];
+  const lastPair = currentIndex === animSteps.indexOf(step)
+    ? Math.min(currentRowIndex, Math.floor((step.input_rids || []).length / 2) - 1)
+    : Math.floor((step.input_rids || []).length / 2) - 1;
+  for (let pairIndex = 0; pairIndex <= lastPair; pairIndex += 1) {
+    for (const rid of joinPairRids(step, pairIndex)) completedRids.add(rid);
   }
-
-  if (currentIndex >= group.scanIndex) {
-    for (const rid of group.rids) states[rid] = "row-pass";
-  }
-  const currentStep = currentIndex >= 0 ? animSteps[currentIndex] : null;
-  if (currentStep) {
-    const currentStates = currentStepStates(currentStep);
-    for (const rid of group.rids) if (currentStates[rid]) states[rid] = currentStates[rid];
+  for (const rid of group.rids) {
+    if (!matchedRids.has(rid)) states[rid] = "row-fail row-dim";
+    else if (!completedRids.has(rid)) states[rid] = "row-pending";
+    else if (currentJoinPhase === "highlight" && activePair.includes(rid) && currentIndex === animSteps.indexOf(step)) {
+      states[rid] = "row-active row-join-highlight";
+    } else if (activePair.includes(rid) && currentIndex === animSteps.indexOf(step)) {
+      states[rid] = "row-active row-pass row-move";
+    } else states[rid] = "row-pass";
   }
   return states;
+}
+
+function sourceGroupStates(group) {
+  if (currentIndex < 0) return {};
+  const currentStep = animSteps[currentIndex];
+  if (currentStep?.op === "join") return joinStatesForGroup(group, currentStep);
+  const currentRids = new Set(flowInputRids(currentStep));
+  if (currentStep?.op === "scan" && currentIndex === group.scanIndex) return currentStepStates(currentStep);
+  if (group.rids.some((rid) => currentRids.has(rid))) return currentStepStates(currentStep);
+
+  const scanLastEvent = lastEventForStep(group.scanIndex);
+  if (scanLastEvent >= 0 && animationEventIndex >= scanLastEvent) {
+    return Object.fromEntries(group.rids.map((rid) => [rid, "row-pass"]));
+  }
+  return {};
 }
 
 function renderSourceTables() {
@@ -732,7 +676,6 @@ function renderSourceTables() {
   const showJoinSources = /\bjoin\b/i.test(String(globalData?.query || "")) && groups.length > 1;
   if (showJoinSources) {
     container.replaceChildren();
-    const comparison = step.op === "join" ? currentJoinComparison(step) : null;
     groups.forEach((group, index) => {
       if (index > 0) {
         const badge = document.createElement("div");
@@ -743,7 +686,7 @@ function renderSourceTables() {
       const tableAlias = group.alias ? ` (${group.alias})` : "";
       const title = `Table ${String.fromCharCode(65 + index)}: ${group.table}${tableAlias}`;
       const sourceClass = index === 0 ? "table-source-a" : "table-source-b";
-      renderFlowRows(container, title, group.rids, joinStatesForGroup(group, comparison), "", {
+      renderFlowRows(container, title, group.rids, sourceGroupStates(group), "", {
         append: true,
         className: sourceClass,
         alias: group.alias,
@@ -800,7 +743,9 @@ function renderIntermediateStats() {
   }
 
   const badge = step.evaluable ? "" : "Scaled from plan counts";
-  renderFlowRows(container, `Output rows - ${step.label}`, currentIntermediateRids(step), {}, badge);
+  const outputRids = currentIntermediateRids(step);
+  const outputStates = Object.fromEntries(outputRids.map((rid) => [rid, "row-pass row-move"]));
+  renderFlowRows(container, `Output rows - ${step.label}`, outputRids, outputStates, badge);
 }
 
 function renderJoinIntermediate(container, step) {
@@ -808,53 +753,50 @@ function renderJoinIntermediate(container, step) {
   if (!comparison) {
     appendEmpty(container, step.never_executed
       ? "JOIN did not run because an upstream input returned 0 rows."
-      : "Select a join sample row to compare the two inputs.");
+      : step.evaluable && currentIndex === animSteps.indexOf(step)
+        ? "No sampled input pair matched the JOIN condition. Unmatched source rows are marked red."
+        : !step.evaluable && currentIndex === animSteps.indexOf(step)
+          ? step.note || "The JOIN condition could not be mapped to sampled rows."
+          : "Matching rows appear here as each JOIN pair is evaluated.");
     return;
   }
   if (!comparison.evaluable) {
-    appendEmpty(container, `Could not evaluate the JOIN condition for ${comparison.currentAlias}: ${step.note || "no supported alias equality was found in the query."}`);
+    appendEmpty(container, step.note || "The JOIN condition could not be mapped to sampled rows.");
     return;
   }
-  if (!comparison.matched) {
-    const rowNumber = String(comparison.rid).match(/#(\d+)$/)?.[1] || "?";
-    appendEmpty(container, `No matching row for ${comparison.currentAlias}#${rowNumber} on ${comparison.condition}. The input row is marked red.`);
+  if (currentJoinPhase === "highlight") {
+    appendEmpty(container, "Matching input rows highlighted. Moving the pair to Intermediate…");
     return;
   }
 
   const records = globalData.row_records;
-  const currentGroupIndex = comparison.groups.findIndex((group) => group.alias.toLowerCase() === comparison.currentAlias);
-  const partners = [];
-  for (const group of comparison.groups) {
-    const partnerRids = comparison.matchesByAlias.get(group.alias.toLowerCase()) || [];
-    for (const rid of partnerRids) partners.push({ group, rid, record: records[rid] });
-  }
-  container.replaceChildren();
-  partners.forEach((partner, index) => {
-    const sides = [
-      { alias: comparison.currentAlias, rid: comparison.rid, record: comparison.currentRecord, groupIndex: currentGroupIndex },
-      { alias: partner.group.alias, rid: partner.rid, record: partner.record, groupIndex: comparison.groups.indexOf(partner.group) },
-    ].sort((left, right) => left.groupIndex - right.groupIndex);
-    const values = {};
-    for (const side of sides) {
-      for (const [column, value] of Object.entries(side.record.values || {})) {
-        values[`${side.alias}.${column}`] = value;
-      }
-    }
-    const rowId = `__ui_join_${String(step.node_id || "join").replace(/[^\w-]/g, "_")}_${animationEventIndex}_${index}`;
-    records[rowId] = {
-      table: "Joined rows",
-      alias: sides.map((side) => side.alias).join("+"),
-      display_id: sides.map((side) => {
-        const number = String(side.rid).match(/#(\d+)$/)?.[1] || "?";
-        return `${side.alias}#${number}`;
-      }).join(" + "),
-      values,
-    };
-    renderFlowRows(container, `Joined pair - ${sides.map((side) => side.alias).join(" + ")}`, [rowId], {
-      [rowId]: "row-active row-pass row-move",
-    }, "Matched by JOIN condition", { append: index > 0 });
-    delete records[rowId];
+  const sides = comparison.pair.map((rid, index) => ({
+    alias: String(comparison.pairRecords[index].alias || comparison.pairRecords[index].table || `Table ${index + 1}`),
+    rid,
+    record: comparison.pairRecords[index],
+  }));
+  const displaySides = sides.map((side) => {
+    const rowNumber = String(side.rid).match(/#(\d+)$/)?.[1] || "?";
+    return `${side.alias}#${rowNumber}`;
   });
+  container.replaceChildren();
+  const values = {};
+  for (const side of sides) {
+    for (const [column, value] of Object.entries(side.record.values || {})) {
+      values[`${side.alias}.${column}`] = value;
+    }
+  }
+  const rowId = `__ui_join_${String(step.node_id || "join").replace(/[^\w-]/g, "_")}_${animationEventIndex}`;
+  records[rowId] = {
+    table: "Joined rows",
+    alias: sides.map((side) => side.alias).join("+"),
+    display_id: displaySides.join(" + "),
+    values,
+  };
+  renderFlowRows(container, `Joined pair - ${sides.map((side) => side.alias).join(" + ")}`, [rowId], {
+    [rowId]: "row-active row-pass row-move",
+  }, "Matched by JOIN condition");
+  delete records[rowId];
 }
 
 function lastEventForStep(stepIndex) {
@@ -1266,11 +1208,12 @@ function buildAnimationEvents(steps) {
   for (let stepIndex = 0; stepIndex < steps.length; stepIndex += 1) {
     const step = steps[stepIndex];
     const rids = flowInputRids(step);
-    if (step.never_executed || !rids.length) {
+    const eventCount = step.op === "join" ? Math.floor(rids.length / 2) : rids.length;
+    if (step.never_executed || !eventCount) {
       events.push({ stepIndex, rowIndex: -1 });
       continue;
     }
-    for (let rowIndex = 0; rowIndex < rids.length; rowIndex += 1) {
+    for (let rowIndex = 0; rowIndex < eventCount; rowIndex += 1) {
       events.push({ stepIndex, rowIndex });
     }
   }
@@ -1290,15 +1233,16 @@ function formattedCount(value) {
 }
 
 function stepSummary(step) {
-  const sampleCount = flowInputRids(step).length;
-  const outputCount = (step.output_rids || []).length;
+  const sampleCount = step.op === "join" ? Math.floor(flowInputRids(step).length / 2) : flowInputRids(step).length;
+  const outputCount = step.op === "join" ? Math.floor((step.output_rids || []).length / 2) : (step.output_rids || []).length;
   const records = globalData?.row_records || {};
   const firstRecord = [...(step.input_rids || []), ...(step.output_rids || [])]
     .map((rid) => records[rid])
     .find(Boolean);
   const tableCount = step.table_row_count || firstRecord?.table_row_count || step.actual_rows || 0;
   const scaled = step.evaluable ? "" : " Scaled from plan counts.";
-  return `${outputCount} of ${sampleCount} sample rows passed. Full run: ${formattedCount(step.actual_rows)} of ${formattedCount(tableCount)} (estimated ${formattedCount(step.est_rows)}).${scaled}`;
+  const unit = step.op === "join" ? "sample pairs matched" : "sample rows passed";
+  return `${outputCount} of ${sampleCount} ${unit}. Full run: ${formattedCount(step.actual_rows)} of ${formattedCount(tableCount)} (estimated ${formattedCount(step.est_rows)}).${scaled}`;
 }
 
 function eventRowIds(step) {
@@ -1330,16 +1274,22 @@ function updateGraphVisuals() {
       flowEvaluationBadge.textContent = step.evaluable || step.never_executed ? "" : "Scaled from plan counts";
     }
     const rids = eventRowIds(step);
-    if (currentRowIndex >= 0 && currentRowIndex < rids.length) {
-      const record = (globalData?.row_records || {})[rids[currentRowIndex]];
+    const eventCount = step.op === "join" ? Math.floor(rids.length / 2) : rids.length;
+    if (currentRowIndex >= 0 && currentRowIndex < eventCount) {
+      const pair = step.op === "join" ? joinPairRids(step) : [];
+      const record = (globalData?.row_records || {})[step.op === "join" ? pair[0] : rids[currentRowIndex]];
       const tableCount = step.table_row_count || record?.table_row_count || 0;
-      stepStatus.textContent = currentRowIndex + 1 < rids.length
-        ? `Sample row ${currentRowIndex + 1} of ${rids.length} (table has ${formattedCount(tableCount)} rows).`
+      stepStatus.textContent = step.op === "join"
+        ? `JOIN pair ${currentRowIndex + 1} of ${eventCount}: ${pair.join(" + ")}.`
+        : currentRowIndex + 1 < eventCount
+          ? `Sample row ${currentRowIndex + 1} of ${eventCount} (table has ${formattedCount(tableCount)} rows).`
         : stepSummary(step);
     } else {
       stepStatus.textContent = step.never_executed
         ? "Never executed: upstream returned 0 rows."
-        : !flowInputRids(step).length
+        : step.op === "join" && step.evaluable && !flowInputRids(step).length
+          ? "JOIN found no matching sampled row pairs; unmatched source rows are marked red."
+          : !flowInputRids(step).length
           ? `${noSampleRowsMessage} Full run reported ${formattedCount(step.actual_rows)} rows.`
           : step.note || "No sample rows to animate.";
     }
@@ -1356,20 +1306,55 @@ function updateGraphVisuals() {
   renderFullPageFlow();
 }
 
-function applyAnimationEvent(eventIndex, writeLog = true) {
+function applyAnimationEvent(eventIndex, writeLog = true, joinPhase = "highlight") {
   const event = animationEvents[eventIndex];
   if (!event) return;
+  if (joinPhaseTimer !== null) {
+    clearTimeout(joinPhaseTimer);
+    joinPhaseTimer = null;
+  }
   animationEventIndex = eventIndex;
   currentIndex = event.stepIndex;
   currentRowIndex = event.rowIndex;
   const step = animSteps[currentIndex];
+  currentJoinPhase = step.op === "join" && event.rowIndex >= 0 ? joinPhase : "merge";
   updateGraphVisuals();
+
+  if (step.op === "join" && event.rowIndex >= 0) {
+    const pair = joinPairRids(step, event.rowIndex);
+    if (writeLog) {
+      appendProcessLog(pair.length === 2
+        ? `JOIN matched ${pair[0]} with ${pair[1]} using the sampled equality condition.`
+        : `${step.label}: the backend did not provide a complete input row pair.`);
+    }
+    if (currentJoinPhase === "highlight") {
+      joinPhaseTimer = window.setTimeout(() => {
+        joinPhaseTimer = null;
+        if (animationEventIndex !== eventIndex || currentIndex !== event.stepIndex || currentRowIndex !== event.rowIndex) return;
+        currentJoinPhase = "merge";
+        updateGraphVisuals();
+        if (joinPhaseResolve) {
+          const resolve = joinPhaseResolve;
+          joinPhaseResolve = null;
+          resolve();
+        }
+      }, 500);
+    }
+    const pairCount = Math.floor(flowInputRids(step).length / 2);
+    if (event.rowIndex === pairCount - 1) {
+      stepStatus.textContent = stepSummary(step);
+      if (writeLog) appendProcessLog(`${step.label}: ${stepSummary(step)}`);
+    }
+    return;
+  }
 
   if (event.rowIndex < 0) {
     if (writeLog) {
       appendProcessLog(step.never_executed
         ? "Never executed: upstream returned 0 rows."
-        : !flowInputRids(step).length
+        : step.op === "join" && step.evaluable && !flowInputRids(step).length
+          ? "JOIN produced no matching sampled row pairs. Unmatched source rows are marked red."
+          : !flowInputRids(step).length
           ? noSampleRowsMessage
           : step.note || `${step.label}: no sample rows to animate.`);
     }
@@ -1423,6 +1408,11 @@ function waitForPauseGate(token) {
   return new Promise((resolve) => pauseResolvers.push(resolve));
 }
 
+function waitForJoinMerge() {
+  if (currentJoinPhase !== "highlight") return Promise.resolve();
+  return new Promise((resolve) => { joinPhaseResolve = resolve; });
+}
+
 function sleep(ms, token) {
   return new Promise((resolve) => {
     animationSleepResolve = resolve;
@@ -1447,6 +1437,16 @@ function cancelAnimationLoop() {
   animationRunning = false;
   animationPaused = false;
   settleAnimationSleep();
+  if (joinPhaseTimer !== null) {
+    clearTimeout(joinPhaseTimer);
+    joinPhaseTimer = null;
+  }
+  if (joinPhaseResolve) {
+    const resolve = joinPhaseResolve;
+    joinPhaseResolve = null;
+    resolve();
+  }
+  currentJoinPhase = "merge";
   const waiting = pauseResolvers;
   pauseResolvers = [];
   for (const resolve of waiting) resolve();
@@ -1469,6 +1469,10 @@ async function runAnimation(token) {
       await waitForPauseGate(token);
       if (token !== animationRunId) break;
       applyAnimationEvent(animationEventIndex + 1);
+      if (nextStep?.op === "join" && nextEvent?.rowIndex >= 0) {
+        await waitForJoinMerge();
+        if (token !== animationRunId) break;
+      }
     }
   } finally {
     if (token === animationRunId) animationRunning = false;
@@ -1485,6 +1489,7 @@ function playAnimation() {
     animationEventIndex = -1;
     currentIndex = -1;
     currentRowIndex = -1;
+    currentJoinPhase = "merge";
     updateGraphVisuals();
   }
   animationPaused = false;
@@ -1494,6 +1499,7 @@ function playAnimation() {
 }
 
 function stepForward() {
+  if (currentIndex >= 0 && animSteps[currentIndex]?.op === "join" && currentJoinPhase === "highlight") return;
   cancelAnimationLoop();
   if (!animationEvents.length || animationEventIndex >= animationEvents.length - 1) return;
   const nextIndex = Math.min(animationEvents.length - 1, animationEventIndex + 1);
@@ -1503,14 +1509,14 @@ function stepForward() {
 function skipAnimationToEnd() {
   cancelAnimationLoop();
   if (!animationEvents.length) return;
-  applyAnimationEvent(animationEvents.length - 1);
+  applyAnimationEvent(animationEvents.length - 1, true, "merge");
 }
 
 function stepBack() {
   cancelAnimationLoop();
   animationEventIndex = Math.max(-1, animationEventIndex - 1);
   if (animationEventIndex >= 0) {
-    applyAnimationEvent(animationEventIndex, false);
+    applyAnimationEvent(animationEventIndex, false, "merge");
   } else {
     currentIndex = -1;
     currentRowIndex = -1;
@@ -1523,6 +1529,7 @@ function resetAnimation() {
   animationEventIndex = -1;
   currentIndex = -1;
   currentRowIndex = -1;
+  currentJoinPhase = "merge";
   updateGraphVisuals();
   if (processLog?.childElementCount) appendProcessLog("Animation reset to the first sample row.");
 }
