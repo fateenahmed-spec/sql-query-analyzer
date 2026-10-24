@@ -40,6 +40,7 @@ from db import (
     get_connection,
     run_explain_analyze,
     run_query_with_data,
+    safe_database_error_message,
     simulate_index as run_index_simulation,
 )
 from public_safety import InMemoryRateLimiter
@@ -83,9 +84,17 @@ async def _lifespan(_app):
     try:
         ensure_upload_schema()
     except mysql.connector.Error as exc:
-        _LOGGER.warning("Upload schema initialization failed (database error code %s).", getattr(exc, "errno", "unknown"))
+        _LOGGER.warning(
+            "Upload schema initialization failed (%s): %s",
+            type(exc).__name__,
+            safe_database_error_message(exc),
+        )
     except Exception as exc:
-        _LOGGER.warning("Upload schema initialization failed (%s).", type(exc).__name__)
+        _LOGGER.warning(
+            "Upload schema initialization failed (%s): %s",
+            type(exc).__name__,
+            safe_database_error_message(exc),
+        )
 
     cleanup_task = asyncio.create_task(_public_upload_cleanup_loop()) if PUBLIC_MODE else None
     try:
@@ -299,15 +308,24 @@ def health():
         with closing(conn.cursor()) as cursor:
             cursor.execute("SELECT 1")
             cursor.fetchone()
-    except (mysql.connector.Error, OSError, ValueError):
-        return JSONResponse(
-            status_code=503,
-            content={"status": "unavailable", "database": "unavailable"},
+    except Exception as exc:
+        _LOGGER.warning(
+            "Database health check failed (%s): %s",
+            type(exc).__name__,
+            safe_database_error_message(exc),
         )
+        return {"db": "down"}
     finally:
         if conn is not None:
-            conn.close()
-    return {"status": "ok", "database": "connected"}
+            try:
+                conn.close()
+            except Exception as exc:
+                _LOGGER.warning(
+                    "Database health check connection close failed (%s): %s",
+                    type(exc).__name__,
+                    safe_database_error_message(exc),
+                )
+    return {"status": "ok", "database": "connected", "db": "up"}
 
 
 @app.post("/api/upload-sql")

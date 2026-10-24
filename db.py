@@ -1,7 +1,10 @@
 import json
+import hashlib
+import logging
 import os
 import re
 import threading
+import tempfile
 import time
 from contextlib import closing
 from datetime import date, datetime
@@ -20,6 +23,11 @@ from security import validate_live_query, validate_query
 
 load_dotenv(Path(__file__).resolve().with_name(".env"))
 
+_LOGGER = logging.getLogger(__name__)
+_SSL_CA_UNRESOLVED = object()
+_SSL_CA_RESOLVED: str | None | object = _SSL_CA_UNRESOLVED
+_SSL_CA_LOCK = threading.Lock()
+
 UPLOAD_SCHEMA = "analyzer_uploads"
 _INDEX_SIMULATION_LOCK = "sql_analyzer_index_simulation"
 _INDEX_SIMULATION_CLONE = "up_temp_clone"
@@ -30,6 +38,9 @@ class UnsupportedServerError(Exception):
     pass
 
 class DatabaseUploadConfigurationError(RuntimeError):
+    pass
+
+class DatabaseSSLConfigurationError(RuntimeError):
     pass
 
 class IndexSimulationValidationError(ValueError):
@@ -51,8 +62,103 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return value.strip().casefold() in {"1", "true", "yes", "on"}
 
 
+def resolve_ssl_ca() -> str | None:
+    """Resolve DB_SSL_CA once, materializing inline PEM certificate text safely."""
+    global _SSL_CA_RESOLVED
+
+    if _SSL_CA_RESOLVED is not _SSL_CA_UNRESOLVED:
+        return _SSL_CA_RESOLVED
+
+    with _SSL_CA_LOCK:
+        if _SSL_CA_RESOLVED is not _SSL_CA_UNRESOLVED:
+            return _SSL_CA_RESOLVED
+
+        ca_value = os.getenv("DB_SSL_CA", "").strip()
+        if len(ca_value) >= 2 and ca_value[0] == ca_value[-1] and ca_value[0] in {"'", '"'}:
+            ca_value = ca_value[1:-1].strip()
+
+        if not ca_value:
+            _SSL_CA_RESOLVED = None
+            return None
+
+        if "BEGIN CERTIFICATE" in ca_value:
+            pem = ca_value.replace("\\n", "\n").replace("\r\n", "\n").replace("\r", "\n").strip()
+            if not pem.endswith("\n"):
+                pem += "\n"
+            digest = hashlib.sha256(pem.encode("utf-8")).hexdigest()
+            ca_path = Path(tempfile.gettempdir()) / f"sql_analyzer_ca_{digest}.pem"
+
+            try:
+                descriptor = os.open(
+                    ca_path,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                )
+            except FileExistsError:
+                if not ca_path.is_file():
+                    raise DatabaseSSLConfigurationError(
+                        "DB_SSL_CA resolved to an existing path that is not a file."
+                    )
+            else:
+                try:
+                    with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+                        handle.write(pem)
+                except Exception:
+                    try:
+                        ca_path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                    raise
+            try:
+                os.chmod(ca_path, 0o600)
+            except OSError as exc:
+                raise DatabaseSSLConfigurationError(
+                    "Could not restrict permissions on the temporary DB_SSL_CA file."
+                ) from exc
+            _SSL_CA_RESOLVED = str(ca_path)
+            return _SSL_CA_RESOLVED
+
+        ca_path = Path(ca_value).expanduser()
+        if not ca_path.is_file():
+            raise DatabaseSSLConfigurationError(
+                f"DB_SSL_CA file does not exist: {ca_path}"
+            )
+        _SSL_CA_RESOLVED = str(ca_path.resolve())
+        return _SSL_CA_RESOLVED
+
+
+def safe_database_error_message(exc: Exception) -> str:
+    """Return useful database diagnostics with credentials and certificate text redacted."""
+    message = str(exc)
+    secrets = (
+        os.getenv("DB_PASS", ""),
+        os.getenv("MYSQL_ROOT_PASSWORD", ""),
+        os.getenv("GEMINI_API_KEY", ""),
+        os.getenv("DB_SSL_CA", ""),
+    )
+    for secret in secrets:
+        if secret:
+            message = message.replace(secret, "[redacted]")
+    message = re.sub(
+        r"(?is)-----BEGIN (?:CERTIFICATE|[^-]*PRIVATE KEY)-----.*?-----END (?:CERTIFICATE|[^-]*PRIVATE KEY)-----",
+        "[redacted certificate]",
+        message,
+    )
+    message = re.sub(
+        r"(?i)(password|passwd|pwd)(\s*[:=]\s*)[^,;\s]+",
+        r"\1\2[redacted]",
+        message,
+    )
+    message = re.sub(
+        r"(?i)(mysql(?:\+\w+)?://[^:/\s]+:)[^@\s]+@",
+        r"\1[redacted]@",
+        message,
+    )
+    return message[:1000]
+
+
 def _mysql_connection_options(include_database: bool = True, user: str | None = None, password: str | None = None) -> dict:
-    ssl_ca = os.getenv("DB_SSL_CA", "").strip()
+    ssl_ca = resolve_ssl_ca()
     ssl_enabled = _env_flag("DB_SSL") or bool(ssl_ca)
     options = {
         "host": os.getenv("DB_HOST") or "127.0.0.1",
@@ -74,7 +180,28 @@ def _mysql_connection_options(include_database: bool = True, user: str | None = 
 
 
 def get_connection(include_database: bool = True):
-    return mysql.connector.connect(**_mysql_connection_options(include_database=include_database))
+    ca_configured = bool(os.getenv("DB_SSL_CA", "").strip())
+    tls_configured = _env_flag("DB_SSL") or ca_configured
+    ssl_branch = (
+        "TLS CA configuration"
+        if tls_configured and ca_configured
+        else "TLS encrypted, unverified"
+        if tls_configured
+        else "TLS disabled"
+    )
+    try:
+        options = _mysql_connection_options(include_database=include_database)
+        if not options["ssl_disabled"]:
+            ssl_branch = "TLS with verified CA" if options.get("ssl_ca") else "TLS encrypted, unverified"
+        return mysql.connector.connect(**options)
+    except Exception as exc:
+        _LOGGER.warning(
+            "Database connection failed (%s; %s): %s",
+            type(exc).__name__,
+            ssl_branch,
+            safe_database_error_message(exc),
+        )
+        raise
 
 
 def ensure_upload_schema() -> None:
