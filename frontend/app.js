@@ -177,59 +177,26 @@ function timeLabel(value) {
   return `${Number(value).toFixed(2)} ms`;
 }
 
-function cleanPredicate(text) {
-  let cleaned = String(text || "")
-    .trim()
-    .replace(/(?<![\w.$'"])(?:`?[A-Za-z_][\w$]*`?\s*\.\s*)+`?([A-Za-z_][\w$]*)`?/g, "$1")
-    .replace(/\s+/g, " ");
-
-  const isWrappedByOnePair = (value) => {
-    if (value.length < 2 || value[0] !== "(" || value[value.length - 1] !== ")") return false;
-    let depth = 0;
-    let quote = "";
-    let escaped = false;
-    for (let index = 0; index < value.length; index += 1) {
-      const character = value[index];
-      if (quote) {
-        if (escaped) escaped = false;
-        else if (character === "\\") escaped = true;
-        else if (character === quote) {
-          if (value[index + 1] === quote) index += 1;
-          else quote = "";
-        }
-        continue;
-      }
-      if (character === "'" || character === '"' || character === "`") quote = character;
-      else if (character === "(") depth += 1;
-      else if (character === ")") {
-        depth -= 1;
-        if (depth === 0 && index < value.length - 1) return false;
-      }
-    }
-    return depth === 0;
-  };
-
-  while (isWrappedByOnePair(cleaned)) cleaned = cleaned.slice(1, -1).trim();
-  return cleaned;
-}
-
 function flattenTree(node, parentId = null) {
   const elements = [];
   const warnings = Array.isArray(node.warnings) ? node.warnings : [];
   const operator = String(node.operator || "Operator");
-  const details = cleanPredicate(node.details);
-  const rows = node.rows_total ?? 0;
-  const totalTime = node.time_total_ms ?? node.self_time_ms ?? 0;
-  const isHotspot = warnings.length > 0 || Number(node.self_time_pct || 0) > 40;
+  const operatorName = operator.toLowerCase();
+  let nodeColor = { bg: "#f1f5f9", border: "#cbd5e1", text: "#000000" };
+  if (operatorName.includes("scan") || operatorName.includes("filter")) {
+    nodeColor = { bg: "#ffe5d9", border: "#ffb703", text: "#000000" };
+  } else if (operatorName.includes("join") || operatorName.includes("hash")) {
+    nodeColor = { bg: "#d8f3dc", border: "#52b788", text: "#000000" };
+  } else if (["sort", "limit", "aggregate", "result"].some((name) => operatorName.includes(name))) {
+    nodeColor = { bg: "#e0fbfc", border: "#00b4d8", text: "#000000" };
+  }
   elements.push({
     data: {
       id: node.id,
-      label: details
-        ? `${operator}\n${details}\nRows: ${rows} | Time: ${totalTime}ms`
-        : `${operator}\nRows: ${rows} | Time: ${totalTime}ms`,
+      label: `${operator}\ncost=${node.estimated_cost || "0.0"} rows=${node.estimated_rows || "0"}`,
+      nodeColor,
       self_time_pct: node.self_time_pct,
       has_warnings: warnings.length > 0,
-      hotspot: isHotspot,
       never_executed: node.never_executed,
       dead_end: Boolean(node.dead_end),
       operator: node.operator,
@@ -244,7 +211,6 @@ function flattenTree(node, parentId = null) {
         id: `e_${parentId}_${node.id}`,
         source: parentId,
         target: node.id,
-        rows_total: node.rows_total || 0,
       },
     });
   }
@@ -264,46 +230,44 @@ function planNodes(root) {
 }
 
 function graphStyle() {
-  const lightTheme = document.body.classList.contains("light-theme");
   return [
     {
       selector: "node",
       style: {
         label: "data(label)",
-        color: lightTheme ? "#0f172a" : "#ededed",
-        "font-size": "13px",
+        color: "data(nodeColor.text)",
+        "font-size": 12,
         "font-weight": 600,
-        "font-family": "Inter, system-ui, sans-serif",
+        "font-family": "sans-serif",
         "text-valign": "center",
         "text-halign": "center",
         "text-wrap": "wrap",
         "text-max-width": "180px",
         width: "label",
         height: "label",
-        padding: "16px",
+        padding: "12px",
         shape: "round-rectangle",
-        "background-color": lightTheme ? "#ffffff" : "#171717",
-        "border-width": lightTheme ? 2 : 1,
-        "border-color": lightTheme ? "#cbd5e1" : "#3b82f6",
+        "background-color": "data(nodeColor.bg)",
+        "border-width": 1,
+        "border-color": "data(nodeColor.border)",
         opacity: 1,
         "overlay-opacity": 0,
       },
     },
     { selector: "node[never_executed = true]", style: { opacity: 0.5, "border-style": "dashed" } },
-    { selector: "node[dead_end = true]", style: { "border-width": 3, "border-color": "#c084fc", "border-style": "dashed" } },
+    { selector: "node[dead_end = true]", style: { "border-width": 3, "border-style": "dashed" } },
     { selector: "node.error-node", style: { label: "data(label)", "border-width": 3, "text-wrap": "wrap" } },
-    { selector: "node.current-node", style: { "border-color": "#fbbf24", "border-width": "5px" } },
-    { selector: "node:selected", style: { "border-color": lightTheme ? "#2563eb" : "#3b82f6", "border-width": 3 } },
-    { selector: "node[hotspot = true]", style: { "background-color": lightTheme ? "#fee2e2" : "#7f1d1d", "border-color": "#ef4444", "border-width": 3, color: lightTheme ? "#991b1b" : "#ededed" } },
+    { selector: "node.current-node", style: { "border-width": "5px" } },
+    { selector: "node:selected", style: { "border-width": 3 } },
     {
       selector: "edge",
       style: {
-        width: 2,
+        width: 1.5,
         "curve-style": "bezier",
-        "line-color": "#94a3b8",
+        "line-color": "#475569",
         "source-arrow-shape": "none",
         "target-arrow-shape": "triangle",
-        "target-arrow-color": "#94a3b8",
+        "target-arrow-color": "#475569",
         "target-distance-from-node": 4,
         "source-distance-from-node": 4,
         opacity: 0.85,
@@ -356,7 +320,7 @@ function buildGraph() {
   let elements;
   if (globalData?.ok === false) {
     const errorMessage = globalData.error?.message || "MySQL could not execute the query.";
-    elements = [{ data: { id: "error_node", label: `ERROR\n${errorMessage}`, error_node: true }, classes: "error-node" }];
+    elements = [{ data: { id: "error_node", label: `ERROR\n${errorMessage}`, error_node: true, nodeColor: { bg: "#f1f5f9", border: "#cbd5e1", text: "#000000" } }, classes: "error-node" }];
   } else {
     currentPlan = globalData?.tree || null;
     elements = currentPlan ? flattenTree(currentPlan) : [];
