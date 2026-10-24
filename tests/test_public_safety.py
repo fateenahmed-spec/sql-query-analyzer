@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from fastapi.testclient import TestClient
 from starlette.requests import Request
+import mysql.connector
 
 import db
 import main
@@ -68,14 +69,17 @@ def test_rate_limiter_uses_a_rolling_window():
     assert limiter.consume("198.51.100.8", "query", 2, 60) is None
 
 
-def test_database_connection_reads_port_and_enables_verified_ssl(monkeypatch, mocker):
+def test_database_connection_reads_port_and_enables_verified_ssl(monkeypatch, mocker, tmp_path):
     monkeypatch.setenv("DB_HOST", "mysql.example.test")
     monkeypatch.setenv("DB_PORT", "24876")
     monkeypatch.setenv("DB_USER", "deployment-user")
     monkeypatch.setenv("DB_PASS", "deployment-placeholder")
     monkeypatch.setenv("DB_NAME", "deployment-db")
     monkeypatch.setenv("DB_SSL", "true")
-    monkeypatch.setenv("DB_SSL_CA", "/etc/secrets/aiven-ca.pem")
+    ca_path = tmp_path / "cloud-ca.pem"
+    ca_path.write_text("placeholder certificate", encoding="utf-8")
+    monkeypatch.setenv("DB_SSL_CA", str(ca_path))
+    monkeypatch.setattr(db, "_SSL_CA_RESOLVED", db._SSL_CA_UNRESOLVED)
     connect = mocker.patch("db.mysql.connector.connect")
 
     db.get_connection()
@@ -85,9 +89,26 @@ def test_database_connection_reads_port_and_enables_verified_ssl(monkeypatch, mo
     assert options["port"] == 24876
     assert options["database"] == "deployment-db"
     assert options["ssl_disabled"] is False
-    assert options["ssl_ca"] == "/etc/secrets/aiven-ca.pem"
+    assert options["ssl_ca"] == str(ca_path.resolve())
     assert options["ssl_verify_cert"] is True
     assert options["ssl_verify_identity"] is True
+
+
+def test_local_database_connection_always_uses_unverified_tls(monkeypatch, mocker):
+    monkeypatch.setenv("DB_HOST", "127.0.0.1")
+    monkeypatch.setenv("DB_SSL", "false")
+    monkeypatch.delenv("DB_SSL_CA", raising=False)
+    monkeypatch.setattr(db, "_SSL_CA_RESOLVED", db._SSL_CA_UNRESOLVED)
+    connect = mocker.patch("db.mysql.connector.connect")
+
+    db.get_connection()
+
+    options = connect.call_args.kwargs
+    assert options["host"] == "127.0.0.1"
+    assert options["ssl_disabled"] is False
+    assert options["ssl_verify_cert"] is False
+    assert options["ssl_verify_identity"] is False
+    assert options["client_flags"] == [db.ClientFlag.SSL]
 
 
 def test_ensure_upload_schema_connects_without_selecting_a_database(mocker):
@@ -116,6 +137,21 @@ def test_client_ip_uses_the_first_forwarded_address():
     })
 
     assert main._client_ip(request) == "203.0.113.14"
+
+
+def test_health_returns_200_with_auth_failure_status(monkeypatch):
+    monkeypatch.setattr(main, "ensure_upload_schema", lambda: None)
+    monkeypatch.setattr(main, "cleanup_expired_uploads", lambda: [])
+
+    def fail_auth():
+        raise mysql.connector.Error("Access denied", errno=1045)
+
+    monkeypatch.setattr(main, "get_connection", fail_auth)
+    with TestClient(main.app) as client:
+        response = client.get("/api/health")
+
+    assert response.status_code == 200
+    assert response.json() == {"database": "auth failed"}
 
 
 def test_cleanup_drops_only_old_valid_upload_tables(monkeypatch):

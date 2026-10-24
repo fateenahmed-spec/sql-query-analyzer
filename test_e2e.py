@@ -6,9 +6,12 @@ import sys
 import io
 import os
 import time
+from contextlib import closing
+from urllib.parse import urlsplit
 
 import requests
 
+from db import get_connection, safe_database_error_message
 
 BASE_URL = os.environ.get("SQL_ANALYZER_BASE_URL", "http://127.0.0.1:8000")
 TIMEOUT_SECONDS = 30
@@ -33,6 +36,27 @@ def post_live(query: str) -> requests.Response:
 
 
 def main() -> int:
+    api_host = (urlsplit(BASE_URL).hostname or "").casefold()
+    db_host = (os.getenv("DB_HOST") or "127.0.0.1").strip().casefold()
+    if api_host not in {"127.0.0.1", "localhost"} or db_host not in {"127.0.0.1", "localhost"}:
+        print("FAIL: E2E local-only guard refused a non-local API or database host.")
+        return 1
+
+    try:
+        conn = get_connection()
+        try:
+            with closing(conn.cursor()) as cursor:
+                cursor.execute("SELECT COUNT(*) FROM customers")
+                customer_count = cursor.fetchone()[0]
+        finally:
+            conn.close()
+        if customer_count != 500:
+            raise RuntimeError("local customers table does not contain the expected 500 rows")
+        print("PASS: E2E database preflight uses shared TLS connection helper (local DB)")
+    except Exception as exc:
+        print(f"FAIL: local database preflight ({type(exc).__name__}): {safe_database_error_message(exc)}")
+        return 1
+
     try:
         health = requests.get(f"{BASE_URL}/api/health", timeout=3)
         if health.status_code != 200:

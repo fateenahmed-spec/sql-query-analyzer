@@ -55,13 +55,6 @@ class UploadTableNotFoundError(LookupError):
 class UploadColumnNotFoundError(LookupError):
     pass
 
-def _env_flag(name: str, default: bool = False) -> bool:
-    value = os.getenv(name)
-    if value is None:
-        return default
-    return value.strip().casefold() in {"1", "true", "yes", "on"}
-
-
 def resolve_ssl_ca() -> str | None:
     """Resolve DB_SSL_CA once, materializing inline PEM certificate text safely."""
     global _SSL_CA_RESOLVED
@@ -157,43 +150,63 @@ def safe_database_error_message(exc: Exception) -> str:
     return message[:1000]
 
 
-def _mysql_connection_options(include_database: bool = True, user: str | None = None, password: str | None = None) -> dict:
-    ssl_ca = resolve_ssl_ca()
-    ssl_enabled = _env_flag("DB_SSL") or bool(ssl_ca)
+def mysql_connection_args(
+    include_database: bool = True,
+    user: str | None = None,
+    password: str | None = None,
+    host: str | None = None,
+) -> dict:
+    """Build the shared TLS-required MySQL arguments for every project connection."""
+    db_host = (host or os.getenv("DB_HOST") or "127.0.0.1").strip()
+    is_local = db_host.casefold() in {"127.0.0.1", "localhost"}
     options = {
-        "host": os.getenv("DB_HOST") or "127.0.0.1",
+        "host": db_host,
         "port": int(os.getenv("DB_PORT") or "3306"),
         "user": user if user is not None else (os.getenv("DB_USER") or "analyzer_ro"),
         "password": password if password is not None else (os.getenv("DB_PASS") or ""),
-        "ssl_disabled": not ssl_enabled,
+        "ssl_disabled": False,
+        "client_flags": [ClientFlag.SSL],
     }
     if include_database:
         options["database"] = os.getenv("DB_NAME") or "sql_analyzer_test"
-    if ssl_enabled:
-        # Require TLS when enabled so a server without SSL cannot cause a plaintext fallback.
-        options["client_flags"] = [ClientFlag.SSL]
-        if ssl_ca:
-            options["ssl_ca"] = ssl_ca
-            options["ssl_verify_cert"] = True
-            options["ssl_verify_identity"] = True
+    if is_local:
+        # Local MySQL commonly uses a self-signed certificate; TLS is mandatory but unverified.
+        options["ssl_verify_cert"] = False
+        options["ssl_verify_identity"] = False
+    else:
+        # Remote database connections always use a configured CA and verify its identity.
+        ssl_ca = resolve_ssl_ca()
+        if not ssl_ca:
+            raise DatabaseSSLConfigurationError(
+                "DB_SSL_CA is required for TLS-verified remote database connections."
+            )
+        options["ssl_ca"] = ssl_ca
+        options["ssl_verify_cert"] = True
+        options["ssl_verify_identity"] = True
     return options
 
 
-def get_connection(include_database: bool = True):
-    ca_configured = bool(os.getenv("DB_SSL_CA", "").strip())
-    tls_configured = _env_flag("DB_SSL") or ca_configured
+def get_connection(
+    include_database: bool = True,
+    user: str | None = None,
+    password: str | None = None,
+    host: str | None = None,
+):
+    connection_host = (host or os.getenv("DB_HOST") or "127.0.0.1").strip()
     ssl_branch = (
-        "TLS CA configuration"
-        if tls_configured and ca_configured
-        else "TLS encrypted, unverified"
-        if tls_configured
-        else "TLS disabled"
+        "TLS locally, certificate verification disabled"
+        if connection_host.casefold() in {"127.0.0.1", "localhost"}
+        else "TLS remotely, verified with DB_SSL_CA"
     )
     try:
-        options = _mysql_connection_options(include_database=include_database)
-        if not options["ssl_disabled"]:
-            ssl_branch = "TLS with verified CA" if options.get("ssl_ca") else "TLS encrypted, unverified"
-        return mysql.connector.connect(**options)
+        return mysql.connector.connect(
+            **mysql_connection_args(
+                include_database=include_database,
+                user=user,
+                password=password,
+                host=connection_host,
+            )
+        )
     except Exception as exc:
         _LOGGER.warning(
             "Database connection failed (%s; %s): %s",
@@ -288,12 +301,10 @@ def execute_sql_file(sql_text: str) -> str:
             "SQL file uploads require MYSQL_ROOT_PASSWORD to be configured."
         )
 
-    conn = mysql.connector.connect(
-        **_mysql_connection_options(
-            include_database=True,
-            user=os.getenv("DB_ADMIN_USER") or "root",
-            password=root_password,
-        )
+    conn = get_connection(
+        include_database=True,
+        user=os.getenv("DB_ADMIN_USER") or "root",
+        password=root_password,
     )
     try:
         with closing(conn.cursor(buffered=True)) as cursor:

@@ -13,8 +13,14 @@ from datetime import date, datetime
 from pathlib import Path
 from math import ceil
 
+_SHELL_DB_ENV_AT_IMPORT = {
+    name.upper(): value
+    for name, value in os.environ.items()
+    if name.upper().startswith(("DB_", "MYSQL_"))
+}
+
 import mysql.connector
-from dotenv import load_dotenv
+from dotenv import dotenv_values, load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -68,6 +74,21 @@ _UPLOAD_CAP_LOCK = "sql_analyzer_upload_table_cap"
 _PUBLIC_UPLOAD_TABLE_LIMIT = 5
 
 
+def _log_shell_db_overrides() -> None:
+    env_values = dotenv_values(_PROJECT_ROOT / ".env", interpolate=False)
+    env_values = {str(name).upper(): value for name, value in env_values.items() if name}
+    overridden = [
+        name
+        for name, shell_value in _SHELL_DB_ENV_AT_IMPORT.items()
+        if name in env_values and str(env_values[name]) != shell_value
+    ]
+    if overridden:
+        _LOGGER.warning(
+            "Shell environment overrides .env settings for: %s",
+            ", ".join(sorted(overridden)),
+        )
+
+
 async def _public_upload_cleanup_loop() -> None:
     while True:
         try:
@@ -81,6 +102,7 @@ async def _public_upload_cleanup_loop() -> None:
 
 @asynccontextmanager
 async def _lifespan(_app):
+    _log_shell_db_overrides()
     try:
         ensure_upload_schema()
     except mysql.connector.Error as exc:
@@ -314,6 +336,8 @@ def health():
             type(exc).__name__,
             safe_database_error_message(exc),
         )
+        if getattr(exc, "errno", None) == 1045:
+            return {"database": "auth failed"}
         return {"db": "down"}
     finally:
         if conn is not None:
