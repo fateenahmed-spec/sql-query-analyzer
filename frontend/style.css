@@ -1,7 +1,7 @@
 :root {
   color-scheme: dark;
-  --bg: #0a0a0a;
-  --surface: #171717;
+  --bg: #101112;
+  --surface: #191b1d;
   --border: #262626;
   --text: #ededed;
   --muted: #a3a3a3;
@@ -9,8 +9,11 @@
   --accent-strong: #2563eb;
   --radius: 8px;
   --ease: 150ms;
-  --surface-raised: #1f1f1f;
-  --surface-soft: #111111;
+  --surface-raised: #222426;
+  --surface-soft: #151719;
+  --polish-border: #303337;
+  --polish-heading: #f1f2ef;
+  --polish-copy: #ced2d0;
   --pass: #22c55e;
   --fail: #ef4444;
   --warn: #f59e0b;
@@ -488,21 +491,24 @@ button:disabled, select:disabled { cursor: not-allowed; opacity: .55; }
 /* User-selectable light theme. The defaults above remain the dark theme. */
 body.light-theme {
   color-scheme: light;
-  --bg: #f8fafc;
+  --bg: #f6f6f3;
   --surface: #ffffff;
   --border: #e2e8f0;
   --text: #0f172a;
   --muted: #64748b;
   --accent: #2563eb;
   --accent-strong: #1d4ed8;
-  --surface-raised: #f1f5f9;
-  --surface-soft: #f8fafc;
+  --surface-raised: #eceeea;
+  --surface-soft: #f4f4f0;
+  --polish-border: #dde1dc;
+  --polish-heading: #18212a;
+  --polish-copy: #45515d;
   --pass: #16a34a;
   --fail: #dc2626;
   background: var(--bg);
   color: var(--text);
 }
-body.light-theme .app-header { background: #f8fafcf2; }
+body.light-theme .app-header { background: #f6f6f3f2; }
 body.light-theme .brand-mark { border-color: #bfdbfe; background: #eff6ff; color: #1d4ed8; }
 body.light-theme .stepper > i { background: #cbd5e1; }
 body.light-theme .stepper-item > span { border-color: #cbd5e1; color: #64748b; }
@@ -643,6 +649,52 @@ body.light-theme .pipeline-row.flow-pass .pipeline-cell.is-null,
 body.light-theme .pipeline-row.flow-fail .pipeline-cell.is-null { color: #64748b; }
 body.light-theme .pipeline-reason { background: #fee2e2; color: #7f1d1d; }
 body.light-theme .flow-progress progress, body.light-theme .flow-progress progress::-webkit-progress-bar { background: #cbd5e1; }
+
+/* Subtle neutral polish for non-button surfaces and copy. */
+.app-header,
+.query-card,
+.ai-card,
+.csv-panel,
+.warnings-panel,
+.animation-panel,
+.flow-column,
+.process-log-panel,
+.table-card,
+.node-stat,
+.empty-state,
+.index-simulation-panel,
+.flow-toolbar,
+.pipeline-card,
+.detail-drawer,
+.csv-schema-scroll,
+.uploaded-table-row,
+.center-container { border-color: var(--polish-border); }
+
+.intro-block h1,
+.step-title-row h1,
+.ai-card-heading h2,
+.ai-summary-block h3,
+.ai-suggestions-block h3,
+.ai-index-actions h3,
+.index-simulation-heading h3,
+.warnings-panel > summary,
+.detail-warning-block h3,
+.process-log-panel h2,
+.flow-column-heading h2,
+.pipeline-card-heading h2 { color: var(--polish-heading); }
+
+.intro-block > p:last-child,
+.ai-summary-block p,
+.ai-suggestions-block ol,
+.warning-message,
+.detail-list dd,
+#process-log { color: var(--polish-copy); }
+
+.csv-table-name input,
+.drop-zone { border-color: var(--polish-border); background: var(--surface-soft); }
+.csv-schema-table th { background: var(--surface-raised); }
+.uploaded-table-row { background: var(--surface-soft); }
+.detail-drawer { background: var(--surface); }
 
 @keyframes pipeline-pass { 0% { opacity: .55; transform: translateY(4px); } 100% { opacity: 1; transform: translateY(0); } }
 @keyframes pipeline-fail { 0% { opacity: .55; transform: translateX(3px); } 100% { opacity: 1; transform: translateX(0); } }
