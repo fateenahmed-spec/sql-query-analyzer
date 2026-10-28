@@ -8,15 +8,19 @@ from core.parser import ParseError, parse_explain_analyze
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = sorted((ROOT / "demo" / "plans_fallback").glob("*.txt"))
-LOOP_FIXTURE = ROOT / "tests" / "fixtures" / "loop_scan.txt"
+EXTRA_FIXTURES = [
+    ROOT / "tests" / "fixtures" / "loop_scan.txt",
+    ROOT / "tests" / "fixtures" / "plans" / "03_join_indexed.txt",
+    ROOT / "tests" / "fixtures" / "plans" / "08_hash_join.txt",
+]
 NODE_LINE = re.compile(r"^( *)-> (.*)$")
-NUMBER = r"\d+(?:\.\d+)?"
+NUMBER = r"\d+(?:\.\d+)?(?:[eE][+-]?\d+)?"
 ACTUAL = re.compile(rf"\s+\(actual time=({NUMBER})\.\.({NUMBER}) rows=({NUMBER}) loops=({NUMBER})\)$")
 COST = re.compile(rf"\s+\(cost=({NUMBER}(?:\.\.{NUMBER})?) rows=({NUMBER})\)$")
 
 
 def _as_number(value):
-    number = float(value) if "." in value else int(value)
+    number = float(value) if "." in value or "e" in value.casefold() else int(value)
     return int(number) if isinstance(number, float) and number.is_integer() else number
 
 
@@ -101,7 +105,7 @@ def _flatten(tree):
     return nodes
 
 
-@pytest.mark.parametrize("path", FIXTURES + [LOOP_FIXTURE], ids=lambda path: path.stem)
+@pytest.mark.parametrize("path", FIXTURES + EXTRA_FIXTURES, ids=lambda path: path.stem)
 def test_parser_matches_independently_read_raw_fixture(path):
     text = path.read_text(encoding="utf-8")
     expected = _raw_records(text)
@@ -199,3 +203,19 @@ def test_parentheses_and_quotes_in_details_are_not_mistaken_for_statistics():
     assert node["estimated_cost"] == 9
     assert node["estimated_rows"] == 20
     assert node["actual_rows"] == 3
+
+
+def test_scientific_notation_parses_for_estimates_actuals_and_loops():
+    node = parse_explain_analyze(
+        "-> Index lookup on t using i (id=1) (cost=1.2e-3 rows=6e-1) "
+        "(actual time=1e-3..2.5E+2 rows=1.37e+2 loops=1e1)"
+    )
+
+    assert node["estimated_cost"] == pytest.approx(0.0012)
+    assert node["estimated_rows"] == pytest.approx(0.6)
+    assert node["time_first_ms"] == pytest.approx(0.001)
+    assert node["time_last_ms"] == pytest.approx(250)
+    assert node["actual_rows"] == 137
+    assert node["loops"] == 10
+    assert node["rows_total"] == 1370
+    assert node["time_total_ms"] == pytest.approx(2500)

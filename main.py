@@ -22,13 +22,13 @@ _SHELL_DB_ENV_AT_IMPORT = {
 import mysql.connector
 from dotenv import dotenv_values, load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, constr
 
 from core.ai import get_ai_explanation, get_rule_based_explanation
 from core.parser import parse_explain_analyze
-from core.rules import analyze_rules, annotate_tree
+from core.rules import analyze_rules, annotate_dead_end_nodes, annotate_tree
 from core.service import calculate_stats, load_plan_text
 from core.steps import build_animation_steps
 from db import (
@@ -573,6 +573,7 @@ def get_plan(id: str):
 
     text, source = load_plan_text(id)
     tree = parse_explain_analyze(text)
+    annotate_dead_end_nodes(tree)
     warnings = analyze_rules(tree)
     annotate_tree(tree, warnings)
     steps = build_animation_steps(tree)
@@ -621,6 +622,7 @@ class AIRequest(BaseModel):
     warnings: list[dict] = Field(default_factory=list)
     error: dict | None = None
     tree: dict | None = None
+    schema_info: dict | None = None
 
 
 @app.post("/api/run-live")
@@ -663,24 +665,8 @@ def run_live(request: LiveQueryRequest, http_request: Request):
     row_records = {}
     for flow_step in row_flow:
         row_records.update(flow_step.pop("row_data", {}))
+    annotate_dead_end_nodes(tree)
     warnings = analyze_rules(tree)
-
-    def mark_dead_ends(node):
-        if node.get("actual_rows") == 0:
-            node["dead_end"] = True
-            warnings.append({
-                "code": "DEAD_END",
-                "type": "DEAD_END",
-                "severity": "info",
-                "node_id": node["id"],
-                "title": "No rows produced",
-                "message": f"{node.get('operator') or 'This operator'} produced no rows.",
-                "suggestion": None,
-            })
-        for child in node.get("children", []):
-            mark_dead_ends(child)
-
-    mark_dead_ends(tree)
     annotate_tree(tree, warnings)
     steps = build_animation_steps(tree)
     stats = calculate_stats(tree)
@@ -695,6 +681,7 @@ def run_live(request: LiveQueryRequest, http_request: Request):
         "rows": result["rows"],
         "columns": result["columns"],
         "source_samples": result["source_samples"],
+        "schema_info": result.get("schema_info"),
     }
 
 
@@ -739,6 +726,7 @@ def get_live_ai_insights(request: AIRequest, http_request: Request):
             request.warnings,
             tree_summary=request.tree,
             error=request.error,
+            schema_info=request.schema_info,
         )
         if request.error and not (isinstance(explanation.get("fix"), str) and explanation["fix"].strip()):
             explanation["fix"] = get_rule_based_explanation(
@@ -793,6 +781,11 @@ def analyze(request: AnalyzeRequest, http_request: Request):
         return JSONResponse(status_code=500, content={"success": False, "error": "Internal server error"})
     finally:
         _slots.release()
+
+@app.get("/", include_in_schema=False)
+def welcome_page():
+    return FileResponse(_PROJECT_ROOT / "frontend" / "welcome.html")
+
 
 app.mount("/", StaticFiles(directory="frontend", html=True), name="frontend")
 

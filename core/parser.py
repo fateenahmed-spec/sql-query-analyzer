@@ -16,7 +16,7 @@ class ParseError(ValueError):
         super().__init__(f"{message} (line {line_no}: {line!r})")
 
 
-_NUMBER = r"\d+(?:\.\d+)?"
+_NUMBER = r"\d+(?:\.\d+)?(?:[eE][+-]?\d+)?"
 _NODE_LINE = re.compile(r"^( *)-> (.*)$")
 _NEVER_EXECUTED = re.compile(r"\s+\(never executed\)$")
 _ACTUAL = re.compile(
@@ -55,7 +55,7 @@ _OPERATORS = tuple(sorted(_OPERATORS, key=len, reverse=True))
 
 
 def _number(value: str) -> int | float:
-    parsed = float(value) if "." in value else int(value)
+    parsed = float(value) if "." in value or "e" in value.casefold() else int(value)
     if isinstance(parsed, float) and parsed.is_integer():
         return int(parsed)
     return parsed

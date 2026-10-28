@@ -183,7 +183,17 @@ function applyTheme(theme, save = false) {
 
 function timeLabel(value) {
   if (value === null || value === undefined) return "—";
-  return `${Number(value).toFixed(2)} ms`;
+  const milliseconds = Number(value);
+  if (!Number.isFinite(milliseconds)) return "Unavailable";
+  return `${Number(milliseconds.toPrecision(4)).toLocaleString()} ms`;
+}
+
+function planNumberLabel(value) {
+  if (value === null || value === undefined) return "unavailable";
+  const number = Number(value);
+  return Number.isFinite(number)
+    ? number.toLocaleString(undefined, { maximumFractionDigits: 6 })
+    : "unavailable";
 }
 
 function flattenTree(node, parentId = null) {
@@ -201,7 +211,7 @@ function flattenTree(node, parentId = null) {
   elements.push({
     data: {
       id: node.id,
-      label: `${operator}\ncost=${node.estimated_cost || "0.0"} rows=${node.estimated_rows || "0"}\nactual: ${node.time_total_ms ?? 0}ms`,
+      label: window.QueryLensPlanLabels.buildGraphLabel(node),
       nodeColor,
       self_time_pct: node.self_time_pct,
       never_executed: node.never_executed,
@@ -298,32 +308,92 @@ function closeDrawer() {
   if (detailDrawer) detailDrawer.hidden = true;
 }
 
-function showNodeDetails(node) {
-  setText("#detail-operator", node.operator);
-  setText("#detail-details", node.details);
-  setText("#detail-rows", node.actual_rows);
-  setText("#detail-estimated", node.estimated_rows);
-  setText("#detail-loops", node.loops);
-  setText("#detail-self-time", timeLabel(node.self_time_ms));
-  setText("#detail-self-pct", `${Number(node.self_time_pct || 0).toFixed(2)}%`);
-  setText("#detail-timing", `${timeLabel(node.time_first_ms)} → ${timeLabel(node.time_last_ms)}`);
-  setText("#detail-execution", node.never_executed ? "Never executed" : node.dead_end ? "Dead end" : "Executed");
+function renderInspectorMetrics(selector, metrics) {
+  const list = document.querySelector(selector);
+  if (!list) return;
+  list.replaceChildren();
+  for (const metric of metrics) {
+    const row = document.createElement("div");
+    const label = document.createElement("dt");
+    label.textContent = metric.label;
+    const value = document.createElement("dd");
+    value.textContent = metric.value;
+    if (metric.help) {
+      label.title = metric.help;
+      value.title = metric.help;
+      value.setAttribute("aria-label", `${metric.label}: ${metric.value}. ${metric.help}`);
+    }
+    row.append(label, value);
+    list.append(row);
+  }
+}
 
+function renderInspectorWarnings(warnings) {
   drawerWarnings.replaceChildren();
-  const nodeWarnings = (globalData?.warnings || []).filter((warning) => warning.node_id === node.id);
-  if (nodeWarnings.length === 0) {
+  if (!warnings.length) {
     const empty = document.createElement("li");
     empty.className = "muted";
-    empty.textContent = "None";
+    empty.textContent = "No warnings attached to this operation.";
     drawerWarnings.append(empty);
-  } else {
-    for (const warning of nodeWarnings) {
-      const item = document.createElement("li");
-      item.textContent = warning.code || warning.type || "Warning";
-      item.title = warning.title || "";
-      drawerWarnings.append(item);
-    }
+    return;
   }
+
+  for (const warning of warnings) {
+    const item = document.createElement("li");
+    item.className = `node-warning-item severity-${warning.severity}`;
+    const title = document.createElement("strong");
+    title.className = "node-warning-title";
+    title.textContent = warning.title;
+    item.append(title);
+    if (warning.message) {
+      const message = document.createElement("p");
+      message.className = "node-warning-message";
+      message.textContent = warning.message;
+      item.append(message);
+    }
+    if (warning.evidence) {
+      const evidence = document.createElement("p");
+      evidence.className = "node-warning-detail";
+      evidence.textContent = `Evidence: ${warning.evidence}`;
+      item.append(evidence);
+    }
+    if (warning.suggestion) {
+      const suggestion = document.createElement("p");
+      suggestion.className = "node-warning-detail";
+      suggestion.textContent = `What to check: ${warning.suggestion}`;
+      item.append(suggestion);
+    }
+    const metadata = [warning.code, warning.nodeId].filter(Boolean).join(" · ");
+    if (metadata) {
+      const meta = document.createElement("span");
+      meta.className = "node-warning-meta";
+      meta.textContent = metadata;
+      item.append(meta);
+    }
+    drawerWarnings.append(item);
+  }
+}
+
+function showNodeDetails(node) {
+  const nodeWarnings = (globalData?.warnings || []).filter((warning) => warning.node_id === node.id);
+  const inspector = window.QueryLensPlanLabels.buildNodeInspector(
+    node,
+    nodeWarnings,
+    currentPlan?.time_total_ms,
+  );
+
+  setText("#detail-operator", inspector.operator);
+  setText("#detail-explanation", inspector.explanation);
+  setText("#detail-details", inspector.details);
+  document.querySelector("#detail-plan-details").hidden = !inspector.details;
+  setText("#detail-rows-summary", inspector.rowsSummary);
+  setText("#detail-time-summary", inspector.timeSummary);
+  setText("#detail-estimate-summary", inspector.estimateSummary);
+  setText("#detail-status", inspector.status);
+  renderInspectorMetrics("#detail-rows-metrics", inspector.rowsMetrics);
+  renderInspectorMetrics("#detail-time-metrics", inspector.timeMetrics);
+  renderInspectorMetrics("#detail-estimate-metrics", inspector.estimateMetrics);
+  renderInspectorWarnings(inspector.warnings);
   detailDrawer.hidden = false;
 }
 
@@ -410,16 +480,45 @@ function warningCard(warning) {
   card.className = `warning-card severity-${warning.severity || "info"}${code === "DEAD_END" ? " dead-end-warning" : ""}`;
   const title = document.createElement("h3");
   title.className = "warning-title";
-  const severity = String(warning.severity || "info").toLowerCase();
-  const severityLabel = severity === "high" ? "Error" : severity === "low" ? "Note" : severity === "info" ? "Info" : "Warning";
-  title.textContent = severityLabel + ": " + (warning.title || code);
+  const category = warning.classification || (
+    ["FULL_SCAN", "LARGE_SORT", "TEMP_TABLE", "DEAD_END", "NEVER_EXECUTED"].includes(code)
+      ? "observation"
+      : "investigate"
+  );
+  const categoryLabel = category === "action"
+    ? "Action recommended"
+    : category === "investigate" ? "Worth investigating" : "Observation";
+  title.textContent = categoryLabel + ": " + (warning.title || code);
   const message = document.createElement("p");
   message.className = "warning-message";
-  message.textContent = warning.message || "";
+  const messageLabel = document.createElement("strong");
+  messageLabel.textContent = "What it means: ";
+  message.append(messageLabel, document.createTextNode(warning.message || ""));
+  const evidenceText = String(warning.evidence || "").trim();
+  let evidence = null;
+  if (evidenceText) {
+    evidence = document.createElement("p");
+    evidence.className = "warning-evidence";
+    const evidenceLabel = document.createElement("strong");
+    evidenceLabel.textContent = "Evidence: ";
+    evidence.append(evidenceLabel, document.createTextNode(evidenceText));
+  }
+  const suggestionText = String(warning.suggestion || "").trim();
+  let suggestion = null;
+  if (suggestionText) {
+    suggestion = document.createElement("p");
+    suggestion.className = "warning-suggestion";
+    const label = document.createElement("strong");
+    label.textContent = "What to check: ";
+    suggestion.append(label, document.createTextNode(suggestionText));
+  }
   const label = document.createElement("span");
   label.className = "warning-code";
   label.textContent = `${code} · ${warning.node_id || ""}`;
-  card.append(title, message, label);
+  card.append(title, message);
+  if (evidence) card.append(evidence);
+  if (suggestion) card.append(suggestion);
+  card.append(label);
   return card;
 }
 
@@ -1636,7 +1735,7 @@ function updatePlanHeading(title, stats) {
   if (stats) {
     planSummary.textContent = `${stats.node_count ?? 0} operators · ${Number(stats.total_time_ms || 0).toFixed(2)} ms total`;
   } else if (globalData?.ok === false) {
-    planSummary.textContent = "MySQL could not execute this query. Review the error node and ask for a suggested fix.";
+    planSummary.textContent = "MySQL could not execute this query. Review the error node and reported reason before editing the query.";
   } else {
     planSummary.textContent = "Live MySQL execution plan.";
   }
@@ -1913,12 +2012,20 @@ function renderAiExplanation(explanation) {
   aiLoading.hidden = true;
   aiContent.hidden = false;
   setText("#ai-summary", explanation.summary || "No summary was returned.");
+  const finding = explanation.finding || "";
+  setText("#ai-finding", finding);
+  document.querySelector("#ai-finding-block").hidden = !finding;
+  const learningPoint = explanation.learning_point || "";
+  setText("#ai-learning-point", learningPoint);
+  document.querySelector("#ai-learning-block").hidden = !learningPoint;
   const suggestions = document.querySelector("#ai-suggestions");
   suggestions.replaceChildren();
   const items = Array.isArray(explanation.suggestions) ? explanation.suggestions : [];
   if (!items.length) {
     const item = document.createElement("li");
-    item.textContent = "No additional suggestions.";
+    item.textContent = explanation.suggested_query
+      ? "Compare the suggested query's results and measured runtime with the original before adopting it."
+      : "No immediate change is recommended based on the available evidence. If the query becomes slow as the data grows, investigate its measured execution time and the operations processing the most rows.";
     suggestions.append(item);
   } else {
     for (const suggestion of items) {
@@ -1927,10 +2034,20 @@ function renderAiExplanation(explanation) {
       suggestions.append(item);
     }
   }
-  const fixBlock = document.querySelector("#ai-fix-block");
-  const fix = document.querySelector("#ai-fix");
-  fixBlock.hidden = !explanation.fix;
-  fix.textContent = explanation.fix || "";
+  const rewrite = explanation.suggested_query;
+  const rewriteBlock = document.querySelector("#ai-suggested-query-block");
+  const hasRewrite = Boolean(rewrite && typeof rewrite.sql === "string");
+  rewriteBlock.hidden = false;
+  document.querySelector("#ai-no-suggested-query").hidden = hasRewrite;
+  document.querySelector("#ai-suggested-query-content").hidden = !hasRewrite;
+  setText(
+    "#ai-suggested-query-title",
+    rewrite?.kind === "simplification" ? "Suggested query simplification" : "Suggested improved query",
+  );
+  setText("#ai-suggested-query", rewrite?.sql || "");
+  setText("#ai-query-why", rewrite?.why_it_may_help || "");
+  setText("#ai-query-changes", rewrite?.what_changed || "");
+  setText("#ai-query-limitations", rewrite?.limitations || "");
   const source = document.querySelector("#ai-source");
   const sourceName = explanation.ai_status === "success" ? "gemini" : explanation.source;
   source.textContent = sourceName === "gemini" ? "Gemini" : "Rule-based (offline)";
@@ -1971,6 +2088,7 @@ async function loadAiInsights() {
           warnings: globalData?.warnings || [],
           error: globalData?.error || null,
           tree: globalData?.tree || null,
+          schema_info: globalData?.schema_info || null,
         }),
       });
     }

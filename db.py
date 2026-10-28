@@ -799,6 +799,10 @@ def run_query_with_data(sql: str) -> dict:
         data_conn.close()
 
     source_samples = {}
+    schema_info = {
+        "dialect": "MySQL",
+        "tables": [],
+    }
     sample_conn = get_connection()
     try:
         with closing(sample_conn.cursor()) as cursor:
@@ -809,6 +813,30 @@ def run_query_with_data(sql: str) -> dict:
                 escaped_table = table_name.replace("`", "``")
                 cursor.execute(f"SELECT * FROM `{escaped_schema}`.`{escaped_table}` LIMIT 10")
                 table_columns = [_bare_column_name(column[0]) for column in (cursor.description or [])]
+                table_sample_rows = cursor.fetchmany(10)
+                indexes: dict[str, dict] = {}
+                index_catalog_available = False
+                try:
+                    cursor.execute(
+                        "SELECT INDEX_NAME, SEQ_IN_INDEX, COLUMN_NAME, NON_UNIQUE "
+                        "FROM information_schema.STATISTICS "
+                        "WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s "
+                        "ORDER BY INDEX_NAME, SEQ_IN_INDEX",
+                        (schema_name, table_name),
+                    )
+                    for index_name, sequence, column_name, non_unique in cursor.fetchall():
+                        name = str(index_name)
+                        index = indexes.setdefault(name, {
+                            "name": name,
+                            "columns": [],
+                            "unique": not bool(non_unique),
+                        })
+                        index["columns"].append(str(column_name))
+                    index_catalog_available = True
+                except mysql.connector.Error:
+                    # Index catalog permissions are optional; the plan's used indexes
+                    # remain available independently.
+                    indexes = {}
                 if alias:
                     sample_key = f"{alias} ({schema_name}.{table_name})"
                 else:
@@ -818,8 +846,16 @@ def run_query_with_data(sql: str) -> dict:
                         column: _json_safe(value)
                         for column, value in zip(table_columns, row)
                     }
-                    for row in cursor.fetchmany(10)
+                    for row in table_sample_rows
                 ]
+                schema_info["tables"].append({
+                    "schema": schema_name,
+                    "table": table_name,
+                    "alias": alias,
+                    "columns": table_columns,
+                    "indexes": list(indexes.values()),
+                    "index_catalog_available": index_catalog_available,
+                })
     finally:
         sample_conn.close()
 
@@ -828,4 +864,5 @@ def run_query_with_data(sql: str) -> dict:
         "rows": rows,
         "columns": columns,
         "source_samples": source_samples,
+        "schema_info": schema_info,
     }
