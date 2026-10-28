@@ -1932,12 +1932,13 @@ function renderAiExplanation(explanation) {
   fixBlock.hidden = !explanation.fix;
   fix.textContent = explanation.fix || "";
   const source = document.querySelector("#ai-source");
-  source.textContent = explanation.source === "gemini" ? "Gemini" : "Rule-based (offline)";
-  source.className = `ai-source ${explanation.source === "gemini" ? "gemini" : "fallback"}`;
+  const sourceName = explanation.ai_status === "success" ? "gemini" : explanation.source;
+  source.textContent = sourceName === "gemini" ? "Gemini" : "Rule-based (offline)";
+  source.className = `ai-source ${sourceName === "gemini" ? "gemini" : "fallback"}`;
   const note = document.querySelector("#ai-note");
   note.textContent = explanation.note || "";
   const error = document.querySelector("#ai-error");
-  const fallbackError = explanation.source === "fallback"
+  const fallbackError = sourceName === "fallback"
     ? explanation.error || explanation.reason || explanation.note || ""
     : "";
   error.textContent = fallbackError;
