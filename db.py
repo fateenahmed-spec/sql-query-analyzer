@@ -19,7 +19,7 @@ from sqlparse.sql import Identifier, IdentifierList, Parenthesis
 from dotenv import load_dotenv
 
 from core.parser import parse_explain_analyze
-from security import validate_live_query, validate_query
+from security import resolve_uploaded_table_references, validate_live_query
 
 load_dotenv(Path(__file__).resolve().with_name(".env"))
 
@@ -343,8 +343,27 @@ def kill_query(conn_id, fired_event):
         if conn is not None:
             conn.close()
 
+
+def _resolve_live_query_tables(cursor, query: str) -> str:
+    """Qualify uploaded logical names after checking actual database tables."""
+    default_schema = os.getenv("DB_NAME") or "sql_analyzer_test"
+    cursor.execute(
+        "SELECT TABLE_SCHEMA, TABLE_NAME FROM information_schema.TABLES "
+        "WHERE TABLE_SCHEMA IN (%s, %s)",
+        (default_schema, UPLOAD_SCHEMA),
+    )
+    tables_by_schema: dict[str, list[str]] = {}
+    for schema, table in cursor.fetchall():
+        tables_by_schema.setdefault(str(schema).casefold(), []).append(str(table))
+    resolved = resolve_uploaded_table_references(
+        query,
+        tables_by_schema.get(UPLOAD_SCHEMA.casefold(), []),
+        tables_by_schema.get(default_schema.casefold(), []),
+    )
+    return validate_live_query(resolved)
+
 def run_explain_analyze(raw_sql: str) -> dict:
-    normalized_sql = validate_query(raw_sql)
+    normalized_sql = validate_live_query(raw_sql)
     with get_connection() as conn:
         with closing(conn.cursor()) as cursor:
             cursor.execute("SELECT VERSION()")
@@ -357,6 +376,7 @@ def run_explain_analyze(raw_sql: str) -> dict:
                 raise UnsupportedServerError()
             if version_tuple < (8, 0, 18):
                 raise UnsupportedServerError()
+            normalized_sql = _resolve_live_query_tables(cursor, normalized_sql)
             cursor.execute("START TRANSACTION READ ONLY")
             cursor.execute("SELECT CONNECTION_ID()")
             conn_id = cursor.fetchone()[0]
@@ -757,6 +777,7 @@ def run_query_with_data(sql: str) -> dict:
     try:
         with closing(conn.cursor()) as cursor:
             cursor.execute("SET SESSION MAX_EXECUTION_TIME=5000")
+            normalized_sql = _resolve_live_query_tables(cursor, normalized_sql)
             cursor.execute(f"EXPLAIN ANALYZE {normalized_sql}")
             plan_text = "\n".join(str(row[0]) for row in cursor.fetchall())
     finally:

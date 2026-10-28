@@ -1,3 +1,5 @@
+import os
+
 import mysql.connector
 import pytest
 
@@ -6,6 +8,11 @@ from db import get_connection, run_explain_analyze
 
 def _connection():
     return get_connection()
+
+
+def _built_in_table(name):
+    schema = os.getenv("DB_NAME") or "sql_analyzer_test"
+    return f"`{schema}`.`{name}`"
 
 
 @pytest.fixture(scope="module")
@@ -20,7 +27,7 @@ def db_available():
 
 
 def test_valid_query_returns_plan(db_available):
-    result = run_explain_analyze("SELECT * FROM orders WHERE customer_id = 7")
+    result = run_explain_analyze(f"SELECT * FROM {_built_in_table('orders')} WHERE customer_id = 7")
     assert result["raw_plan"]
     assert result["mysql_version"]
     assert result["elapsed_ms"] >= 0
@@ -31,7 +38,8 @@ def test_cross_join_times_out_under_eight_seconds(db_available):
     from db import UnsupportedServerError
     started = time.perf_counter()
     with pytest.raises(TimeoutError):
-        run_explain_analyze("SELECT SUM(a.id + b.id + c.id) FROM orders a CROSS JOIN orders b CROSS JOIN orders c")
+        table = _built_in_table("orders")
+        run_explain_analyze(f"SELECT SUM(a.id + b.id + c.id) FROM {table} a CROSS JOIN {table} b CROSS JOIN {table} c")
     assert time.perf_counter() - started < 8
 
 
