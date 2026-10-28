@@ -1936,10 +1936,14 @@ function renderAiExplanation(explanation) {
   source.className = `ai-source ${explanation.source === "gemini" ? "gemini" : "fallback"}`;
   const note = document.querySelector("#ai-note");
   note.textContent = explanation.note || "";
-  note.hidden = !explanation.note;
   const error = document.querySelector("#ai-error");
-  error.textContent = explanation.error || "";
-  error.hidden = !explanation.error;
+  const fallbackError = explanation.source === "fallback"
+    ? explanation.error || explanation.reason || explanation.note || ""
+    : "";
+  error.textContent = fallbackError;
+  error.hidden = !fallbackError;
+  document.querySelector(".ai-summary-block").after(error);
+  note.hidden = !explanation.note || explanation.note === fallbackError;
   renderIndexSimulationActions(explanation);
 }
 
@@ -1971,7 +1975,12 @@ async function loadAiInsights() {
     }
     renderAiExplanation(explanation);
   } catch (error) {
-    renderAiExplanation({ summary: error.message, suggestions: [], source: "fallback" });
+    renderAiExplanation({
+      summary: error.message,
+      suggestions: [],
+      source: "fallback",
+      error: error.message,
+    });
   }
 }
 

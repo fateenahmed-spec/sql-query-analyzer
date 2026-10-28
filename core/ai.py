@@ -259,8 +259,16 @@ def get_ai_explanation(
         }
         headers = {"Content-Type": "application/json", "x-goog-api-key": api_key}
         response = None
+        timeout_retried = False
         for attempt in range(3):
-            response = requests.post(url, headers=headers, json=body, timeout=(5, 30))
+            try:
+                response = requests.post(url, headers=headers, json=body, timeout=(10, 30))
+            except requests.exceptions.Timeout:
+                if timeout_retried:
+                    raise
+                timeout_retried = True
+                time.sleep(1)
+                response = requests.post(url, headers=headers, json=body, timeout=(10, 30))
             status_code = int(response.status_code)
             if status_code in {429, 500, 503} and attempt < 2:
                 time.sleep(0.5 * (2 ** attempt))
@@ -308,7 +316,14 @@ def get_ai_explanation(
         _store_cached(key, result)
         return {**result, "ai_status": "success"}
     except requests.exceptions.Timeout:
-        return _fallback_result(query, warnings, tree_summary, error, api_key, "Gemini request timed out")
+        return _fallback_result(
+            query,
+            warnings,
+            tree_summary,
+            error,
+            api_key,
+            "Gemini API timed out. Using offline fallback.",
+        )
     except requests.exceptions.ConnectionError:
         return _fallback_result(query, warnings, tree_summary, error, api_key, "network blocked")
     except requests.exceptions.RequestException:
