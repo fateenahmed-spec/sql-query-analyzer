@@ -8,3 +8,28 @@ ai_cache.json
 diag_*.py
 sample_upload.csv
 *.log
+
+# Local environments and secrets
+.env.*
+!.env.example
+.venv/
+
+# Python and browser-test artifacts
+*.py[cod]
+.playwright-mcp/
+node_modules/
+
+# Temporary files
+*.tmp
+*.temp
+*.swp
+*~
+tmp/
+temp/
+
+# Local database files and generated SQL dumps
+*.sql
+*.dump
+*.sqlite
+*.sqlite3
+*.db

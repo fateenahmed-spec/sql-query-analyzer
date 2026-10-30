@@ -32,6 +32,8 @@ _OPERATORS = (
     "Index range scan",
     "Index lookup",
     "Index scan",
+    "Window aggregate with buffering",
+    "Window aggregate",
     "Table scan",
     "Nested loop inner join",
     "Nested loop left join",

@@ -30,7 +30,7 @@ let demoQueryId = "";
 let selectedDemoQueryId = "";
 let selectedCsvFile = null;
 let fullFlowAutoScroll = true;
-const noSampleRowsMessage = "No sample rows available for this operator (derived table or missing alias).";
+const noSampleRowsMessage = "Exact intermediate rows are unavailable for this operator.";
 const presentationDemo = new URLSearchParams(window.location.search).get("demo") === "1";
 
 const cyContainer = document.querySelector("#cy");
@@ -66,10 +66,7 @@ const examplesSelect = document.querySelector("#examples-select");
 const planSummary = document.querySelector("#plan-summary");
 const sourceBadge = document.querySelector("#source-badge");
 const graphMessage = document.querySelector("#graph-message");
-const warningCount = document.querySelector("#warning-count");
-const warningsList = document.querySelector("#warnings-list");
 const detailDrawer = document.querySelector("#node-detail-drawer");
-const drawerWarnings = document.querySelector("#detail-warnings");
 const speedSlider = document.querySelector("#speed-slider");
 const stepStatus = document.querySelector("#step-status");
 const stepProgress = document.querySelector("#step-progress");
@@ -328,72 +325,11 @@ function renderInspectorMetrics(selector, metrics) {
   }
 }
 
-function renderInspectorWarnings(warnings) {
-  drawerWarnings.replaceChildren();
-  if (!warnings.length) {
-    const empty = document.createElement("li");
-    empty.className = "muted";
-    empty.textContent = "No warnings attached to this operation.";
-    drawerWarnings.append(empty);
-    return;
-  }
-
-  for (const warning of warnings) {
-    const item = document.createElement("li");
-    item.className = `node-warning-item severity-${warning.severity}`;
-    const title = document.createElement("strong");
-    title.className = "node-warning-title";
-    title.textContent = warning.title;
-    item.append(title);
-    if (warning.message) {
-      const message = document.createElement("p");
-      message.className = "node-warning-message";
-      message.textContent = warning.message;
-      item.append(message);
-    }
-    if (warning.evidence) {
-      const evidence = document.createElement("p");
-      evidence.className = "node-warning-detail";
-      evidence.textContent = `Evidence: ${warning.evidence}`;
-      item.append(evidence);
-    }
-    if (warning.suggestion) {
-      const suggestion = document.createElement("p");
-      suggestion.className = "node-warning-detail";
-      suggestion.textContent = `What to check: ${warning.suggestion}`;
-      item.append(suggestion);
-    }
-    const metadata = [warning.code, warning.nodeId].filter(Boolean).join(" · ");
-    if (metadata) {
-      const meta = document.createElement("span");
-      meta.className = "node-warning-meta";
-      meta.textContent = metadata;
-      item.append(meta);
-    }
-    drawerWarnings.append(item);
-  }
-}
-
 function showNodeDetails(node) {
-  const nodeWarnings = (globalData?.warnings || []).filter((warning) => warning.node_id === node.id);
-  const inspector = window.QueryLensPlanLabels.buildNodeInspector(
-    node,
-    nodeWarnings,
-    currentPlan?.time_total_ms,
-  );
-
-  setText("#detail-operator", inspector.operator);
-  setText("#detail-explanation", inspector.explanation);
-  setText("#detail-details", inspector.details);
-  document.querySelector("#detail-plan-details").hidden = !inspector.details;
-  setText("#detail-rows-summary", inspector.rowsSummary);
-  setText("#detail-time-summary", inspector.timeSummary);
-  setText("#detail-estimate-summary", inspector.estimateSummary);
-  setText("#detail-status", inspector.status);
-  renderInspectorMetrics("#detail-rows-metrics", inspector.rowsMetrics);
-  renderInspectorMetrics("#detail-time-metrics", inspector.timeMetrics);
-  renderInspectorMetrics("#detail-estimate-metrics", inspector.estimateMetrics);
-  renderInspectorWarnings(inspector.warnings);
+  const inspector = window.QueryLensPlanLabels.buildNodeInspector(node);
+  setText("#detail-operator", inspector.operation);
+  setText("#detail-operation-details", inspector.details);
+  renderInspectorMetrics("#detail-node-metrics", inspector.metrics);
   detailDrawer.hidden = false;
 }
 
@@ -474,67 +410,6 @@ function showGraphMessage(message) {
   graphMessage.hidden = false;
 }
 
-function warningCard(warning) {
-  const card = document.createElement("article");
-  const code = warning.code || warning.type || "WARNING";
-  card.className = `warning-card severity-${warning.severity || "info"}${code === "DEAD_END" ? " dead-end-warning" : ""}`;
-  const title = document.createElement("h3");
-  title.className = "warning-title";
-  const category = warning.classification || (
-    ["FULL_SCAN", "LARGE_SORT", "TEMP_TABLE", "DEAD_END", "NEVER_EXECUTED"].includes(code)
-      ? "observation"
-      : "investigate"
-  );
-  const categoryLabel = category === "action"
-    ? "Action recommended"
-    : category === "investigate" ? "Worth investigating" : "Observation";
-  title.textContent = categoryLabel + ": " + (warning.title || code);
-  const message = document.createElement("p");
-  message.className = "warning-message";
-  const messageLabel = document.createElement("strong");
-  messageLabel.textContent = "What it means: ";
-  message.append(messageLabel, document.createTextNode(warning.message || ""));
-  const evidenceText = String(warning.evidence || "").trim();
-  let evidence = null;
-  if (evidenceText) {
-    evidence = document.createElement("p");
-    evidence.className = "warning-evidence";
-    const evidenceLabel = document.createElement("strong");
-    evidenceLabel.textContent = "Evidence: ";
-    evidence.append(evidenceLabel, document.createTextNode(evidenceText));
-  }
-  const suggestionText = String(warning.suggestion || "").trim();
-  let suggestion = null;
-  if (suggestionText) {
-    suggestion = document.createElement("p");
-    suggestion.className = "warning-suggestion";
-    const label = document.createElement("strong");
-    label.textContent = "What to check: ";
-    suggestion.append(label, document.createTextNode(suggestionText));
-  }
-  const label = document.createElement("span");
-  label.className = "warning-code";
-  label.textContent = `${code} · ${warning.node_id || ""}`;
-  card.append(title, message);
-  if (evidence) card.append(evidence);
-  if (suggestion) card.append(suggestion);
-  card.append(label);
-  return card;
-}
-
-function renderWarnings(warnings) {
-  warningsList.replaceChildren();
-  warningCount.textContent = String(warnings.length);
-  if (!warnings.length) {
-    const empty = document.createElement("p");
-    empty.className = "warning-empty";
-    empty.textContent = "No warnings found for this plan.";
-    warningsList.append(empty);
-  } else {
-    for (const warning of warnings) warningsList.append(warningCard(warning));
-  }
-}
-
 function appendEmpty(container, message) {
   const empty = document.createElement("p");
   empty.className = "empty-state";
@@ -597,7 +472,9 @@ function renderTable(container, title, rows, options = {}) {
 
 function flowInputRids(step) {
   if (!step) return [];
-  return step.op === "scan" ? (step.output_rids || []) : (step.input_rids || []);
+  return step.op === "scan"
+    ? (step.source_sample_rids || step.output_rids || [])
+    : (step.input_rids || []);
 }
 
 function renderFlowRows(container, title, rids, states = {}, badge = "", options = {}) {
@@ -713,6 +590,10 @@ function currentStepStates(step) {
 
 function currentIntermediateRids(step) {
   if (!step || currentRowIndex < 0 || step.never_executed) return [];
+  if (["sampled_simulation", "actual_query_result"].includes(step.exactness) || step.branch_join) {
+    const outputs = step.output_rids || [];
+    return outputs.slice(0, Math.min(currentRowIndex + 1, outputs.length));
+  }
   const input = flowInputRids(step);
   const processed = new Set(input.slice(0, Math.min(currentRowIndex + 1, input.length)));
   const output = new Set(step.output_rids || []);
@@ -726,7 +607,7 @@ function sourceScanGroups() {
   const records = globalData?.row_records || {};
   animSteps.forEach((step, scanIndex) => {
     if (step.op !== "scan") return;
-    const rids = (step.output_rids || []).filter((rid) => records[rid]);
+    const rids = (step.source_sample_rids || step.output_rids || []).filter((rid) => records[rid]);
     const rowRecord = records[rids[0]] || Object.values(step.row_data || {})[0] || null;
     if (!rowRecord) return;
     const alias = String(rowRecord.alias || rowRecord.table || `table_${groups.length + 1}`);
@@ -769,7 +650,12 @@ function currentJoinComparison(step) {
 function joinStatesForGroup(group, step) {
   const states = {};
   if (!step || currentIndex < animSteps.indexOf(step) || !step.evaluable) return states;
-  const matchedRids = new Set(step.input_rids || []);
+  const matchedRids = new Set(step.matched_input_rids || []);
+  if (step.branch_join) {
+    for (const rid of group.rids) states[rid] = matchedRids.has(rid) ? "row-pass" : "row-fail row-dim";
+    return states;
+  }
+  const matchedRidsLegacy = new Set(step.input_rids || []);
   const completedRids = new Set();
   const activePair = currentIndex === animSteps.indexOf(step) ? joinPairRids(step) : [];
   const lastPair = currentIndex === animSteps.indexOf(step)
@@ -779,7 +665,7 @@ function joinStatesForGroup(group, step) {
     for (const rid of joinPairRids(step, pairIndex)) completedRids.add(rid);
   }
   for (const rid of group.rids) {
-    if (!matchedRids.has(rid)) states[rid] = "row-fail row-dim";
+    if (!matchedRidsLegacy.has(rid)) states[rid] = "row-fail row-dim";
     else if (!completedRids.has(rid)) states[rid] = "row-pending";
     else if (currentJoinPhase === "highlight" && activePair.includes(rid) && currentIndex === animSteps.indexOf(step)) {
       states[rid] = "row-active row-join-highlight";
@@ -844,7 +730,7 @@ function renderSourceTables() {
     ? `Source table: ${firstRecord.table}${sourceAlias}`
     : step.op === "scan" ? `Source scan - ${step.label}` : `Input rows - ${step.label}`;
   if (!rids.length && !step.never_executed) {
-    appendEmpty(container, `${noSampleRowsMessage} Full run reported ${formattedCount(step.actual_rows)} rows.`);
+    appendEmpty(container, step.note || noSampleRowsMessage);
     return;
   }
   renderFlowRows(container, title, rids, currentIndex >= 0 ? currentStepStates(step) : {});
@@ -858,7 +744,7 @@ function renderIntermediateStats() {
     return;
   }
   if (step && !step.never_executed && !flowInputRids(step).length) {
-    appendEmpty(container, `${noSampleRowsMessage} Full run reported ${formattedCount(step.actual_rows)} rows.`);
+    appendEmpty(container, step.note || noSampleRowsMessage);
     return;
   }
   if (!step || currentRowIndex < 0 || step.never_executed) {
@@ -866,30 +752,29 @@ function renderIntermediateStats() {
     return;
   }
 
-  if (step.op === "aggregate" && step.output_rids?.length) {
-    const count = currentIntermediateRids(step).length;
-    if (!count) {
-      appendEmpty(container, "No aggregate output yet for the processed sample rows.");
-      return;
-    }
-    const tokenRid = `group:${step.node_id}`;
-    globalData.row_records[tokenRid] = {
-      table: "Aggregate token",
-      table_row_count: step.actual_rows,
-      values: { token: "Sample group token", sample_rows: count },
-    };
-    renderFlowRows(container, "Aggregate output", [tokenRid], {}, step.evaluable ? "" : "Scaled from plan counts");
-    delete globalData.row_records[tokenRid];
-    return;
-  }
-
-  const badge = step.evaluable ? "" : "Scaled from plan counts";
+  const badge = step.exactness === "sampled_simulation" ? "Calculated over sampled inputs" : step.evaluable ? "" : "Sample unavailable";
   const outputRids = currentIntermediateRids(step);
   const outputStates = Object.fromEntries(outputRids.map((rid) => [rid, "row-pass row-move"]));
-  renderFlowRows(container, `Output rows - ${step.label}`, outputRids, outputStates, badge);
+  renderFlowRows(container, `Output rows - ${step.label}`, outputRids, outputStates, badge, {
+    emptyMessage: step.note || noSampleRowsMessage,
+  });
 }
 
 function renderJoinIntermediate(container, step) {
+  if (step.branch_join) {
+    const rids = currentIntermediateRids(step);
+    if (!step.evaluable) {
+      appendEmpty(container, step.note || "The JOIN output could not be evaluated from its two input branches.");
+      return;
+    }
+    if (!rids.length) {
+      appendEmpty(container, "No joined rows were produced from the sampled input branches.");
+      return;
+    }
+    renderFlowRows(container, "Combined JOIN output", rids,
+      Object.fromEntries(rids.map((rid) => [rid, "row-pass row-move"])), "Matched rows returned by the sample join");
+    return;
+  }
   const comparison = currentJoinComparison(step);
   if (!comparison) {
     appendEmpty(container, step.never_executed
@@ -1101,7 +986,18 @@ function pipelineCard(step, stepIndex) {
   const title = document.createElement("h2");
   title.textContent = step.label || step.op || "Query operator";
   const detail = document.createElement("p");
-  detail.textContent = `${String(step.op || "operator").toUpperCase()}${step.condition ? ` · ${step.condition}` : ""}`;
+  const quality = {
+    actual_query_result: "Original query result",
+    exact_for_sample: "Evaluated on sample",
+    sampled_source: "Source sample",
+    sampled_simulation: "Calculated over sample",
+    sample_passthrough: "Child rows passed through",
+    sampled_input_empty: "No sampled input rows",
+    physical_plan_never_executed: "Plan says not executed",
+    not_evaluable: "Intermediate unavailable",
+  }[step.exactness] || "Sample status unavailable";
+  const mapping = step.mapping_note ? ` · ${step.mapping_note}` : "";
+  detail.textContent = `${step.layer || "SQL stage"} · ${step.logical_op || step.op || "operator"} · ${quality}${step.condition ? ` · ${step.condition}` : ""}${mapping}`;
   titleGroup.append(title, detail);
   const count = document.createElement("span");
   count.className = "pipeline-count";
@@ -1114,9 +1010,7 @@ function pipelineCard(step, stepIndex) {
   const rids = flowInputRids(step);
   const outputCount = (step.output_rids || []).length;
   const record = (globalData?.row_records || {})[rids[0]];
-  const inputCount = step.op === "scan"
-    ? Number(step.table_row_count || record?.table_row_count || step.actual_rows || rids.length)
-    : Number(step.input_rids?.length || rids.length);
+  const inputCount = Number(step.input_rids?.length || rids.length);
   const stats = document.createElement("div");
   stats.className = "pipeline-stat-grid";
   for (const [label, value] of [["Input rows", inputCount], ["Sample output", outputCount], ["Plan rows", Number(step.actual_rows || 0)]]) {
@@ -1131,7 +1025,23 @@ function pipelineCard(step, stepIndex) {
   }
   body.append(stats);
 
-  if (step.op === "join") {
+  if (step.op === "join" && step.input_branches?.length) {
+    const joinInputs = document.createElement("div");
+    joinInputs.className = "pipeline-join-inputs";
+    for (const branch of step.input_branches) {
+      const rows = (branch.output_rids || []).map((rid) => ({
+        rid,
+        record: (globalData?.row_records || {})[rid],
+        state: (step.matched_input_rids || []).includes(rid) ? "pass" : "sample",
+        active: false,
+        collapsed: false,
+      }));
+      const record = rows.find((row) => row.record)?.record;
+      const title = record ? `${record.table}${record.alias ? ` (${record.alias})` : ""}` : `${branch.operator || "Input"} branch`;
+      joinInputs.append(pipelineTable(title, rows, { emptyMessage: step.note || noSampleRowsMessage }));
+    }
+    body.append(joinInputs);
+  } else if (step.op === "join") {
     const scans = animSteps.map((candidate, index) => ({ candidate, index }))
       .filter((item) => item.candidate.op === "scan" && item.index < stepIndex)
       .slice(-2);
@@ -1161,6 +1071,17 @@ function pipelineCard(step, stepIndex) {
       ? `Never executed: upstream returned 0 rows. Plan reports ${formattedCount(step.actual_rows)} output rows.`
       : step.note || `${noSampleRowsMessage} Input count ${formattedCount(inputCount)}; output count ${formattedCount(step.actual_rows || outputCount)}.`;
     body.append(empty);
+  }
+  const outputRids = step.output_rids || [];
+  if (outputRids.length) {
+    const outputRows = outputRids.map((rid) => ({
+      rid,
+      record: (globalData?.row_records || {})[rid],
+      state: "pass",
+      active: false,
+      collapsed: false,
+    }));
+    body.append(pipelineTable("Output records", outputRows, { emptyMessage: step.note || noSampleRowsMessage }));
   }
   if (step.note && rids.length) {
     const note = document.createElement("p");
@@ -1348,8 +1269,8 @@ function buildAnimationEvents(steps) {
   const events = [];
   for (let stepIndex = 0; stepIndex < steps.length; stepIndex += 1) {
     const step = steps[stepIndex];
-    const rids = flowInputRids(step);
-    const eventCount = step.op === "join" ? Math.floor(rids.length / 2) : rids.length;
+    const rids = eventRowIds(step);
+    const eventCount = step.op === "join" && !step.branch_join ? Math.floor(rids.length / 2) : rids.length;
     if (step.never_executed || !eventCount) {
       events.push({ stepIndex, rowIndex: -1 });
       continue;
@@ -1374,20 +1295,21 @@ function formattedCount(value) {
 }
 
 function stepSummary(step) {
-  const sampleCount = step.op === "join" ? Math.floor(flowInputRids(step).length / 2) : flowInputRids(step).length;
-  const outputCount = step.op === "join" ? Math.floor((step.output_rids || []).length / 2) : (step.output_rids || []).length;
-  const records = globalData?.row_records || {};
-  const firstRecord = [...(step.input_rids || []), ...(step.output_rids || [])]
-    .map((rid) => records[rid])
-    .find(Boolean);
-  const tableCount = step.table_row_count || firstRecord?.table_row_count || step.actual_rows || 0;
-  const scaled = step.evaluable ? "" : " Scaled from plan counts.";
-  const unit = step.op === "join" ? "sample pairs matched" : "sample rows passed";
-  return `${outputCount} of ${sampleCount} ${unit}. Full run: ${formattedCount(step.actual_rows)} of ${formattedCount(tableCount)} (estimated ${formattedCount(step.est_rows)}).${scaled}`;
+  const inputCount = (step.input_rids || []).length;
+  const outputCount = (step.output_rids || []).length;
+  const quality = {
+    actual_query_result: "Original query output",
+    exact_for_sample: "Operation evaluated on these samples",
+    sampled_source: "Independent source sample",
+    sampled_simulation: "Calculated from sampled inputs only",
+    sample_passthrough: "Child sample passed through unchanged",
+    not_evaluable: step.note || "Exact intermediate rows are unavailable",
+  }[step.exactness] || step.note || "Sample status unavailable";
+  return `${formattedCount(inputCount)} sampled input rows, ${formattedCount(outputCount)} sampled output rows. Physical plan reported ${formattedCount(step.actual_rows)} rows. ${quality}.`;
 }
 
 function eventRowIds(step) {
-  return flowInputRids(step);
+  return Array.isArray(step.event_rids) ? step.event_rids : flowInputRids(step);
 }
 
 function updateGraphVisuals() {
@@ -1412,15 +1334,15 @@ function updateGraphVisuals() {
     }
     if (flowEvaluationBadge) {
       flowEvaluationBadge.hidden = Boolean(step.evaluable || step.never_executed);
-      flowEvaluationBadge.textContent = step.evaluable || step.never_executed ? "" : "Scaled from plan counts";
+      flowEvaluationBadge.textContent = step.evaluable || step.never_executed ? "" : "Intermediate unavailable";
     }
     const rids = eventRowIds(step);
-    const eventCount = step.op === "join" ? Math.floor(rids.length / 2) : rids.length;
+    const eventCount = step.op === "join" && !step.branch_join ? Math.floor(rids.length / 2) : rids.length;
     if (currentRowIndex >= 0 && currentRowIndex < eventCount) {
-      const pair = step.op === "join" ? joinPairRids(step) : [];
-      const record = (globalData?.row_records || {})[step.op === "join" ? pair[0] : rids[currentRowIndex]];
+      const pair = step.op === "join" && !step.branch_join ? joinPairRids(step) : [];
+      const record = (globalData?.row_records || {})[step.op === "join" && !step.branch_join ? pair[0] : rids[currentRowIndex]];
       const tableCount = step.table_row_count || record?.table_row_count || 0;
-      stepStatus.textContent = step.op === "join"
+      stepStatus.textContent = step.op === "join" && !step.branch_join
         ? `JOIN pair ${currentRowIndex + 1} of ${eventCount}: ${pair.join(" + ")}.`
         : currentRowIndex + 1 < eventCount
           ? `Sample row ${currentRowIndex + 1} of ${eventCount} (table has ${formattedCount(tableCount)} rows).`
@@ -1431,7 +1353,7 @@ function updateGraphVisuals() {
         : step.op === "join" && step.evaluable && !flowInputRids(step).length
           ? "JOIN found no matching sampled row pairs; unmatched source rows are marked red."
           : !flowInputRids(step).length
-          ? `${noSampleRowsMessage} Full run reported ${formattedCount(step.actual_rows)} rows.`
+          ? step.note || noSampleRowsMessage
           : step.note || "No sample rows to animate.";
     }
   } else {
@@ -1458,10 +1380,10 @@ function applyAnimationEvent(eventIndex, writeLog = true, joinPhase = "highlight
   currentIndex = event.stepIndex;
   currentRowIndex = event.rowIndex;
   const step = animSteps[currentIndex];
-  currentJoinPhase = step.op === "join" && event.rowIndex >= 0 ? joinPhase : "merge";
+  currentJoinPhase = step.op === "join" && !step.branch_join && event.rowIndex >= 0 ? joinPhase : "merge";
   updateGraphVisuals();
 
-  if (step.op === "join" && event.rowIndex >= 0) {
+  if (step.op === "join" && !step.branch_join && event.rowIndex >= 0) {
     const pair = joinPairRids(step, event.rowIndex);
     if (writeLog) {
       appendProcessLog(pair.length === 2
@@ -1505,7 +1427,9 @@ function applyAnimationEvent(eventIndex, writeLog = true, joinPhase = "highlight
   const rid = eventRowIds(step)[event.rowIndex];
   const passed = step.row_results?.[rid] ?? (step.output_rids || []).includes(rid);
   if (writeLog) {
-    if (step.op === "join") {
+    if (step.op === "join" && step.branch_join) {
+      appendProcessLog(`JOIN produced sampled output row ${rid} from the child input branches.`);
+    } else if (step.op === "join") {
       const comparison = currentJoinComparison(step);
       if (comparison?.evaluable) {
         const rowNumber = String(comparison.rid).match(/#(\d+)$/)?.[1] || "?";
@@ -1715,7 +1639,6 @@ function resetGraphState() {
   closeDrawer();
   if (sourceBadge) sourceBadge.textContent = "";
   if (planSummary) planSummary.textContent = "";
-  renderWarnings([]);
   clearErrorBanner();
 }
 
@@ -1753,7 +1676,6 @@ function loadPlanData(data, isDemo = false, queryId = "") {
   currentIndex = -1;
   currentRowIndex = -1;
   processLog.replaceChildren();
-  renderWarnings(data.warnings || []);
   updatePlanHeading(data.query?.title || "Live query plan", data.stats);
   sourceBadge.textContent = isDemo ? "Offline demo plan" : data.ok === false ? "MySQL error" : "Live MySQL";
   maxCompleted = Math.max(maxCompleted, 2);

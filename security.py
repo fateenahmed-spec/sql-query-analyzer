@@ -196,6 +196,30 @@ def resolve_uploaded_table_references(
     return str(statements[0])
 
 
+def query_source_references(sql: str) -> list[dict[str, str | None]]:
+    """Return base table references from every SQL scope, excluding CTE names."""
+    cleaned = validate_live_query(sql)
+    statements = sqlparse.parse(cleaned)
+    if len(statements) != 1:
+        raise UnsafeQueryError("Multiple statements are not allowed")
+    references = []
+    seen = set()
+    for identifier, cte_names in _source_identifiers(statements[0]):
+        table = (identifier.get_real_name() or "").strip("`\"[]")
+        if not table:
+            continue
+        schema = (identifier.get_parent_name() or "").strip("`\"[]") or None
+        if not schema and table.casefold() in cte_names:
+            continue
+        alias = (identifier.get_alias() or table).strip("`\"[]")
+        identity = ((schema or "").casefold(), table.casefold(), alias.casefold())
+        if identity in seen:
+            continue
+        seen.add(identity)
+        references.append({"schema": schema, "table": table, "alias": alias})
+    return references
+
+
 def validate_query(sql: str) -> str:
     cleaned = sql.strip()
     cleaned = re.sub(r"^EXPLAIN(?:\s+ANALYZE)?\b", "", cleaned, count=1, flags=re.IGNORECASE).strip()

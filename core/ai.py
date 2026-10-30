@@ -16,21 +16,26 @@ from typing import Any
 
 import requests
 import sqlparse
-from sqlparse.sql import Where
+from sqlparse.sql import Comparison, Function, Identifier, IdentifierList, Parenthesis, Where
 from sqlparse import tokens as sql_tokens
 from dotenv import load_dotenv
 
-from security import UnsafeQueryError, validate_query
+from security import UnsafeQueryError, validate_live_query, validate_query
 
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _CACHE_PATH = _PROJECT_ROOT / "ai_cache.json"
 _MEMORY_CACHE: dict[str, dict[str, Any]] = {}
 _CACHE_LOCK = threading.Lock()
+_CACHE_VERSION = 7
 load_dotenv(_PROJECT_ROOT / ".env")
 _NO_CHANGE = (
     "No immediate change is recommended based on the available evidence. If the query becomes slow as the data grows, "
     "investigate its measured execution time and the operations processing the most rows."
+)
+_ALTERNATIVE_FORMULATION_NOTE = (
+    "This query preserves the intended result, but a performance improvement has not been established. "
+    "Compare both execution plans."
 )
 _SQL_IDENTIFIER = r"(?:`(?:``|[^`])+`|[\w$]+)"
 _QUERY_SOURCE = re.compile(
@@ -50,6 +55,29 @@ _SQL_RESERVED = {
     "lock", "not", "offset", "on", "or", "order", "outer", "right", "select", "set", "union",
     "using", "when", "where", "window", "with",
 }
+
+
+def _rewrite_result(
+    *,
+    kind: str,
+    category: str,
+    sql: str,
+    why: str,
+    changes: str,
+    performance: str,
+    assumptions: str,
+    limitations: str,
+) -> dict[str, str]:
+    return {
+        "kind": kind,
+        "category": category,
+        "sql": sql,
+        "why_it_may_help": why,
+        "what_changed": changes,
+        "performance_expectation": performance,
+        "semantic_assumptions": assumptions,
+        "limitations": limitations,
+    }
 
 
 class AIUnavailableError(RuntimeError):
@@ -83,7 +111,7 @@ def _cache_key(
 ) -> str:
     encoded = json.dumps(
         {
-            "version": 6,
+            "version": _CACHE_VERSION,
             "query": query,
             "warnings": warnings,
             "error": error,
@@ -114,12 +142,15 @@ def _read_disk_cache() -> dict[str, dict[str, Any]]:
                     item.get("suggested_query") is None
                     or (
                         isinstance(item.get("suggested_query"), dict)
-                        and item["suggested_query"].get("kind") in {
-                            "measured_optimization", "simplification", "general_optimization"
+                        and item["suggested_query"].get("category") in {
+                            "measured_optimization", "alternative_formulation"
                         }
                         and all(
                             isinstance(item["suggested_query"].get(field), str)
-                            for field in ("sql", "why_it_may_help", "what_changed", "limitations")
+                            for field in (
+                                "sql", "kind", "why_it_may_help", "what_changed",
+                                "performance_expectation", "semantic_assumptions", "limitations",
+                            )
                         )
                     )
                 )
@@ -453,35 +484,356 @@ def _safe_distinct_star_rewrite(
     }
     measured_dedup = measured_dedup & plan_temp_ids
     if measured_dedup:
-        return {
-            "kind": "measured_optimization",
-            "sql": rewritten_sql,
-            "why_it_may_help": (
+        return _rewrite_result(
+            kind="measured_optimization",
+            category="measured_optimization",
+            sql=rewritten_sql,
+            why=(
                 "The plan marks this temporary-table step as its largest measured time share. The query selects every column "
                 "from one table with a primary key, so its rows are already unique; DISTINCT adds duplicate-removal work "
                 "without changing the result."
             ),
-            "what_changed": "Removed DISTINCT. The selected columns and any filter stay the same.",
-            "limitations": (
+            changes="Removed DISTINCT. The selected columns and any filter stay the same.",
+            performance="The original plan measured duplicate-removal work; this candidate has not been benchmarked.",
+            assumptions=(
+                "The primary key uniquely identifies every row, and SELECT * returns all columns from that one base table."
+            ),
+            limitations=(
                 "This relies on selecting every column from the same single table whose primary index appears in the plan. "
                 "If joins, grouping, or the projection change, check equivalence again. The rewrite is not a guarantee of a faster query."
             ),
-        }
+        )
 
-    return {
-        "kind": "simplification",
-        "sql": rewritten_sql,
-        "why_it_may_help": (
+    return _rewrite_result(
+        kind="simplification",
+        category="alternative_formulation",
+        sql=rewritten_sql,
+        why=(
             "This is a query simplification: selecting every column from one table with a primary key already produces "
             "unique rows, so DISTINCT is redundant. The plan does not show duplicate-removal work as a measured hotspot, "
             "so the performance benefit may be negligible."
         ),
-        "what_changed": "Removed DISTINCT only; the table, alias, WHERE, ORDER BY, LIMIT, and FORCE INDEX hint are preserved.",
-        "limitations": (
+        changes="Removed DISTINCT only; the table, alias, WHERE, ORDER BY, LIMIT, and FORCE INDEX hint are preserved.",
+        performance="Unknown; the candidate has not been benchmarked.",
+        assumptions="The primary key uniquely identifies every row, and SELECT * returns all columns from that one base table.",
+        limitations=(
             "This relies on the query selecting every column from one base table and on the primary-key evidence for that table. "
-            "Because no separate duplicate-removal work was measured, treat this as a simplification rather than a performance fix."
+            "Because no separate duplicate-removal work was measured, treat this as a simplification rather than a performance fix. "
+            f"{_ALTERNATIVE_FORMULATION_NOTE}"
         ),
-    }
+    )
+
+
+def _significant_sql_tokens(tokens) -> list:
+    return [
+        token for token in tokens
+        if not token.is_whitespace
+        and not (token.ttype and token.ttype in sql_tokens.Comment)
+        and token.value.strip()
+    ]
+
+
+def _simple_column_reference(token) -> tuple[str | None, str] | None:
+    if not isinstance(token, Identifier):
+        return None
+    value = token.value.strip()
+    if not value or "*" in value or "(" in value or ")" in value or value.count(".") > 1:
+        return None
+    column = token.get_real_name()
+    if not column:
+        return None
+    return token.get_parent_name(), _unquote_identifier(column)
+
+
+def _top_level_source(statement):
+    tokens = statement.tokens
+    from_index = next(
+        (
+            index for index, token in enumerate(tokens)
+            if token.ttype in sql_tokens.Keyword and token.normalized.upper() == "FROM"
+        ),
+        None,
+    )
+    if from_index is None:
+        return None, None
+    source_end = len(tokens)
+    for index in range(from_index + 1, len(tokens)):
+        token = tokens[index]
+        if isinstance(token, Where) or (
+            token.ttype in sql_tokens.Keyword
+            and token.normalized.upper() in {"ORDER BY", "LIMIT", "OFFSET", "GROUP BY", "HAVING", "UNION"}
+        ):
+            source_end = index
+            break
+    source_tokens = _significant_sql_tokens(tokens[from_index + 1:source_end])
+    if len(source_tokens) != 1 or not isinstance(source_tokens[0], Identifier):
+        return None, None
+    source = source_tokens[0]
+    if not source.get_real_name() or source.get_alias() and source.get_alias().casefold() in _SQL_RESERVED:
+        return None, None
+    return source, from_index
+
+
+def _select_projection(statement, from_index: int) -> list[Identifier] | None:
+    tokens = statement.tokens
+    select_index = next(
+        (
+            index for index, token in enumerate(tokens)
+            if token.ttype in sql_tokens.DML and token.normalized.upper() == "SELECT"
+        ),
+        None,
+    )
+    if select_index is None:
+        return None
+    projection_tokens = _significant_sql_tokens(tokens[select_index + 1:from_index])
+    if len(projection_tokens) == 1 and isinstance(projection_tokens[0], IdentifierList):
+        projection = list(projection_tokens[0].get_identifiers())
+    else:
+        projection = projection_tokens
+    if not projection or any(
+        not isinstance(item, Identifier)
+        or _simple_column_reference(item) is None
+        or item.get_alias()
+        for item in projection
+    ):
+        return None
+    return projection
+
+
+def _walk_identifiers(token_list):
+    for token in getattr(token_list, "tokens", []):
+        if isinstance(token, Identifier):
+            yield token
+            continue
+        if token.is_group:
+            yield from _walk_identifiers(token)
+
+
+def _token_span(token_list, target) -> tuple[int, int] | None:
+    def find(tokens, offset: int) -> tuple[int, int] | None:
+        position = offset
+        for token in getattr(tokens, "tokens", []):
+            if token is target:
+                return position, position + len(token.value)
+            if token.is_group:
+                found = find(token, position)
+                if found:
+                    return found
+            position += len(token.value)
+        return None
+
+    return find(token_list, 0)
+
+
+def _safe_correlated_avg_window_rewrite(query: str) -> dict[str, str] | None:
+    """Rewrite one simple same-table correlated AVG scalar subquery to a window."""
+    if not _is_single_read_only_select(query):
+        return None
+    try:
+        validate_live_query(query)
+    except (UnsafeQueryError, TypeError, ValueError):
+        return None
+    statements = [statement for statement in sqlparse.parse(query) if str(statement).strip()]
+    if len(statements) != 1:
+        return None
+    statement = statements[0]
+    significant = _significant_sql_tokens(statement.tokens)
+    if not significant or significant[0].normalized.upper() != "SELECT":
+        return None
+    if any(token.ttype and token.ttype in sql_tokens.Comment for token in statement.flatten()):
+        return None
+    if any(
+        token.ttype in sql_tokens.Keyword
+        and token.normalized.upper() in {"GROUP BY", "HAVING", "UNION", "INTERSECT", "EXCEPT", "WINDOW", "PROCEDURE", "INTO", "FOR UPDATE", "FOR SHARE"}
+        for token in statement.tokens
+    ):
+        return None
+
+    outer_source, from_index = _top_level_source(statement)
+    if outer_source is None:
+        return None
+    projection = _select_projection(statement, from_index)
+    if not projection:
+        return None
+    outer_wheres = [token for token in statement.tokens if isinstance(token, Where)]
+    if len(outer_wheres) != 1:
+        return None
+    outer_where = outer_wheres[0]
+    selects_in_where = [token for token in outer_where.flatten() if token.ttype in sql_tokens.DML and token.normalized.upper() == "SELECT"]
+    if len(selects_in_where) != 1:
+        return None
+
+    scalar_comparisons = []
+    for token in outer_where.tokens:
+        if not isinstance(token, Comparison):
+            continue
+        comparison_tokens = _significant_sql_tokens(token.tokens)
+        subqueries = [
+            item for item in comparison_tokens
+            if isinstance(item, Parenthesis)
+            and any(child.ttype in sql_tokens.DML and child.normalized.upper() == "SELECT" for child in item.flatten())
+        ]
+        if subqueries:
+            scalar_comparisons.append((token, comparison_tokens, subqueries))
+    if len(scalar_comparisons) != 1:
+        return None
+    comparison, comparison_tokens, subqueries = scalar_comparisons[0]
+    if len(comparison_tokens) != 3 or len(subqueries) != 1:
+        return None
+    outer_value = _simple_column_reference(comparison_tokens[0])
+    operator = comparison_tokens[1].value.strip()
+    if outer_value is None or operator not in {">", ">=", "<", "<=", "=", "<>", "!="}:
+        return None
+    subquery = subqueries[0]
+    inner_statements = [item for item in sqlparse.parse(subquery.value[1:-1]) if str(item).strip()]
+    if len(inner_statements) != 1:
+        return None
+    inner_statement = inner_statements[0]
+    inner_tokens = _significant_sql_tokens(inner_statement.tokens)
+    if not inner_tokens or inner_tokens[0].normalized.upper() != "SELECT":
+        return None
+    inner_source, inner_from_index = _top_level_source(inner_statement)
+    if inner_source is None:
+        return None
+    inner_projection = _significant_sql_tokens(inner_statement.tokens[1:inner_from_index])
+    if len(inner_projection) != 1 or not isinstance(inner_projection[0], Function):
+        return None
+    aggregate = inner_projection[0]
+    parameters = list(aggregate.get_parameters() or [])
+    if aggregate.get_name().casefold() != "avg" or len(parameters) != 1:
+        return None
+    avg_reference = _simple_column_reference(parameters[0])
+    if avg_reference is None:
+        return None
+    inner_wheres = [token for token in inner_statement.tokens if isinstance(token, Where)]
+    if len(inner_wheres) != 1:
+        return None
+    inner_where_tokens = _significant_sql_tokens(inner_wheres[0].tokens)
+    if len(inner_where_tokens) != 2 or not isinstance(inner_where_tokens[1], Comparison):
+        return None
+    equality_tokens = _significant_sql_tokens(inner_where_tokens[1].tokens)
+    if len(equality_tokens) != 3 or equality_tokens[1].value.strip() != "=":
+        return None
+    equality_left = _simple_column_reference(equality_tokens[0])
+    equality_right = _simple_column_reference(equality_tokens[2])
+    if equality_left is None or equality_right is None:
+        return None
+
+    outer_table = _unquote_identifier(outer_source.get_real_name())
+    inner_table = _unquote_identifier(inner_source.get_real_name())
+    outer_schema = _unquote_identifier(outer_source.get_parent_name() or "")
+    inner_schema = _unquote_identifier(inner_source.get_parent_name() or "")
+    outer_alias = _unquote_identifier(outer_source.get_alias() or outer_table)
+    inner_alias = _unquote_identifier(inner_source.get_alias() or inner_table)
+    if (outer_table.casefold(), outer_schema.casefold()) != (inner_table.casefold(), inner_schema.casefold()):
+        return None
+    if outer_alias.casefold() == inner_alias.casefold():
+        return None
+    if avg_reference[0] is None or avg_reference[0].casefold() != inner_alias.casefold():
+        return None
+    if outer_value[1].casefold() != avg_reference[1].casefold():
+        return None
+    if equality_left[0] and equality_left[0].casefold() == inner_alias.casefold():
+        inner_correlation, outer_correlation = equality_left, equality_right
+    elif equality_right[0] and equality_right[0].casefold() == inner_alias.casefold():
+        inner_correlation, outer_correlation = equality_right, equality_left
+    else:
+        return None
+    if (
+        inner_correlation[1].casefold() != outer_correlation[1].casefold()
+        or outer_correlation[0] is None
+        or outer_correlation[0].casefold() != outer_alias.casefold()
+    ):
+        return None
+
+    # Keep only simple base columns needed by the original SELECT, filters and ordering.
+    # Replacing the scalar subquery with NULL before walking prevents inner aliases
+    # from being mistaken for outer-table columns.
+    sanitized_query = query.replace(subquery.value, "NULL", 1)
+    sanitized_statement = sqlparse.parse(sanitized_query)[0]
+    required_columns = set()
+    for identifier in _walk_identifiers(sanitized_statement):
+        reference = _simple_column_reference(identifier)
+        if reference is None:
+            continue
+        qualifier, column = reference
+        if column.casefold() == outer_table.casefold() and qualifier and qualifier.casefold() == outer_schema.casefold():
+            continue
+        if qualifier and qualifier.casefold() not in {outer_alias.casefold(), outer_table.casefold()}:
+            return None
+        required_columns.add(column)
+    required_columns.update((avg_reference[1], inner_correlation[1]))
+    if not required_columns:
+        return None
+
+    original_names = _identifier_names(query)
+    cte_suffix = 1
+    cte_name = "__query_lens_avg"
+    while cte_name.casefold() in original_names:
+        cte_suffix += 1
+        cte_name = f"__query_lens_avg_{cte_suffix}"
+    avg_alias = "__query_lens_department_avg"
+    avg_suffix = 1
+    while avg_alias.casefold() in original_names or avg_alias.casefold() == cte_name.casefold():
+        avg_suffix += 1
+        avg_alias = f"__query_lens_department_avg_{avg_suffix}"
+
+    quote = lambda value: "`" + value.replace("`", "``") + "`"
+    base_ref = quote(outer_alias)
+    outer_ref = quote(outer_alias)
+    selected_columns = ", ".join(f"{base_ref}.{quote(column)}" for column in sorted(required_columns, key=str.casefold))
+    source_sql = outer_source.value.strip()
+    source_span = _token_span(statement, outer_source)
+    subquery_span = _token_span(statement, subquery)
+    if source_span is None or subquery_span is None:
+        return None
+    replacement = (
+        f"CASE WHEN {outer_ref}.{quote(inner_correlation[1])} IS NOT NULL "
+        f"THEN {outer_ref}.{quote(avg_alias)} END"
+    )
+    rewritten = query
+    for start, end, value in sorted(
+        (
+            (*source_span, f"{quote(cte_name)} {outer_ref}"),
+            (*subquery_span, replacement),
+        ),
+        reverse=True,
+    ):
+        rewritten = rewritten[:start] + value + rewritten[end:]
+    rewritten = rewritten.replace(subquery.value, replacement, 1)
+    window_cte = (
+        f"WITH {quote(cte_name)} AS (SELECT {selected_columns}, "
+        f"AVG({base_ref}.{quote(avg_reference[1])}) OVER "
+        f"(PARTITION BY {base_ref}.{quote(inner_correlation[1])}) AS {quote(avg_alias)} "
+        f"FROM {source_sql}) "
+    )
+    rewritten = window_cte + rewritten
+    if not _is_single_read_only_select(rewritten):
+        return None
+    try:
+        validate_live_query(rewritten)
+    except (UnsafeQueryError, TypeError, ValueError):
+        return None
+    return _rewrite_result(
+        kind="simplification",
+        category="alternative_formulation",
+        sql=rewritten,
+        why=(
+            "The correlated AVG is recalculated for each matching employee row. A partitioned window computes each department's "
+            "average alongside its rows, which may make the query easier to inspect and could reduce repeated work."
+        ),
+        changes="Replaced the same-table correlated AVG scalar subquery with AVG() OVER (PARTITION BY department).",
+        performance="Unknown; the candidate has not been benchmarked against the correlated query.",
+        assumptions=(
+            "The query has one base table, one correlated equality on department, and AVG over the same salary column. "
+            "The CASE expression preserves the scalar subquery's NULL result when department is NULL."
+        ),
+        limitations=(
+            "Only this simple same-table correlated AVG shape is rewritten. Other subquery predicates, joins, grouping, "
+            "and existing CTEs are left unchanged. The alternative has not been run or benchmarked. "
+            f"{_ALTERNATIVE_FORMULATION_NOTE}"
+        ),
+    )
 
 
 def _sql_token_signature(sql: str) -> tuple[str, ...]:
@@ -653,6 +1005,149 @@ def _validated_redundant_numeric_conditions(original_statement, candidate_statem
     return proven
 
 
+def _safe_redundant_predicate_rewrite(
+    query: str,
+    tree_summary: dict | None = None,
+) -> dict[str, str] | None:
+    """Remove only a literal TRUE conjunct or numeric bounds proven redundant."""
+    if not _is_single_read_only_select(query):
+        return None
+    try:
+        validate_live_query(query)
+    except (UnsafeQueryError, TypeError, ValueError):
+        return None
+    statements = [statement for statement in sqlparse.parse(query) if str(statement).strip()]
+    if len(statements) != 1 or any(
+        token.ttype and token.ttype in sql_tokens.Comment for token in statements[0].flatten()
+    ):
+        return None
+    statement = statements[0]
+    where_clauses = [token for token in statement.tokens if isinstance(token, Where)]
+    if len(where_clauses) != 1 or _where_contains_subquery(where_clauses[0]):
+        return None
+    where = where_clauses[0]
+    terms, current = [], []
+    has_semicolon = False
+    for token in where.tokens[1:]:
+        if token.value == ";":
+            has_semicolon = True
+            continue
+        if token.ttype in sql_tokens.Keyword and token.normalized.upper() == "AND":
+            terms.append("".join(current).strip())
+            current = []
+        else:
+            current.append(token.value)
+    if current:
+        terms.append("".join(current).strip())
+    if not terms:
+        return None
+
+    tautology = re.compile(r"^\(*\s*1(?:\.0*)?\s*=\s*1(?:\.0*)?\s*\)*$", re.IGNORECASE)
+    remove = {index for index, term in enumerate(terms) if tautology.fullmatch(term)}
+    parsed_bounds = [_numeric_comparison(term) for term in terms]
+    for index, weaker in enumerate(parsed_bounds):
+        if weaker is None:
+            continue
+        if any(
+            other_index != index
+            and stronger is not None
+            and _comparison_implies(stronger, weaker)
+            for other_index, stronger in enumerate(parsed_bounds)
+        ):
+            remove.add(index)
+    if not remove:
+        return None
+
+    retained = [term for index, term in enumerate(terms) if index not in remove]
+    replacement = "WHERE " + " AND ".join(retained) if retained else ""
+    if has_semicolon:
+        replacement += ";"
+    span = _token_span(statement, where)
+    if span is None:
+        return None
+    rewritten = query[:span[0]] + replacement + query[span[1]:]
+    if not _is_single_read_only_select(rewritten):
+        return None
+    try:
+        validate_live_query(rewritten)
+    except (UnsafeQueryError, TypeError, ValueError):
+        return None
+
+    numeric_proofs = []
+    for index in sorted(remove):
+        weaker = parsed_bounds[index]
+        if weaker is None:
+            continue
+        stronger = next(
+            (item for other_index, item in enumerate(parsed_bounds)
+             if other_index != index and item is not None and _comparison_implies(item, weaker)),
+            None,
+        )
+        if stronger:
+            numeric_proofs.append((terms[index], stronger))
+    if numeric_proofs:
+        why = " ".join(
+            f"The condition `{weaker}` is redundant because the retained numeric bound already implies it."
+            for weaker, _stronger in numeric_proofs
+        )
+        changes = "Removed only numeric predicates implied by stronger predicates on the same column."
+        assumptions = "The compared values are numeric literals and the predicates use the same column and direction."
+    else:
+        why = "Removed a constant TRUE condition (`1 = 1`), which cannot filter any rows."
+        changes = "Removed only the constant TRUE predicate; all other query clauses are preserved."
+        assumptions = "The removed expression compares the numeric literal 1 with itself and has no data-dependent behavior."
+    has_filter = any(
+        str(node.get("operator") or "").casefold() == "filter"
+        for node in _plan_nodes(tree_summary)
+    )
+    return _rewrite_result(
+        kind="general_optimization" if has_filter else "simplification",
+        category="alternative_formulation",
+        sql=rewritten,
+        why=why,
+        changes=changes,
+        performance="Unknown; MySQL may already simplify the predicate, and the candidate has not been benchmarked.",
+        assumptions=assumptions,
+        limitations=(
+            "This rewrite is equivalent for the exact redundant predicate described above. Its runtime effect is unknown. "
+            f"{_ALTERNATIVE_FORMULATION_NOTE}"
+        ),
+    )
+
+
+def _safe_offline_rewrite(
+    query: str,
+    warnings: list[dict],
+    tree_summary: dict | None,
+    error: dict | None = None,
+    schema_info: dict | None = None,
+) -> dict[str, str] | None:
+    if error:
+        return None
+    measured_distinct = _safe_distinct_star_rewrite(query, warnings, tree_summary)
+    if measured_distinct and measured_distinct.get("category") == "measured_optimization":
+        candidate = measured_distinct
+    else:
+        candidate = (
+            _safe_correlated_avg_window_rewrite(query)
+            or _safe_redundant_predicate_rewrite(query, tree_summary)
+            or measured_distinct
+        )
+    if not candidate:
+        return None
+    plan_tables = {str(node.get("table") or "").casefold() for node in _compact_tree(tree_summary)[0]}
+    return _validated_suggested_query(
+        candidate,
+        candidate,
+        query,
+        plan_tables,
+        warnings=warnings,
+        tree_summary=tree_summary,
+        schema_info=schema_info,
+        error=error,
+    )
+
+
 def _removed_numeric_condition_is_unverified(original_statement, candidate_statement) -> bool:
     if _where_clause_count(original_statement) != 1 or _where_clause_count(candidate_statement) != 1:
         return False
@@ -821,107 +1316,28 @@ def _validated_suggested_query(
     if not _is_single_read_only_select(sql):
         return None
     try:
-        validate_query(sql)
+        validate_live_query(sql)
     except (UnsafeQueryError, TypeError, ValueError):
-        return None
-    if _unmatched_table_references(sql, query, plan_tables):
         return None
     if _sql_token_signature(sql) == _sql_token_signature(query):
         return None
 
-    if safe_candidate is not None and _sql_token_signature(sql) == _sql_token_signature(safe_candidate["sql"]):
-        return safe_candidate
-
-    original_context = _query_reference_context(query)
-    candidate_context = _query_reference_context(sql)
-    if Counter(original_context["source_identities"]) != Counter(candidate_context["source_identities"]):
-        return None
-    if not _identifier_names(sql).issubset(_identifier_names(query)):
-        return None
-    if not _qualified_columns_are_supported(sql, query, schema_info):
-        return None
-
-    original_statements = [statement for statement in sqlparse.parse(query) if str(statement).strip()]
-    candidate_statements = [statement for statement in sqlparse.parse(sql) if str(statement).strip()]
-    if len(original_statements) != 1 or len(candidate_statements) != 1:
-        return None
-    # Projections, sources, join types and conditions, grouping, ordering, and
-    # limits must stay intact. This leaves predicate simplification available
-    # for any query shape while preventing an AI rewrite from changing the
-    # result columns or relational operations without a verifiable basis.
-    if _signature_without_where(original_statements[0]) != _signature_without_where(candidate_statements[0]):
-        return None
-    if _where_clause_count(original_statements[0]) != _where_clause_count(candidate_statements[0]):
-        return None
-    if (
-        _where_contains_subquery(original_statements[0])
-        or _where_contains_subquery(candidate_statements[0])
-    ) and _sql_token_signature(sql) != _sql_token_signature(query):
-        return None
-
-    why = proposed.get("why_it_may_help")
-    changes = proposed.get("what_changed")
-    limitations = proposed.get("limitations")
-    if not all(isinstance(value, str) and value.strip() for value in (why, changes, limitations)):
-        return None
-    redundant_numeric_conditions = _validated_redundant_numeric_conditions(
-        original_statements[0], candidate_statements[0]
-    )
-    if redundant_numeric_conditions:
-        explanations = [
-            f"The weaker condition `{weaker}` is redundant because `{stronger}` already implies it, "
-            "so removing it preserves the query's results."
-            for weaker, stronger in redundant_numeric_conditions
-        ]
-        removed_conditions = ", ".join(f"`{weaker}`" for weaker, _stronger in redundant_numeric_conditions)
-        return {
-            "kind": "simplification",
-            "sql": sql,
-            "why_it_may_help": " ".join(explanations),
-            "what_changed": f"Removed the weaker predicate {removed_conditions}; the rest of the query is unchanged.",
-            "limitations": (
-                "The result equivalence follows from the same-column numeric bounds. The suggested query has not been "
-                "executed or benchmarked; MySQL may already simplify this predicate, so a speed improvement is not guaranteed."
-            ),
-        }
-    explanation = " ".join((why, changes, limitations))
-    original_where = _where_clause_signatures(original_statements[0])
-    candidate_where = _where_clause_signatures(candidate_statements[0])
-    if original_where != candidate_where:
-        if _removed_numeric_condition_is_unverified(original_statements[0], candidate_statements[0]):
-            return None
-        if not re.search(
-            r"\b(?:equivalent|same\s+(?:rows|results)|redundant|duplicate|preserv(?:es|ing)?)\b",
-            explanation,
-            re.IGNORECASE,
+    trusted_candidates = [safe_candidate]
+    trusted_candidates.extend((
+        _safe_distinct_star_rewrite(query, warnings or [], tree_summary),
+        _safe_correlated_avg_window_rewrite(query),
+        _safe_redundant_predicate_rewrite(query, tree_summary),
+    ))
+    for candidate in trusted_candidates:
+        if (
+            isinstance(candidate, dict)
+            and isinstance(candidate.get("sql"), str)
+            and _sql_token_signature(sql) == _sql_token_signature(candidate["sql"])
         ):
-            return None
-        original_literals = _literal_signature(query)
-        candidate_literals = _literal_signature(sql)
-        if any(candidate_literals[literal] > original_literals[literal] for literal in candidate_literals):
-            return None
-    if _unsupported_metric_claim(explanation, tree_summary) or _unsupported_plan_claim(
-        explanation, warnings or [], tree_summary
-    ):
-        return None
-    limitation = (
-        "The application did not run this candidate and cannot prove full result equivalence or a speedup. "
-        "Compare complete results with the original under the same data and settings before adopting it."
-    )
-    has_filter_plan_step = any(
-        str(node.get("operator") or "").casefold() == "filter"
-        for node in _plan_nodes(tree_summary)
-    )
-    kind = "general_optimization" if has_filter_plan_step else "simplification"
-    if kind == "simplification":
-        limitation += " Treat this as a query simplification; no performance benefit is measured or guaranteed."
-    return {
-        "kind": kind,
-        "sql": sql,
-        "why_it_may_help": why.strip(),
-        "what_changed": changes.strip(),
-        "limitations": f"{limitations.strip()} {limitation}",
-    }
+            if schema_info and not _qualified_columns_are_supported(query, query, schema_info):
+                return None
+            return candidate
+    return None
 
 
 def _compact_tree(tree: dict | None) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -993,13 +1409,20 @@ def _response_json(text: str) -> dict[str, Any]:
         raise ValueError("AI fix must be a string or null")
     suggested_query = value.get("suggested_query")
     if suggested_query is not None:
-        required_rewrite_fields = {"sql", "why_it_may_help", "what_changed", "limitations"}
+        legacy_fields = {"sql", "why_it_may_help", "what_changed", "limitations"}
+        rewrite_fields = legacy_fields | {
+            "category", "performance_expectation", "semantic_assumptions",
+        }
         if (
             not isinstance(suggested_query, dict)
-            or set(suggested_query) != required_rewrite_fields
-            or any(not isinstance(suggested_query[field], str) for field in required_rewrite_fields)
+            or frozenset(suggested_query) not in {frozenset(legacy_fields), frozenset(rewrite_fields)}
+            or any(not isinstance(suggested_query[field], str) for field in suggested_query)
+            or (
+                "category" in suggested_query
+                and suggested_query["category"] not in {"measured_optimization", "alternative_formulation"}
+            )
         ):
-            raise ValueError("AI suggested_query must be null or contain SQL and all explanation fields")
+            raise ValueError("AI suggested_query must be null or contain a complete supported rewrite object")
     return {
         "summary": value["summary"],
         "finding": value.get("finding") or "",
@@ -1247,13 +1670,22 @@ def _normalise_ai_response(
     ):
         summary = _query_summary(query, tree_summary)
     proposed_rewrite = result.get("suggested_query")
-    if proposed_rewrite is None and result.get("fix"):
+    if not isinstance(proposed_rewrite, dict) and result.get("fix"):
         proposed_rewrite = {"sql": result["fix"]}
-    if proposed_rewrite and _unmatched_table_references(
-        str(proposed_rewrite.get("sql") or ""), query,
-        {str(node.get("table") or "").casefold() for node in _compact_tree(tree_summary)[0]},
+    if not isinstance(proposed_rewrite, dict):
+        proposed_rewrite = safe_candidate
+    trusted_sql = safe_candidate.get("sql") if isinstance(safe_candidate, dict) else None
+    if (
+        isinstance(proposed_rewrite, dict)
+        and proposed_rewrite.get("sql")
+        and trusted_sql
+        and _sql_token_signature(str(proposed_rewrite["sql"])) != _sql_token_signature(trusted_sql)
+        and _unmatched_table_references(
+            str(proposed_rewrite.get("sql") or ""), query,
+            {str(node.get("table") or "").casefold() for node in _compact_tree(tree_summary)[0]},
+        )
     ):
-        print("WARNING: AI hallucinated a table name, but the suggested query was omitted.")
+        print("WARNING: AI suggested an unrecognized table reference; the rewrite was omitted.")
     suggested_query = _validated_suggested_query(
         proposed_rewrite,
         safe_candidate,
@@ -1264,6 +1696,17 @@ def _normalise_ai_response(
         schema_info=schema_info,
         error=error,
     )
+    if suggested_query is None and safe_candidate is not None:
+        suggested_query = _validated_suggested_query(
+            safe_candidate,
+            safe_candidate,
+            query,
+            {str(node.get("table") or "").casefold() for node in _compact_tree(tree_summary)[0]},
+            warnings=warnings,
+            tree_summary=tree_summary,
+            schema_info=schema_info,
+            error=error,
+        )
     if proposed_rewrite and suggested_query is None:
         print("WARNING: AI suggested SQL was not a verified safe rewrite; omitting it.")
     if suggested_query and suggestions == [_NO_CHANGE]:
@@ -1381,15 +1824,19 @@ def get_ai_explanation(
         "does and MySQL's high-level work), finding (the single most relevant confirmed observation, "
         "or an empty string), suggestions (zero to three concise strings), and learning_point (one short "
         "optional sentence, or an empty string), and suggested_query (null or an object with exactly "
-        "sql, why_it_may_help, what_changed, and limitations). Evaluate this SQL generally, including "
-        "filters, projections, DISTINCT, joins, subqueries, aggregation, sorting, limits, and repeated work; "
-        "these are possibilities to assess, not a checklist of required changes. Return a complete improved "
-        "statement only when the plan and query support a meaningful, semantics-preserving change. If a "
-        "rewrite depends on uncertain equivalence, omit it. Do not remove a condition, change a join, alter "
-        "projection or grouping, or replace a subquery just because another form looks shorter. Keep all "
-        "table and column references grounded in the supplied SQL and catalog. Never put index DDL in "
-        "suggested_query; discuss index checks separately. The server independently validates the SQL and "
-        "will omit candidates outside its safety checks. For each suggestion, state what to check or change, why "
+        "sql, category, why_it_may_help, what_changed, performance_expectation, semantic_assumptions, and limitations). "
+        "category must be measured_optimization only when supplied plan evidence identifies the measured work being "
+        "removed; otherwise use alternative_formulation. performance_expectation must say measured, expected, or unknown, "
+        "and must not call a candidate measured unless comparative measurements for that candidate are supplied. "
+        "Evaluate possible equivalent forms including correlated AVG subqueries versus partitioned window functions, "
+        "subqueries versus joins, redundant DISTINCT, nested SELECTs, repeated calculations, CTEs versus derived tables, "
+        "EXISTS versus IN only when NULL semantics are preserved, redundant expressions, and safe filter/projection changes. "
+        "These are candidates to assess, not transformations to force. Return complete executable SQL only when the result "
+        "equivalence is established by the query and supplied evidence. If equivalence is uncertain, omit it. Do not remove "
+        "conditions, change join types, grouping, projection, or NULL behavior without proving equivalence. Keep every base "
+        "table and input column grounded in the supplied SQL and catalog. Never put index DDL in suggested_query; discuss "
+        "index checks separately. The server independently validates SQL and only accepts deterministic, proven rewrite "
+        "candidates. For each suggestion, state what to check or change, why "
         "it may help, and when it is worth doing. If no optimization is justified, use exactly this "
         f"suggestion: {_NO_CHANGE!r}.\n"
         "Warning categories must agree with the supplied classification: observations describe normal plan "

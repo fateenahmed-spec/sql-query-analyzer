@@ -317,6 +317,40 @@ def _csv_upload_name(filename: str, table_name: str | None = None) -> str:
     return f"up_{sanitized[:61]}"
 
 
+def _detect_csv_delimiter(csv_text: str) -> str:
+    """Choose a supported delimiter using the complete header and a sample of rows."""
+    sample = csv_text[:8192]
+    delimiters = ",;\t|"
+    try:
+        sniffed = csv.Sniffer().sniff(sample, delimiters=delimiters)
+    except csv.Error:
+        sniffed = None
+
+    # Prefer a sniffed delimiter only when it produces a consistent multi-column
+    # shape. This avoids accepting a misleading guess for short or sparse files.
+    candidates = [sniffed.delimiter] if sniffed else []
+    candidates.extend(delimiter for delimiter in delimiters if delimiter not in candidates)
+    best_delimiter = ","
+    best_score = (-1, -1, -1)
+    for delimiter in candidates:
+        try:
+            rows = list(csv.reader(io.StringIO(sample, newline=""), delimiter=delimiter, strict=True))
+        except csv.Error:
+            continue
+        widths = [len(row) for row in rows if row]
+        if not widths:
+            continue
+        width = widths[0]
+        consistent = sum(row_width == width for row_width in widths)
+        # Favor consistent multi-column parses, then wider headers, then sniff's choice.
+        score = (int(width > 1 and consistent == len(widths)), width, consistent)
+        if score > best_score:
+            best_score = score
+            best_delimiter = delimiter
+
+    return best_delimiter
+
+
 def _read_queries():
     with _QUERIES_FILE.open("r", encoding="utf-8") as handle:
         return json.load(handle)
@@ -404,13 +438,8 @@ async def upload_csv_file(http_request: Request, file: UploadFile = File(...), t
     if not csv_text.strip():
         raise HTTPException(status_code=400, detail="The CSV file must include a header row.")
 
-    sample = csv_text[:8192]
-    try:
-        dialect = csv.Sniffer().sniff(sample, delimiters=",;\t|")
-    except csv.Error:
-        dialect = csv.excel
-
-    reader = csv.reader(io.StringIO(csv_text, newline=""), dialect=dialect, strict=True)
+    delimiter = _detect_csv_delimiter(csv_text)
+    reader = csv.reader(io.StringIO(csv_text, newline=""), delimiter=delimiter, strict=True)
     try:
         headers = next(reader, None)
         if not headers:
@@ -654,10 +683,10 @@ def run_live(request: LiveQueryRequest, http_request: Request):
         return JSONResponse(status_code=503, content={"error": "db_unavailable"})
 
     tree = parse_explain_analyze(result["plan_text"])
-    tree["_flow_query"] = request.query
+    tree["_flow_query"] = result.get("query") or request.query
     flow_conn = get_connection()
     try:
-        row_flow = build_row_flow(tree, flow_conn, result["source_samples"])
+        row_flow = build_row_flow(tree, flow_conn, result["source_samples"], result["rows"])
     finally:
         flow_conn.close()
         tree.pop("_flow_query", None)

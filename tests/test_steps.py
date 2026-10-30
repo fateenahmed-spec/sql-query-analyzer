@@ -55,3 +55,16 @@ def test_action_mapping_covers_plan_operator_families():
     other_plan = "-> Hash\n    -> Table scan on t (actual time=0.1..0.2 rows=2 loops=1)"
     other_steps = build_animation_steps(parse_explain_analyze(other_plan))
     assert next(step for step in other_steps if step["node_id"] == "node_1")["action"] == "other"
+
+
+def test_physical_window_and_materialization_operators_are_distinguished():
+    tree = parse_explain_analyze(
+        "-> Window aggregate with buffering: row_number() over (partition by grp) "
+        "(actual time=0.1..0.2 rows=2 loops=1)\n"
+        "    -> Materialize CTE sample (actual time=0.1..0.1 rows=2 loops=1)"
+    )
+    steps = build_animation_steps(tree)
+
+    assert steps[0]["layer"] == "physical execution-plan operator"
+    assert steps[0]["operator_family"] == "materialize"
+    assert steps[1]["operator_family"] == "window"

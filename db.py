@@ -19,7 +19,7 @@ from sqlparse.sql import Identifier, IdentifierList, Parenthesis
 from dotenv import load_dotenv
 
 from core.parser import parse_explain_analyze
-from security import resolve_uploaded_table_references, validate_live_query
+from security import query_source_references, resolve_uploaded_table_references, validate_live_query
 
 load_dotenv(Path(__file__).resolve().with_name(".env"))
 
@@ -731,28 +731,16 @@ def _source_table_names(plan_text: str, cursor, query_text: str = "") -> list[tu
     cursor.execute("SELECT DATABASE()")
     default_schema_row = cursor.fetchone()
     default_schema = str(default_schema_row[0]) if default_schema_row else "sql_analyzer_test"
-    aliases = _query_table_aliases(query_text)
-    derived_references = _query_derived_references(query_text)
     candidates = []
-    seen_references = set()
-    for match in _TABLE_ACCESS.finditer(plan_text):
-        plan_schema = match.group(1).strip("`") if match.group(1) else None
-        reference = match.group(2)
-        source = aliases.get(reference.casefold())
-        if source is None and reference.casefold() in derived_references:
-            continue
-        reference_identity = (reference.casefold(), source[2].casefold() if source else None)
-        if reference_identity in seen_references:
-            continue
-        seen_references.add(reference_identity)
-        if source:
-            schema_hint, table_name, alias = source
-            schemas = [schema_hint] if schema_hint else [default_schema, UPLOAD_SCHEMA]
-        else:
-            table_name = reference
-            alias = None
-            schemas = [plan_schema] if plan_schema else [default_schema, UPLOAD_SCHEMA]
+    seen_sources = set()
+    for source in query_source_references(query_text):
+        schema_hint = source["schema"]
+        table_name = str(source["table"] or "")
+        alias = str(source["alias"] or table_name)
+        schemas = [schema_hint] if schema_hint else [default_schema, UPLOAD_SCHEMA]
         for schema in schemas:
+            if not schema:
+                continue
             cursor.execute(
                 "SELECT TABLE_NAME FROM information_schema.TABLES "
                 "WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s LIMIT 1",
@@ -761,7 +749,10 @@ def _source_table_names(plan_text: str, cursor, query_text: str = "") -> list[tu
             table_row = cursor.fetchone()
             if table_row:
                 resolved_table = str(table_row[0])
-                candidates.append((schema, resolved_table, alias))
+                identity = (str(schema).casefold(), resolved_table.casefold(), alias.casefold())
+                if identity not in seen_sources:
+                    candidates.append((str(schema), resolved_table, alias))
+                    seen_sources.add(identity)
                 break
     return candidates
 
@@ -860,6 +851,7 @@ def run_query_with_data(sql: str) -> dict:
         sample_conn.close()
 
     return {
+        "query": normalized_sql,
         "plan_text": plan_text,
         "rows": rows,
         "columns": columns,

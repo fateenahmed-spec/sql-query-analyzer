@@ -2,6 +2,7 @@ import pytest
 
 from security import (
     UnsafeQueryError,
+    query_source_references,
     resolve_uploaded_table_references,
     validate_live_query,
     validate_query,
@@ -150,6 +151,22 @@ def test_nested_query_sources_are_resolved():
 
     assert resolved.count("`analyzer_uploads`.`up_employees`") == 1
     assert "JOIN `analyzer_uploads`.`up_orders` o" in resolved
+
+
+def test_query_source_references_resolve_aliases_without_treating_ctes_as_tables():
+    query = (
+        "WITH base_rows AS (SELECT * FROM employees e), "
+        "recent AS (SELECT * FROM base_rows r JOIN orders o ON o.employee_id = r.id) "
+        "SELECT * FROM (SELECT * FROM recent) d JOIN departments p ON p.id = d.department_id"
+    )
+
+    refs = query_source_references(query)
+
+    assert refs == [
+        {"schema": None, "table": "employees", "alias": "e"},
+        {"schema": None, "table": "orders", "alias": "o"},
+        {"schema": None, "table": "departments", "alias": "p"},
+    ]
 
 
 def test_uploaded_name_resolution_keeps_read_only_validation():

@@ -30,9 +30,17 @@ def build_fixture_flows() -> dict[str, list[dict]]:
 
 def verify_step_chaining(flows: dict[str, list[dict]]) -> None:
     for fixture_id, steps in flows.items():
-        for previous, current in zip(steps, steps[1:]):
-            assert current["input_rids"] == previous["output_rids"], (
-                f"{fixture_id}: {current['node_id']} input did not match prior output"
+        by_id = {step["node_id"]: step for step in steps}
+        for child in steps:
+            if child["parent_id"] is None:
+                continue
+            parent = by_id[child["parent_id"]]
+            branch = next(
+                item for item in parent["input_branches"]
+                if item["node_id"] == child["node_id"]
+            )
+            assert branch["output_rids"] == child["output_rids"], (
+                f"{fixture_id}: {child['node_id']} output was not kept on its parent branch"
             )
 
 
@@ -64,8 +72,9 @@ def verify_zero_rows_skips_join(flow: list[dict]) -> None:
     assert filter_step["output_rids"] == []
     assert all(passed is False for passed in filter_step["row_results"].values())
     join_step = next(step for step in flow if step["op"] == "join")
-    assert join_step["never_executed"] is True
-    assert join_step["note"] == "Never executed: upstream returned 0 rows."
+    assert join_step["output_rids"] == []
+    assert join_step["exactness"] == "exact_for_sample"
+    assert any(step["never_executed"] for step in flow if step["parent_id"] == join_step["node_id"])
 
 
 def main() -> int:

@@ -123,42 +123,15 @@
           <div id="source-badge" class="source-badge" aria-live="polite"></div>
           <div id="graph-message" class="graph-message" aria-live="polite" hidden></div>
         </div>
-        <details id="warnings-panel" class="warnings-panel" open>
-          <summary><span>Plan warnings</span><span id="warning-count" class="count-pill">0</span></summary>
-          <div id="warnings-list" class="warnings-list"><p class="muted">Warnings will appear here.</p></div>
-        </details>
         <aside id="node-detail-drawer" class="detail-drawer" aria-labelledby="drawer-title" hidden>
           <div class="drawer-heading"><div><p class="eyebrow">NODE INSPECTOR</p><h2 id="drawer-title">Node details</h2></div><button id="drawer-close" class="icon-button" type="button" aria-label="Close node details">×</button></div>
           <div class="node-inspector-content">
-            <p class="node-inspector-operator"><span>Operator</span><strong id="detail-operator">—</strong></p>
+            <p class="node-inspector-operator"><span>Operation</span><strong id="detail-operator">—</strong></p>
             <section class="node-inspector-section">
-              <h3>What MySQL did</h3>
-              <p id="detail-explanation"></p>
-              <p id="detail-plan-details" class="node-inspector-plan-details" hidden><span>Plan detail: </span><code id="detail-details"></code></p>
+              <h3>Condition / Operation Details</h3>
+              <p id="detail-operation-details"></p>
             </section>
-            <section class="node-inspector-section">
-              <h3>Rows processed</h3>
-              <p id="detail-rows-summary" class="node-inspector-note"></p>
-              <dl id="detail-rows-metrics" class="node-inspector-metrics"></dl>
-            </section>
-            <section class="node-inspector-section">
-              <h3>Time taken</h3>
-              <p id="detail-time-summary" class="node-inspector-note"></p>
-              <dl id="detail-time-metrics" class="node-inspector-metrics"></dl>
-            </section>
-            <section class="node-inspector-section">
-              <h3>MySQL's estimate</h3>
-              <p id="detail-estimate-summary" class="node-inspector-note"></p>
-              <dl id="detail-estimate-metrics" class="node-inspector-metrics"></dl>
-            </section>
-            <section class="node-inspector-section">
-              <h3>Execution status</h3>
-              <p id="detail-status"></p>
-            </section>
-            <section class="node-inspector-section detail-warning-block">
-              <h3>Warnings</h3>
-              <ul id="detail-warnings"><li class="muted">No warnings attached to this operation.</li></ul>
-            </section>
+            <dl id="detail-node-metrics" class="node-inspector-metrics"></dl>
           </div>
         </aside>
       </section>

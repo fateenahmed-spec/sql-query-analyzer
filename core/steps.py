@@ -17,20 +17,35 @@ _SCAN_OPERATORS = {
 }
 
 
-def _action(operator: str) -> str:
-    if operator in _SCAN_OPERATORS:
+def operator_family(operator: str) -> str:
+    """Classify the physical plan operator, independently of SQL logic stages."""
+    normalized = str(operator or "").casefold()
+    if operator in _SCAN_OPERATORS or normalized == "rows fetched before execution":
         return "scan"
-    if operator == "Filter":
+    if normalized == "filter":
         return "filter"
-    if "join" in operator.casefold():
+    if "join" in normalized:
         return "join"
-    if operator.startswith("Aggregate") or operator == "Group aggregate":
+    if normalized.startswith("aggregate") or normalized.startswith("group aggregate") or normalized.startswith("groupaggregate"):
         return "aggregate"
-    if operator == "Sort":
+    if normalized.startswith("window aggregate") or normalized == "window":
+        return "window"
+    if normalized == "sort":
         return "sort"
-    if operator == "Limit":
+    if normalized == "limit":
         return "limit"
+    if normalized.startswith("materialize"):
+        return "materialize"
+    if normalized == "hash":
+        return "hash"
+    if normalized == "zero rows":
+        return "empty"
     return "other"
+
+
+def _action(operator: str) -> str:
+    family = operator_family(operator)
+    return family if family in {"scan", "filter", "join", "aggregate", "window", "sort", "limit", "materialize", "empty"} else "other"
 
 
 def build_animation_steps(tree: dict[str, Any]) -> list[dict[str, Any]]:
@@ -46,6 +61,9 @@ def build_animation_steps(tree: dict[str, Any]) -> list[dict[str, Any]]:
                 "node_id": node["id"],
                 "parent_id": parent_id,
                 "action": _action(str(node.get("operator") or "")),
+                "layer": "physical execution-plan operator",
+                "operator_family": operator_family(str(node.get("operator") or "")),
+                "operator": str(node.get("operator") or ""),
                 "rows_out": node.get("rows_total"),
                 "loops": node.get("loops"),
                 "never_executed": bool(node.get("never_executed")),
