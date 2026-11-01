@@ -844,6 +844,7 @@ def run_query_with_data(sql: str) -> dict:
                     "table": table_name,
                     "alias": alias,
                     "columns": table_columns,
+                    "columns_complete": True,
                     "indexes": list(indexes.values()),
                     "index_catalog_available": index_catalog_available,
                 })

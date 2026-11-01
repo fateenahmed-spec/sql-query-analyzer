@@ -65,8 +65,9 @@ def test_analyzer_is_directly_loadable_with_an_empty_sql_editor():
     parser.feed(response.text)
     assert parser.textarea_content == []
     assert 'id="btn-run-query"' in response.text
-    assert 'id="warnings-list"' in response.text
+    assert 'id="cy"' in response.text
     assert 'id="ai-panel"' in response.text
+    assert 'id="warnings-list"' not in response.text
     assert 'src="app.js"' in response.text
 
 

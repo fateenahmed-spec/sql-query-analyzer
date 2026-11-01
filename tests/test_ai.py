@@ -63,6 +63,11 @@ def _response(mocker, text=GOOD_RESPONSE_TEXT, status=200, *, candidates=True, f
     return response
 
 
+def _submitted_ai_context(post):
+    prompt = post.call_args.kwargs["json"]["contents"][0]["parts"][0]["text"]
+    return json.loads(prompt.split("DATA:\n", 1)[1])
+
+
 def _run_and_check_secret(caplog, capsys):
     result = ai.get_ai_explanation(QUERY, WARNINGS, tree_summary=TREE)
     response_body = json.dumps(result, ensure_ascii=False)
@@ -99,8 +104,10 @@ def test_rest_success_sends_key_only_in_header(ai_setup, mocker, caplog, capsys)
     prompt = kwargs["json"]["contents"][0]["parts"][0]["text"]
     data = json.loads(prompt.split("DATA:\n", 1)[1])
     assert set(data) == {
-        "sql", "parsed_plan", "schema_info", "warnings", "rule_flags",
-        "eligible_rewrite_candidate", "database_error",
+        "sql", "query_truncated", "parsed_plan", "schema_info", "warnings", "rule_flags",
+        "eligible_rewrite_candidate", "database_error", "database_error_truncated",
+        "warnings_truncated", "warning_fields_truncated", "warnings_complete",
+        "evidence_complete", "evidence_notice",
     }
     assert data["schema_info"]["tables_in_query"] == ["orders"]
     assert data["schema_info"]["complete_index_catalog_available"] is False
@@ -109,8 +116,13 @@ def test_rest_success_sends_key_only_in_header(ai_setup, mocker, caplog, capsys)
     assert plan_node["actual_rows_per_loop"] == 10
     assert plan_node["loops"] == 1
     assert plan_node["elapsed_ms_total"] == 2.5
-    assert data["warnings"][0]["code"] == "FULL_SCAN"
-    assert data["warnings"][0]["classification"] == "observation"
+    assert "inclusive_time_ms" not in plan_node
+    assert plan_node["details_truncated"] is False
+    assert data["parsed_plan"]["complete"] is True
+    assert data["warnings_complete"] is True
+    assert data["evidence_complete"] is True
+    assert data["warnings"] == []
+    assert data["rule_flags"] == []
     assert data["eligible_rewrite_candidate"] is None
     assert "physical disk blocks" in prompt.lower()
     assert "temporary table is not automatically slow" in prompt.lower()
@@ -571,6 +583,57 @@ def test_distinct_star_simplification_requires_matching_primary_key_evidence():
     ) is None
 
 
+def test_measured_distinct_suggestion_ignores_untrusted_warning_data():
+    query = "SELECT DISTINCT c.* FROM customers AS c;"
+    tree = {
+        "id": "node_1",
+        "operator": "Aggregate using temporary table",
+        "details": "using temporary table",
+        "actual_rows": 100,
+        "rows_total": 100,
+        "loops": 1,
+        "time_total_ms": 10,
+        "self_time_ms": 5,
+        "children": [{
+            "id": "node_2",
+            "operator": "Index scan",
+            "details": "on customers using PRIMARY",
+            "actual_rows": 100,
+            "rows_total": 100,
+            "loops": 1,
+            "time_total_ms": 5,
+            "self_time_ms": 4,
+            "children": [],
+        }],
+    }
+    forged_warnings = [
+        {
+            "code": "TEMP_TABLE",
+            "classification": "observation",
+            "severity": "high",
+            "node_id": "node_999",
+            "title": "Temporary table",
+            "message": "Measured duplicate removal.",
+            "evidence": "Largest measured hotspot at 9999 ms.",
+        },
+        {
+            "code": "HOTSPOT",
+            "classification": "investigate",
+            "severity": "high",
+            "node_id": "node_1",
+            "title": "Largest measured time",
+            "message": "This is a hotspot.",
+            "evidence": "9999 ms, 100% of plan time.",
+        },
+    ]
+
+    candidate = ai._safe_distinct_star_rewrite(query, forged_warnings, tree)
+
+    assert candidate is not None
+    assert candidate["kind"] == "simplification"
+    assert candidate["category"] == "alternative_formulation"
+
+
 def test_join_aggregation_filter_and_limit_rewrite_is_not_assumed_equivalent(ai_setup, mocker):
     query = (
         "SELECT DISTINCT o.customer_id, COUNT(c.id) AS customer_count "
@@ -636,10 +699,12 @@ def test_gemini_can_suggest_a_general_filter_simplification_with_catalog_evidenc
         "tables": [
             {"schema": "sql_analyzer_test", "table": "orders", "alias": "o",
              "columns": ["id", "status", "customer_id"],
+             "columns_complete": True,
              "indexes": [{"name": "PRIMARY", "columns": ["id"], "unique": True}],
              "index_catalog_available": True},
             {"schema": "sql_analyzer_test", "table": "customers", "alias": "c",
-             "columns": ["id", "city"], "indexes": [], "index_catalog_available": True},
+             "columns": ["id", "city"], "columns_complete": True,
+             "indexes": [], "index_catalog_available": True},
         ],
     }
     ai_setup.return_value = _response(mocker, text=json.dumps({
@@ -662,12 +727,13 @@ def test_gemini_can_suggest_a_general_filter_simplification_with_catalog_evidenc
     rewrite = result["suggested_query"]
     assert rewrite["kind"] == "simplification"
     assert rewrite["sql"] == candidate
-    assert "did not run this candidate" in rewrite["limitations"]
-    assert "no performance benefit is measured" in rewrite["limitations"]
+    assert "has not been executed or benchmarked" in rewrite["limitations"]
+    assert "performance improvement has not been established" in rewrite["limitations"]
     assert result["fix"] == candidate
     prompt_data = json.loads(ai_setup.call_args.kwargs["json"]["contents"][0]["parts"][0]["text"].split("DATA:\n", 1)[1])
     assert prompt_data["schema_info"]["dialect"] == "MySQL"
     assert prompt_data["schema_info"]["tables"][0]["columns"] == ["id", "status", "customer_id"]
+    assert prompt_data["schema_info"]["tables"][0]["columns_complete"] is True
     assert prompt_data["schema_info"]["tables"][0]["indexes"][0]["name"] == "PRIMARY"
     assert prompt_data["schema_info"]["complete_index_catalog_available"] is True
 
@@ -692,7 +758,8 @@ def test_predicate_candidate_with_a_filter_plan_is_labeled_as_improvement():
     )
 
     assert rewrite["kind"] == "general_optimization"
-    assert "cannot prove full result equivalence or a speedup" in rewrite["limitations"]
+    assert "equivalent for the exact redundant predicate" in rewrite["limitations"]
+    assert "runtime effect is unknown" in rewrite["limitations"]
 
 
 def test_redundant_numeric_bound_rewrite_states_result_equivalence_without_contradiction(ai_setup, mocker):
@@ -791,6 +858,67 @@ def test_schema_catalog_rejects_qualified_column_not_present_for_table():
     )
 
 
+def test_schema_catalog_requires_exact_schema_for_qualified_columns():
+    schema_info = {"tables": [{
+        "schema": "sales",
+        "table": "orders",
+        "columns": ["id", "sale_only"],
+        "columns_complete": True,
+    }]}
+    query = "SELECT sales.orders.id FROM sales.orders"
+
+    assert ai._qualified_columns_are_supported(
+        "SELECT sales.orders.id FROM sales.orders", query, schema_info
+    )
+    assert not ai._qualified_columns_are_supported(
+        "SELECT evil.orders.id FROM sales.orders", query, schema_info
+    )
+
+    candidate = "SELECT evil.orders.id FROM sales.orders"
+    trusted = {"sql": candidate, "kind": "simplification", "category": "alternative_formulation"}
+    assert ai._validated_suggested_query(
+        {"sql": candidate}, trusted,
+        "SELECT sales.orders.id FROM sales.orders WHERE 1 = 1",
+        {"orders"}, schema_info=schema_info,
+    ) is None
+
+
+def test_schema_catalog_rejects_unknown_unqualified_column():
+    query = "SELECT sales.orders.id FROM sales.orders"
+    schema_info = {"tables": [{
+        "schema": "sales", "table": "orders", "columns": ["id"],
+        "columns_complete": True,
+    }]}
+
+    assert not ai._qualified_columns_are_supported(
+        "SELECT mystery FROM sales.orders", query, schema_info
+    )
+
+
+def test_schema_catalog_handles_duplicate_table_names_by_schema():
+    schema_info = {"tables": [
+        {
+            "schema": "sales", "table": "orders", "columns": ["id", "sale_only"],
+            "columns_complete": True,
+        },
+        {
+            "schema": "archive", "table": "orders", "columns": ["id", "archive_only"],
+            "columns_complete": True,
+        },
+    ]}
+    query = "SELECT sales.orders.id FROM sales.orders"
+
+    assert ai._qualified_columns_are_supported(
+        "SELECT sales.orders.sale_only FROM sales.orders", query, schema_info
+    )
+    assert not ai._qualified_columns_are_supported(
+        "SELECT archive.orders.archive_only FROM sales.orders", query, schema_info
+    )
+    assert not ai._qualified_columns_are_supported(
+        "SELECT id FROM orders", "SELECT id FROM orders", schema_info
+    )
+
+
 def test_offline_fallback_uses_only_deterministic_safe_rewrite():
     query, tree, warnings = _distinct_temp_table_plan()
     result = ai.get_rule_based_explanation(query, warnings, tree_summary=tree)
@@ -811,3 +939,643 @@ def test_offline_fallback_uses_only_deterministic_safe_rewrite():
         query, warnings, tree_summary=tree, error={"code": "SQL_ERROR", "message": "failed"}
     )
     assert result_for_error["suggested_query"] is None
+
+
+def _node_scoped_metric_tree():
+    return {
+        "id": "root",
+        "operator": "Sort",
+        "details": "orders.salary DESC",
+        "estimated_rows": 90,
+        "actual_rows": 30,
+        "rows_total": 60,
+        "loops": 2,
+        "time_first_ms": 1,
+        "time_last_ms": 5,
+        "time_total_ms": 10,
+        "self_time_ms": 4,
+        "self_time_pct": 40,
+        "children": [{
+            "id": "child",
+            "operator": "Table scan",
+            "details": "on orders",
+            "estimated_rows": 100,
+            "actual_rows": 10,
+            "rows_total": 60,
+            "loops": 6,
+            "time_first_ms": 0.5,
+            "time_last_ms": 5,
+            "time_total_ms": 30,
+            "self_time_ms": 10,
+            "self_time_pct": 50,
+            "children": [],
+        }],
+    }
+
+
+def test_metric_validation_rejects_cross_node_attribution():
+    tree = _node_scoped_metric_tree()
+
+    assert ai._unsupported_metric_claim("The Sort returned 10 rows.", tree)
+    assert not ai._unsupported_metric_claim("The Table scan returned 10 rows per loop.", tree)
+
+
+def _multi_node_metric_claim_tree():
+    return {
+        "id": "filter",
+        "operator": "Filter",
+        "details": "(orders.status = 'open')",
+        "estimated_rows": 20,
+        "actual_rows": 5,
+        "rows_total": 15,
+        "loops": 3,
+        "children": [{
+            "id": "scan",
+            "operator": "Table scan",
+            "details": "on orders",
+            "estimated_rows": 100,
+            "actual_rows": 10,
+            "rows_total": 60,
+            "loops": 6,
+            "children": [],
+        }],
+    }
+
+
+def test_metric_validation_supports_multiple_node_claims_in_one_sentence():
+    tree = _multi_node_metric_claim_tree()
+
+    assert not ai._unsupported_metric_claim(
+        "Table Scan returned 10 rows per loop and Filter returned 5 rows per loop.", tree
+    )
+    assert not ai._unsupported_metric_claim(
+        "plan_node_2 returned 10 rows per loop and plan_node_1 returned 5 rows per loop.", tree
+    )
+
+
+def test_metric_validation_supports_per_loop_rows_loops_and_total_in_one_sentence():
+    tree = _multi_node_metric_claim_tree()
+
+    assert not ai._unsupported_metric_claim(
+        "Filter produced 5 rows per loop over 3 loops, totaling 15 rows.", tree
+    )
+
+
+def test_metric_validation_rejects_wrong_node_references_and_values():
+    tree = _multi_node_metric_claim_tree()
+
+    assert ai._unsupported_metric_claim("Sort returned 5 rows per loop.", tree)
+    assert ai._unsupported_metric_claim("plan_node_99 returned 5 rows per loop.", tree)
+    assert ai._unsupported_metric_claim("Filter returned 10 rows per loop.", tree)
+    assert ai._unsupported_metric_claim("Table Scan returned 5 rows per loop.", tree)
+
+
+def test_metric_validation_rejects_a_matching_operator_with_the_wrong_table():
+    tree = {
+        "id": "root",
+        "operator": "Sort",
+        "details": "orders.salary DESC",
+        "actual_rows": 90,
+        "children": [{
+            "id": "child",
+            "operator": "Table scan",
+            "details": "on customers",
+            "actual_rows": 10,
+            "loops": 1,
+            "children": [],
+        }],
+    }
+
+    assert ai._unsupported_metric_claim("Table Scan on orders returned 10 rows per loop.", tree)
+
+
+def test_metric_validation_keeps_estimated_and_actual_rows_separate():
+    tree = _node_scoped_metric_tree()
+
+    assert not ai._unsupported_metric_claim("The Sort estimated 90 rows.", tree)
+    assert ai._unsupported_metric_claim("The Sort estimated 30 rows.", tree)
+    assert not ai._unsupported_metric_claim("The Sort produced 60 actual rows.", tree)
+    assert ai._unsupported_metric_claim("The Sort produced 90 actual rows.", tree)
+
+
+def test_metric_validation_keeps_actual_rows_per_loop_separate_from_total():
+    tree = _node_scoped_metric_tree()
+
+    assert not ai._unsupported_metric_claim("The Sort returned 30 rows per loop.", tree)
+    assert ai._unsupported_metric_claim("The Sort returned 60 rows per loop.", tree)
+    assert not ai._unsupported_metric_claim("The Sort returned 60 rows across loops.", tree)
+    assert ai._unsupported_metric_claim("The Sort returned 30 rows across loops.", tree)
+
+
+def test_metric_validation_keeps_inclusive_and_self_time_separate():
+    tree = _node_scoped_metric_tree()
+
+    assert not ai._unsupported_metric_claim("The Sort self time was 4 ms.", tree)
+    assert ai._unsupported_metric_claim("The Sort self time was 10 ms.", tree)
+    assert not ai._unsupported_metric_claim("The Sort execution time was 10 ms.", tree)
+    assert ai._unsupported_metric_claim("The Sort execution time was 4 ms.", tree)
+    assert not ai._unsupported_metric_claim("The Sort inclusive time was 10 ms.", tree)
+    assert ai._unsupported_metric_claim("The Sort inclusive time was 4 ms.", tree)
+    assert not ai._unsupported_metric_claim("The Sort inclusive execution time was 10 ms.", tree)
+    assert ai._unsupported_metric_claim("The Sort inclusive execution time was 4 ms.", tree)
+
+
+def test_metric_validation_keeps_first_and_last_row_times_separate():
+    tree = _node_scoped_metric_tree()
+
+    assert not ai._unsupported_metric_claim("The Sort first-row time was 1 ms.", tree)
+    assert ai._unsupported_metric_claim("The Sort first-row time was 5 ms.", tree)
+    assert not ai._unsupported_metric_claim("The Sort last-row time per loop was 5 ms.", tree)
+    assert ai._unsupported_metric_claim("The Sort last-row time per loop was 1 ms.", tree)
+
+
+def test_metric_validation_accepts_normal_rounding_and_grouped_numbers():
+    tree = _node_scoped_metric_tree()
+    tree["time_last_ms"] = 5.04
+    tree["actual_rows"] = 1000
+    tree["rows_total"] = 1000
+    tree["loops"] = 1
+
+    assert not ai._unsupported_metric_claim("The Sort last-row time per loop was 5.0 ms.", tree)
+    assert ai._unsupported_metric_claim("The Sort last-row time per loop was 5.1 ms.", tree)
+    assert not ai._unsupported_metric_claim("The Sort returned 1,000 rows across loops.", tree)
+
+
+def test_metric_validation_checks_labelled_values_without_units_and_rejects_other_metrics():
+    tree = _node_scoped_metric_tree()
+
+    assert not ai._unsupported_metric_claim("The Sort estimated rows: 90.", tree)
+    assert ai._unsupported_metric_claim("The Sort actual rows count: 10.", tree)
+    assert ai._unsupported_metric_claim("The Sort estimated cost: 90.", tree)
+    assert ai._unsupported_metric_claim("The Sort returned -30 rows.", tree)
+
+
+def test_warning_classification_must_match_rule_evidence(ai_setup, mocker):
+    warning = {
+        "code": "ESTIMATE_MISMATCH",
+        "classification": "observation",
+        "severity": "high",
+        "message": "The estimate differs from actual rows.",
+        "evidence": "The estimate was much lower.",
+        "suggestion": "Investigate if the query is slow.",
+    }
+    ai_setup.return_value = _response(mocker, text=json.dumps({
+        "summary": "This query reads orders.",
+        "finding": "The row estimate is inaccurate and should be investigated.",
+        "suggestions": [],
+        "learning_point": "Estimated rows are predictions.",
+    }))
+
+    result = ai.get_ai_explanation(QUERY, [warning], tree_summary=TREE)
+
+    assert result["finding"] == "The available plan does not show a clear performance concern."
+
+
+def _large_scan_warning_tree():
+    return parse_explain_analyze(
+        "-> Table scan on orders (cost=100 rows=5000) "
+        "(actual time=0.1..30 rows=5000 loops=1)"
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "forged_value"),
+    [
+        ("node_id", "node_999"),
+        ("evidence", "Table scan on orders · 999999 rows read · 1 loop · self time 9999 ms."),
+        ("severity", "high"),
+        ("classification", "investigate"),
+    ],
+    ids=["mismatched-node-id", "unsupported-evidence", "incorrect-severity", "incorrect-classification"],
+)
+def test_ai_warning_context_is_derived_from_plan_not_caller_objects(
+    ai_setup, mocker, field, forged_value
+):
+    tree = _large_scan_warning_tree()
+    generated = analyze_rules(tree)
+    assert generated and generated[0]["code"] == "FULL_SCAN"
+    forged = dict(generated[0])
+    forged[field] = forged_value
+    ai_setup.return_value = _response(mocker)
+
+    ai.get_ai_explanation(QUERY, [forged], tree_summary=tree)
+
+    prompt = ai_setup.call_args.kwargs["json"]["contents"][0]["parts"][0]["text"]
+    data = _submitted_ai_context(ai_setup)
+    assert len(data["warnings"]) == 1
+    assert data["warnings"][0]["code"] == generated[0]["code"]
+    assert data["warnings"][0]["classification"] == generated[0]["classification"]
+    assert data["warnings"][0]["severity"] == generated[0]["severity"]
+    assert data["warnings"][0]["evidence"] == generated[0]["evidence"]
+    assert str(forged_value) not in json.dumps(data["warnings"], ensure_ascii=False)
+
+
+def test_live_ai_route_regenerates_warnings_instead_of_using_request_warnings(monkeypatch, mocker):
+    import main
+
+    tree = {"id": "node_1", "operator": "Table scan", "details": "on orders", "children": []}
+    generated = [{
+        "code": "FULL_SCAN",
+        "classification": "observation",
+        "severity": "low",
+        "node_id": "node_1",
+        "title": "Trusted server warning",
+        "message": "Built from the plan tree.",
+        "evidence": "Table scan on orders · 5000 rows read.",
+        "suggestion": None,
+    }]
+    caller_warning = {**generated[0], "node_id": "node_999", "evidence": "unsupported evidence"}
+    monkeypatch.setattr(main, "_public_rate_limit", lambda *_args: None)
+    monkeypatch.setattr(main, "analyze_rules", lambda _actual_tree: generated)
+    ai_call = mocker.patch(
+        "main.get_ai_explanation",
+        return_value={"ai_status": "success", "reason": "", "summary": "ok"},
+    )
+
+    main.get_live_ai_insights(
+        main.AIRequest(query=QUERY, warnings=[caller_warning], tree=tree),
+        mocker.Mock(),
+    )
+
+    assert ai_call.call_args.args[1] == generated
+    assert ai_call.call_args.kwargs["tree_summary"] == tree
+
+
+def test_warning_severity_and_recommendation_must_match_evidence(ai_setup, mocker):
+    warning = {
+        "code": "HOTSPOT",
+        "classification": "investigate",
+        "severity": "info",
+        "message": "A step used the largest measured share of time.",
+        "evidence": "Sort self time was a small share of total elapsed time.",
+        "suggestion": "Investigate only if the overall query is slow.",
+    }
+    ai_setup.return_value = _response(mocker, text=json.dumps({
+        "summary": "This query reads orders.",
+        "finding": "This is a high-severity hotspot.",
+        "suggestions": ["Update table statistics to fix the estimate."],
+        "learning_point": "The query reads rows from orders.",
+    }))
+
+    result = ai.get_ai_explanation(QUERY, [warning], tree_summary=TREE)
+
+    assert result["finding"] == "The available plan does not show a clear performance concern."
+    assert result["suggestions"] == [ai._NO_CHANGE]
+
+
+def test_informational_scan_warning_is_not_promoted_to_a_performance_problem(ai_setup, mocker):
+    ai_setup.return_value = _response(mocker, text=json.dumps({
+        "summary": "This query reads orders.",
+        "finding": "A full table scan is always inefficient and makes this query slow.",
+        "suggestions": ["Avoid the full table scan and add an index."],
+        "learning_point": "A full scan is a performance problem.",
+    }))
+
+    result = ai.get_ai_explanation(QUERY, WARNINGS, tree_summary=TREE)
+
+    assert result["finding"] == "The available plan does not show a clear performance concern."
+    assert result["suggestions"] == [ai._NO_CHANGE]
+    assert "performance problem" not in result["learning_point"].lower()
+
+
+def _informational_temporary_table_tree():
+    return {
+        "id": "node_1",
+        "operator": "Aggregate using temporary table",
+        "details": "using temporary table",
+        "actual_rows": 100,
+        "rows_total": 100,
+        "loops": 1,
+        "time_total_ms": 10,
+        "self_time_ms": 5,
+        "children": [{
+            "id": "node_2",
+            "operator": "Table scan",
+            "details": "on orders",
+            "actual_rows": 100,
+            "rows_total": 100,
+            "loops": 1,
+            "time_total_ms": 5,
+            "self_time_ms": 5,
+            "children": [],
+        }],
+    }
+
+
+def test_informational_warning_cannot_be_promoted_to_a_high_priority_finding(ai_setup, mocker):
+    tree = _informational_temporary_table_tree()
+    warnings = analyze_rules(tree)
+    assert any(item["code"] == "TEMP_TABLE" and item["severity"] == "info" for item in warnings)
+    ai_setup.return_value = _response(mocker, text=json.dumps({
+        "summary": "This query uses a temporary table.",
+        "finding": "The temporary table is a high-priority performance problem.",
+        "suggestions": ["Fix this high-priority temporary-table problem."],
+        "learning_point": "Temporary tables are used for intermediate results.",
+    }))
+
+    result = ai.get_ai_explanation(QUERY, warnings, tree_summary=tree)
+
+    assert result["finding"] == "The available plan does not show a clear performance concern."
+    assert result["suggestions"] == [ai._NO_CHANGE]
+
+
+def test_never_executed_warning_gets_a_conditional_fallback_recommendation():
+    tree = {
+        "id": "node_1",
+        "operator": "Index lookup",
+        "details": "on orders using PRIMARY",
+        "never_executed": True,
+        "children": [],
+    }
+    warnings = analyze_rules(tree)
+
+    result = ai.get_rule_based_explanation(QUERY, warnings, tree_summary=tree)
+
+    assert "only if you expected this step to run" in result["suggestions"][0]
+    assert "did not run" not in result["finding"].lower()
+
+
+def test_offline_fallback_selects_only_an_established_rewrite():
+    query = "SELECT id FROM orders WHERE amount > 500 AND amount > 100"
+    correlated_query = (
+        "SELECT e.id FROM employees AS e WHERE e.salary > "
+        "(SELECT AVG(i.salary) FROM employees AS i WHERE i.department = e.department)"
+    )
+
+    result = ai.get_rule_based_explanation(query, [])
+    no_candidate = ai.get_rule_based_explanation("SELECT id FROM orders WHERE amount > 500", [])
+    correlated_result = ai.get_rule_based_explanation(correlated_query, [])
+
+    assert result["suggested_query"]["sql"] == "SELECT id FROM orders WHERE amount > 500"
+    assert no_candidate["suggested_query"] is None
+    assert "AVG(`e`.`salary`) OVER" in correlated_result["suggested_query"]["sql"]
+    assert "`e`.`employees`" not in correlated_result["suggested_query"]["sql"]
+
+
+def test_correlated_avg_rewrite_preserves_outer_filter_and_null_semantics():
+    query = (
+        "SELECT e.id FROM employees AS e WHERE e.status = 'active' AND e.salary > "
+        "(SELECT AVG(i.salary) FROM employees AS i WHERE i.department = e.department)"
+    )
+
+    candidate = ai._safe_correlated_avg_window_rewrite(query)
+
+    assert candidate is not None
+    assert "WHERE e.status = 'active' AND e.salary > CASE WHEN" in candidate["sql"]
+    assert "CASE WHEN `e`.`department` IS NOT NULL THEN `e`.`__query_lens_department_avg` END" in candidate["sql"]
+
+
+def test_correlated_avg_rewrite_keeps_columns_inside_outer_functions():
+    query = (
+        "SELECT e.id FROM employees AS e WHERE e.salary > "
+        "(SELECT AVG(i.salary) FROM employees AS i WHERE i.department = e.department) "
+        "AND ABS(e.bonus) > 0"
+    )
+
+    candidate = ai._safe_correlated_avg_window_rewrite(query)
+
+    assert candidate is not None
+    assert "`e`.`bonus`" in candidate["sql"]
+    assert "`e`.`ABS`" not in candidate["sql"]
+
+
+@pytest.mark.parametrize(
+    "inner_clause",
+    [
+        "HAVING AVG(i.salary) > 100",
+        "LIMIT 0",
+        "LIMIT 5",
+        "ORDER BY i.salary",
+        "GROUP BY i.department",
+        "LIMIT 1 OFFSET 1",
+    ],
+    ids=["having", "limit-zero", "limit-nonzero", "order-by", "group-by", "offset"],
+)
+def test_correlated_avg_rewrite_rejects_unsupported_inner_clauses(inner_clause):
+    query = (
+        "SELECT e.id FROM employees AS e WHERE e.salary > "
+        "(SELECT AVG(i.salary) FROM employees AS i "
+        f"WHERE i.department = e.department {inner_clause})"
+    )
+
+    assert ai._safe_correlated_avg_window_rewrite(query) is None
+
+    fallback = ai.get_rule_based_explanation(query, [])
+    assert fallback["suggested_query"] is None
+    assert fallback["fix"] is None
+
+
+def test_demo_ai_route_passes_its_parsed_tree_to_fallback(monkeypatch, mocker):
+    import main
+
+    tree = {"id": "demo-root", "operator": "Table scan", "children": []}
+    warnings = []
+    fallback = mocker.patch("main.get_rule_based_explanation", return_value={"summary": "ok"})
+    monkeypatch.setattr(main, "_public_rate_limit", lambda *_args: None)
+    monkeypatch.setattr(main, "_read_queries", lambda: [{"id": "demo", "sql": "SELECT 1"}])
+    monkeypatch.setattr(main, "load_plan_text", lambda _plan_id: ("plan text", "captured"))
+    monkeypatch.setattr(main, "parse_explain_analyze", lambda _text: tree)
+    monkeypatch.setattr(main, "analyze_rules", lambda _tree: warnings)
+
+    main.get_ai_insights("demo", mocker.Mock())
+
+    fallback.assert_called_once_with("SELECT 1", warnings, tree_summary=tree)
+
+
+def test_candidate_sql_is_checked_against_schema(monkeypatch):
+    query = "SELECT c.city FROM customers AS c WHERE c.status = 'open' AND 1 = 1"
+    candidate = "SELECT c.secret FROM customers AS c WHERE c.status = 'open'"
+    trusted = {
+        "sql": candidate,
+        "kind": "simplification",
+        "category": "alternative_formulation",
+        "why_it_may_help": "A deterministic candidate.",
+        "what_changed": "Changed the projection.",
+        "performance_expectation": "unknown",
+        "semantic_assumptions": "Test fixture.",
+        "limitations": "Test fixture.",
+    }
+    schema_info = {"tables": [{
+        "schema": "sql_analyzer_test",
+        "table": "customers",
+        "alias": "c",
+        "columns": ["city", "status"],
+    }]}
+    monkeypatch.setattr(ai, "_safe_redundant_predicate_rewrite", lambda *_args: trusted)
+
+    result = ai._validated_suggested_query(
+        {"sql": candidate}, trusted, query, {"customers"}, schema_info=schema_info
+    )
+
+    assert result is None
+
+
+def test_invalid_sql_suggestion_is_rejected(ai_setup, mocker):
+    ai_setup.return_value = _response(mocker, text=json.dumps({
+        "summary": "This query reads orders.",
+        "suggestions": [],
+        "suggested_query": {
+            "sql": "DELETE FROM orders",
+            "why_it_may_help": "It removes data.",
+            "what_changed": "Changed the statement type.",
+            "limitations": "None.",
+        },
+    }))
+
+    result = ai.get_ai_explanation(QUERY, WARNINGS, tree_summary=TREE)
+
+    assert result["suggested_query"] is None
+    assert result["fix"] is None
+
+
+def test_truncated_plan_and_warning_evidence_is_marked_for_gemini(ai_setup, mocker):
+    root = {
+        "id": "root",
+        "operator": "Filter",
+        "details": "(orders.amount > 500) " + ("detail " * 100),
+        "children": [
+            {
+                "id": f"child-{index}",
+                "operator": "Table scan",
+                "details": "on orders",
+                "estimated_rows": 5000,
+                "actual_rows": 5000,
+                "rows_total": 5000,
+                "loops": 1,
+                "time_total_ms": 30,
+                "self_time_ms": 30,
+                "children": [],
+            }
+            for index in range(21)
+        ],
+    }
+    warnings = [dict(WARNINGS[0]) for _ in range(21)]
+    ai_setup.return_value = _response(mocker)
+
+    ai.get_ai_explanation(QUERY, warnings, tree_summary=root)
+
+    prompt = ai_setup.call_args.kwargs["json"]["contents"][0]["parts"][0]["text"]
+    data = json.loads(prompt.split("DATA:\n", 1)[1])
+    assert data["parsed_plan"]["nodes_truncated"] is True
+    assert data["warnings_truncated"] is True
+    assert data["evidence_notice"]
+    assert "omitted evidence may change the interpretation" in data["evidence_notice"].lower()
+    assert len(data["parsed_plan"]["nodes"][0]["details"]) == 500
+    assert data["parsed_plan"]["nodes_truncated"] is True
+    assert data["parsed_plan"]["complete"] is False
+    assert data["warnings_complete"] is False
+    assert data["evidence_complete"] is False
+    assert "never call the supplied plan or warning list complete" in prompt.lower()
+
+
+def test_clipped_plan_node_details_are_marked_incomplete(ai_setup, mocker):
+    tree = {
+        "id": "node-1",
+        "operator": "Table scan",
+        "details": "on orders " + ("detail " * 100),
+        "actual_rows": 10,
+        "rows_total": 10,
+        "loops": 1,
+        "children": [],
+    }
+    ai_setup.return_value = _response(mocker)
+
+    ai.get_ai_explanation("SELECT id FROM orders", [], tree_summary=tree)
+
+    data = _submitted_ai_context(ai_setup)
+    node = data["parsed_plan"]["nodes"][0]
+    assert len(node["details"]) == 500
+    assert node["details_truncated"] is True
+    assert node["node_fields_truncated"] is True
+    assert data["parsed_plan"]["node_details_truncated"] is True
+    assert data["parsed_plan"]["complete"] is False
+    assert data["evidence_complete"] is False
+    assert "node details were clipped" in data["evidence_notice"]
+
+
+def test_clipped_warning_fields_are_marked_incomplete(ai_setup, mocker):
+    tree = {
+        "id": "node-1",
+        "operator": "Table scan",
+        "details": "on " + ("x" * 600),
+        "actual_rows": 5000,
+        "rows_total": 5000,
+        "loops": 1,
+        "self_time_ms": 30,
+        "children": [],
+    }
+    ai_setup.return_value = _response(mocker)
+
+    ai.get_ai_explanation("SELECT * FROM orders", [], tree_summary=tree)
+
+    data = _submitted_ai_context(ai_setup)
+    assert data["warning_fields_truncated"] is True
+    assert data["warnings_complete"] is False
+    assert "evidence" in data["warnings"][0]["fields_truncated"]
+    assert data["warnings"][0]["complete"] is False
+    assert "warning fields were clipped" in data["evidence_notice"]
+
+
+def test_truncated_schema_table_list_is_not_marked_complete(ai_setup, mocker):
+    schema_info = {"tables": [
+        {
+            "schema": "test_db", "table": f"table_{index}", "columns": ["id"],
+            "columns_complete": True, "indexes": [], "index_catalog_available": True,
+        }
+        for index in range(21)
+    ]}
+    ai_setup.return_value = _response(mocker)
+
+    ai.get_ai_explanation("SELECT 1", [], tree_summary=TREE, schema_info=schema_info)
+
+    data = _submitted_ai_context(ai_setup)
+    assert len(data["schema_info"]["tables"]) == 20
+    assert data["schema_info"]["tables_truncated"] is True
+    assert data["schema_info"]["tables_complete"] is False
+    assert data["schema_info"]["complete_index_catalog_available"] is False
+    assert data["evidence_complete"] is False
+    assert "schema table list was limited" in data["evidence_notice"]
+
+
+def test_truncated_index_list_is_not_marked_complete(ai_setup, mocker):
+    schema_info = {"tables": [{
+        "schema": "test_db", "table": "orders", "columns": ["id"],
+        "columns_complete": True,
+        "indexes": [
+            {"name": f"idx_{index}", "columns": ["id"], "unique": False}
+            for index in range(31)
+        ],
+        "index_catalog_available": True,
+    }]}
+    ai_setup.return_value = _response(mocker)
+
+    ai.get_ai_explanation("SELECT id FROM orders", [], tree_summary=TREE, schema_info=schema_info)
+
+    data = _submitted_ai_context(ai_setup)
+    table = data["schema_info"]["tables"][0]
+    assert len(table["indexes"]) == 30
+    assert table["indexes_truncated"] is True
+    assert table["indexes_complete"] is False
+    assert table["index_catalog_available"] is False
+    assert data["schema_info"]["complete_index_catalog_available"] is False
+    assert "schema index lists were limited" in data["evidence_notice"]
+
+
+def test_truncated_index_column_list_is_not_marked_complete(ai_setup, mocker):
+    schema_info = {"tables": [{
+        "schema": "test_db", "table": "orders", "columns": ["id"],
+        "columns_complete": True,
+        "indexes": [{"name": "wide_idx", "columns": [f"col_{i}" for i in range(21)]}],
+        "index_catalog_available": True,
+    }]}
+    ai_setup.return_value = _response(mocker)
+
+    ai.get_ai_explanation("SELECT id FROM orders", [], tree_summary=TREE, schema_info=schema_info)
+
+    data = _submitted_ai_context(ai_setup)
+    table = data["schema_info"]["tables"][0]
+    assert len(table["indexes"][0]["columns"]) == 20
+    assert table["index_columns_truncated"] is True
+    assert table["indexes_complete"] is False
+    assert data["schema_info"]["complete_index_catalog_available"] is False
+    assert "schema index lists were limited" in data["evidence_notice"]

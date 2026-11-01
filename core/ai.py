@@ -10,7 +10,7 @@ import re
 import threading
 import time
 from collections import Counter
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +20,10 @@ from sqlparse.sql import Comparison, Function, Identifier, IdentifierList, Paren
 from sqlparse import tokens as sql_tokens
 from dotenv import load_dotenv
 
+from core.rules import (
+    _WARNING_CLASSIFICATION as _AI_WARNING_CLASSIFICATION,
+    analyze_rules as _analyze_plan_rules,
+)
 from security import UnsafeQueryError, validate_live_query, validate_query
 
 
@@ -27,7 +31,7 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _CACHE_PATH = _PROJECT_ROOT / "ai_cache.json"
 _MEMORY_CACHE: dict[str, dict[str, Any]] = {}
 _CACHE_LOCK = threading.Lock()
-_CACHE_VERSION = 7
+_CACHE_VERSION = 9
 load_dotenv(_PROJECT_ROOT / ".env")
 _NO_CHANGE = (
     "No immediate change is recommended based on the available evidence. If the query becomes slow as the data grows, "
@@ -37,6 +41,7 @@ _ALTERNATIVE_FORMULATION_NOTE = (
     "This query preserves the intended result, but a performance improvement has not been established. "
     "Compare both execution plans."
 )
+_WARNING_SEVERITIES = {"high", "medium", "low", "info"}
 _SQL_IDENTIFIER = r"(?:`(?:``|[^`])+`|[\w$]+)"
 _QUERY_SOURCE = re.compile(
     rf"\b(?:FROM|JOIN)\s+(?P<source>{_SQL_IDENTIFIER}(?:\s*\.\s*{_SQL_IDENTIFIER})?)"
@@ -202,8 +207,11 @@ def _fallback_result(
     error: dict | None,
     api_key: str,
     reason: str,
+    schema_info: dict | None = None,
 ) -> dict[str, Any]:
-    explanation = get_rule_based_explanation(query, warnings, tree_summary, error)
+    explanation = get_rule_based_explanation(
+        query, warnings, tree_summary, error, schema_info=schema_info
+    )
     return {
         **explanation,
         "summary": _redact_text(explanation["summary"], api_key),
@@ -244,6 +252,10 @@ def _clip(value: Any) -> str:
     return str(value if value is not None else "")[:500]
 
 
+def _was_clipped(value: Any) -> bool:
+    return len(str(value if value is not None else "")) > 500
+
+
 def _mask_sql_literals_and_comments(query: str) -> str:
     pieces = []
     try:
@@ -274,8 +286,10 @@ def _query_reference_context(query: str) -> dict[str, Any]:
     references = set(cte_names)
     source_tables = []
     source_identities = []
+    sources = []
     seen_source_tables = set()
     alias_to_table = {}
+    alias_to_identity = {}
 
     for match in _QUERY_SOURCE.finditer(masked):
         parts = [
@@ -285,40 +299,91 @@ def _query_reference_context(query: str) -> dict[str, Any]:
         if not parts:
             continue
         table = parts[-1]
+        schema = parts[-2] if len(parts) > 1 else ""
         folded_table = table.casefold()
         references.add(folded_table)
-        if len(parts) > 1:
-            references.add(".".join(parts).casefold())
-        if folded_table not in cte_names:
+        if schema:
+            references.add(f"{schema}.{table}".casefold())
+        is_cte = folded_table in cte_names
+        alias = match.group("alias")
+        if alias:
+            alias = _unquote_identifier(alias)
+            if alias.casefold() in _SQL_RESERVED:
+                alias = ""
+        source_alias = alias or table
+        sources.append({
+            "schema": schema,
+            "table": table,
+            "alias": source_alias,
+            "is_cte": is_cte,
+        })
+        if not is_cte:
             source_identities.append(".".join(part.casefold() for part in parts))
             if folded_table not in seen_source_tables:
                 source_tables.append(table)
                 seen_source_tables.add(folded_table)
-        alias = match.group("alias")
-        if alias:
-            alias = _unquote_identifier(alias)
-            if alias.casefold() not in _SQL_RESERVED:
-                references.add(alias.casefold())
-                alias_to_table[alias.casefold()] = table
+        references.add(source_alias.casefold())
+        alias_to_table[source_alias.casefold()] = table
+        alias_to_identity[source_alias.casefold()] = (schema, table)
 
     for match in _DERIVED_ALIAS.finditer(masked):
         alias = _unquote_identifier(match.group("alias"))
         if alias.casefold() not in _SQL_RESERVED:
             references.add(alias.casefold())
             alias_to_table[alias.casefold()] = "<derived>"
+            alias_to_identity[alias.casefold()] = ("<derived>", alias)
 
     return {
         "references": references,
         "source_tables": source_tables,
         "source_identities": source_identities,
+        "sources": sources,
         "alias_to_table": alias_to_table,
+        "alias_to_identity": alias_to_identity,
     }
 
 
-def _unmatched_table_references(sql: str, query: str, plan_tables: set[str]) -> set[str]:
+def _unmatched_table_references(
+    sql: str,
+    query: str,
+    plan_tables: set[str],
+    schema_info: dict | None = None,
+) -> set[str]:
+    candidate_context = _query_reference_context(sql)
+    query_context = _query_reference_context(query)
     allowed = {str(table).casefold() for table in plan_tables}
-    allowed.update(_query_reference_context(query)["references"])
-    return _referenced_tables(sql) - allowed
+    allowed.update(query_context["references"])
+    allowed.update(
+        _unquote_identifier(match.group("name")).casefold()
+        for match in _CTE_DECLARATION.finditer(_mask_sql_literals_and_comments(sql))
+    )
+    unmatched = _referenced_tables(sql) - allowed
+
+    query_sources = [source for source in query_context["sources"] if not source["is_cte"]]
+    catalog = _schema_tables(schema_info) if schema_info else None
+    for source in candidate_context["sources"]:
+        if source["is_cte"]:
+            continue
+        table = source["table"].casefold()
+        schema = source["schema"].casefold()
+        same_table_sources = [item for item in query_sources if item["table"].casefold() == table]
+        if schema:
+            identity = f"{schema}.{table}"
+            if identity in query_context["source_identities"]:
+                continue
+            # A schema-qualified spelling of an originally unqualified source
+            # is checked against the resolved catalog below, if one is present.
+            catalog_match = _catalog_source_matches(source, catalog) if catalog else False
+            if schema_info and same_table_sources and catalog_match:
+                continue
+            unmatched.add(identity)
+        elif same_table_sources:
+            originally_qualified = any(item["schema"] for item in same_table_sources)
+            if originally_qualified and not schema_info:
+                unmatched.add(table)
+        elif table not in allowed:
+            unmatched.add(table)
+    return unmatched
 
 
 def _plan_number(node: dict[str, Any], field: str) -> int | float | None:
@@ -372,6 +437,7 @@ def _safe_distinct_star_rewrite(
     tree_summary: dict | None,
 ) -> dict[str, Any] | None:
     """Offer a safe DISTINCT simplification, distinguishing measured work from semantics alone."""
+    warnings = _server_generated_warnings(tree_summary)
     if not _is_single_read_only_select(query):
         return None
     if any(token.ttype and token.ttype in sql_tokens.Comment for token in sqlparse.parse(query)[0].flatten()):
@@ -602,8 +668,16 @@ def _select_projection(statement, from_index: int) -> list[Identifier] | None:
 
 def _walk_identifiers(token_list):
     for token in getattr(token_list, "tokens", []):
+        if isinstance(token, Function):
+            for child in token.tokens:
+                if isinstance(child, Parenthesis):
+                    yield from _walk_identifiers(child)
+            continue
         if isinstance(token, Identifier):
             yield token
+            for child in token.tokens:
+                if isinstance(child, Function) or isinstance(child, Parenthesis):
+                    yield from _walk_identifiers(child)
             continue
         if token.is_group:
             yield from _walk_identifiers(token)
@@ -692,6 +766,15 @@ def _safe_correlated_avg_window_rewrite(query: str) -> dict[str, str] | None:
     inner_tokens = _significant_sql_tokens(inner_statement.tokens)
     if not inner_tokens or inner_tokens[0].normalized.upper() != "SELECT":
         return None
+    # The rewrite is proven only for SELECT AVG(...) FROM one table WHERE
+    # correlation = correlation. Other top-level clauses can change which
+    # scalar value (or number of values) the subquery returns.
+    if any(
+        token.ttype in sql_tokens.Keyword
+        and token.normalized.upper() not in {"SELECT", "FROM"}
+        for token in inner_statement.tokens
+    ):
+        return None
     inner_source, inner_from_index = _top_level_source(inner_statement)
     if inner_source is None:
         return None
@@ -751,8 +834,12 @@ def _safe_correlated_avg_window_rewrite(query: str) -> dict[str, str] | None:
     # from being mistaken for outer-table columns.
     sanitized_query = query.replace(subquery.value, "NULL", 1)
     sanitized_statement = sqlparse.parse(sanitized_query)[0]
+    sanitized_source, _ = _top_level_source(sanitized_statement)
+    sanitized_source_span = _token_span(sanitized_statement, sanitized_source) if sanitized_source else None
     required_columns = set()
     for identifier in _walk_identifiers(sanitized_statement):
+        if sanitized_source_span is not None and _token_span(sanitized_statement, identifier) == sanitized_source_span:
+            continue
         reference = _simple_column_reference(identifier)
         if reference is None:
             continue
@@ -1065,7 +1152,10 @@ def _safe_redundant_predicate_rewrite(
     span = _token_span(statement, where)
     if span is None:
         return None
-    rewritten = query[:span[0]] + replacement + query[span[1]:]
+    suffix = query[span[1]:]
+    if replacement and suffix and not suffix[0].isspace():
+        replacement += " "
+    rewritten = query[:span[0]] + replacement + suffix
     if not _is_single_read_only_select(rewritten):
         return None
     try:
@@ -1073,22 +1163,22 @@ def _safe_redundant_predicate_rewrite(
     except (UnsafeQueryError, TypeError, ValueError):
         return None
 
-    numeric_proofs = []
+    numeric_proofs: list[tuple[str, str]] = []
     for index in sorted(remove):
         weaker = parsed_bounds[index]
         if weaker is None:
             continue
-        stronger = next(
-            (item for other_index, item in enumerate(parsed_bounds)
+        stronger_term = next(
+            (terms[other_index] for other_index, item in enumerate(parsed_bounds)
              if other_index != index and item is not None and _comparison_implies(item, weaker)),
             None,
         )
-        if stronger:
-            numeric_proofs.append((terms[index], stronger))
+        if stronger_term is not None:
+            numeric_proofs.append((terms[index], stronger_term))
     if numeric_proofs:
         why = " ".join(
-            f"The condition `{weaker}` is redundant because the retained numeric bound already implies it."
-            for weaker, _stronger in numeric_proofs
+            f"The condition `{weaker}` is redundant because `{stronger}` already implies it, and this preserves the query's results."
+            for weaker, stronger in numeric_proofs
         )
         changes = "Removed only numeric predicates implied by stronger predicates on the same column."
         assumptions = "The compared values are numeric literals and the predicates use the same column and direction."
@@ -1109,7 +1199,8 @@ def _safe_redundant_predicate_rewrite(
         performance="Unknown; MySQL may already simplify the predicate, and the candidate has not been benchmarked.",
         assumptions=assumptions,
         limitations=(
-            "This rewrite is equivalent for the exact redundant predicate described above. Its runtime effect is unknown. "
+            "This rewrite has not been executed or benchmarked. It is equivalent for the exact redundant predicate described above; "
+            "its runtime effect is unknown, and speed improvement is not guaranteed. "
             f"{_ALTERNATIVE_FORMULATION_NOTE}"
         ),
     )
@@ -1125,27 +1216,32 @@ def _safe_offline_rewrite(
     if error:
         return None
     measured_distinct = _safe_distinct_star_rewrite(query, warnings, tree_summary)
+    candidates = []
     if measured_distinct and measured_distinct.get("category") == "measured_optimization":
-        candidate = measured_distinct
-    else:
-        candidate = (
-            _safe_correlated_avg_window_rewrite(query)
-            or _safe_redundant_predicate_rewrite(query, tree_summary)
-            or measured_distinct
-        )
-    if not candidate:
-        return None
+        candidates.append(measured_distinct)
+    candidates.extend((
+        _safe_correlated_avg_window_rewrite(query),
+        _safe_redundant_predicate_rewrite(query, tree_summary),
+    ))
+    if measured_distinct and measured_distinct not in candidates:
+        candidates.append(measured_distinct)
     plan_tables = {str(node.get("table") or "").casefold() for node in _compact_tree(tree_summary)[0]}
-    return _validated_suggested_query(
-        candidate,
-        candidate,
-        query,
-        plan_tables,
-        warnings=warnings,
-        tree_summary=tree_summary,
-        schema_info=schema_info,
-        error=error,
-    )
+    for candidate in candidates:
+        if not candidate:
+            continue
+        validated = _validated_suggested_query(
+            candidate,
+            candidate,
+            query,
+            plan_tables,
+            warnings=warnings,
+            tree_summary=tree_summary,
+            schema_info=schema_info,
+            error=error,
+        )
+        if validated is not None:
+            return validated
+    return None
 
 
 def _removed_numeric_condition_is_unverified(original_statement, candidate_statement) -> bool:
@@ -1190,11 +1286,11 @@ def _literal_signature(sql: str) -> Counter:
     )
 
 
-def _schema_tables(schema_info: dict | None) -> dict[str, dict[str, Any]]:
-    result = {}
+def _schema_tables(schema_info: dict | None) -> dict[str, Any]:
+    entries = []
     if not isinstance(schema_info, dict) or not isinstance(schema_info.get("tables"), list):
-        return result
-    for entry in schema_info["tables"][:20]:
+        return {"entries": [], "by_table": {}, "by_identity": {}, "by_alias": {}}
+    for entry in schema_info["tables"]:
         if not isinstance(entry, dict):
             continue
         table = str(entry.get("table") or "").strip()
@@ -1206,96 +1302,462 @@ def _schema_tables(schema_info: dict | None) -> dict[str, dict[str, Any]]:
             columns = []
         column_names = {
             str(column.get("name") if isinstance(column, dict) else column).casefold()
-            for column in columns[:200]
+            for column in columns
             if str(column.get("name") if isinstance(column, dict) else column).strip()
         }
-        clean_entry = {
+        entries.append({
             "schema": schema,
             "table": table,
             "columns": column_names,
+            "columns_complete": bool(
+                entry.get("columns_complete", schema_info.get("columns_complete", False))
+            ),
             "alias": str(entry.get("alias") or "").strip(),
             "indexes": entry.get("indexes") if isinstance(entry.get("indexes"), list) else [],
             "index_catalog_available": bool(entry.get("index_catalog_available")),
-        }
-        result[table.casefold()] = clean_entry
-        if schema:
-            result[f"{schema}.{table}".casefold()] = clean_entry
-        if clean_entry["alias"]:
-            result[clean_entry["alias"].casefold()] = clean_entry
+        })
+
+    by_table: dict[str, list[dict[str, Any]]] = {}
+    by_identity: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    by_alias: dict[str, list[dict[str, Any]]] = {}
+    for entry in entries:
+        by_table.setdefault(entry["table"].casefold(), []).append(entry)
+        identity = (entry["schema"].casefold(), entry["table"].casefold())
+        by_identity.setdefault(identity, []).append(entry)
+        if entry["alias"]:
+            by_alias.setdefault(entry["alias"].casefold(), []).append(entry)
+    return {
+        "entries": entries,
+        "by_table": by_table,
+        "by_identity": by_identity,
+        "by_alias": by_alias,
+    }
+
+
+def _unique_schema_entry(entries: list[dict[str, Any]]) -> dict[str, Any] | None:
+    identities = {
+        (entry["schema"].casefold(), entry["table"].casefold())
+        for entry in entries
+    }
+    if len(identities) != 1 or not entries:
+        return None
+    if len({frozenset(entry["columns"]) for entry in entries}) != 1:
+        return None
+    result = dict(entries[0])
+    result["columns_complete"] = any(entry["columns_complete"] for entry in entries)
     return result
+
+
+def _catalog_source_entry(
+    source: dict[str, Any], catalog: dict[str, Any]
+) -> dict[str, Any] | None:
+    table = str(source.get("table") or "").casefold()
+    schema = str(source.get("schema") or "").casefold()
+    if not table:
+        return None
+    if schema:
+        candidates = catalog["by_identity"].get((schema, table), [])
+    else:
+        alias = str(source.get("alias") or table).casefold()
+        candidates = [
+            entry for entry in catalog["by_alias"].get(alias, [])
+            if entry["table"].casefold() == table
+        ]
+        if not candidates:
+            candidates = catalog["by_table"].get(table, [])
+    return _unique_schema_entry(candidates)
+
+
+def _catalog_source_matches(source: dict[str, Any], catalog: dict[str, Any]) -> bool:
+    return _catalog_source_entry(source, catalog) is not None
+
+
+def _schema_identity(entry: dict[str, Any]) -> tuple[str, str]:
+    return entry["schema"].casefold(), entry["table"].casefold()
+
+
+def _cte_output_columns(sql: str) -> dict[str, set[str]]:
+    masked = _mask_sql_literals_and_comments(sql)
+    result: dict[str, set[str]] = {}
+    for match in _CTE_DECLARATION.finditer(masked):
+        opening = match.end() - 1
+        depth = 1
+        closing = opening + 1
+        while closing < len(masked) and depth:
+            if masked[closing] == "(":
+                depth += 1
+            elif masked[closing] == ")":
+                depth -= 1
+            closing += 1
+        if depth:
+            continue
+        body = sql[opening + 1:closing - 1]
+        statements = [item for item in sqlparse.parse(body) if str(item).strip()]
+        if len(statements) != 1:
+            continue
+        statement = statements[0]
+        _source, from_index = _top_level_source(statement)
+        if from_index is None:
+            continue
+        select_index = next(
+            (
+                index for index, token in enumerate(statement.tokens)
+                if token.ttype in sql_tokens.DML and token.normalized.upper() == "SELECT"
+            ),
+            None,
+        )
+        if select_index is None:
+            continue
+        projection_tokens = _significant_sql_tokens(statement.tokens[select_index + 1:from_index])
+        if len(projection_tokens) == 1 and isinstance(projection_tokens[0], IdentifierList):
+            projection = list(projection_tokens[0].get_identifiers())
+        else:
+            projection = projection_tokens
+        columns = set()
+        for item in projection:
+            if isinstance(item, Identifier):
+                name = item.get_alias() or item.get_real_name()
+                if name:
+                    columns.add(_unquote_identifier(name).casefold())
+            elif isinstance(item, Function):
+                name = item.get_name()
+                if name:
+                    columns.add(_unquote_identifier(name).casefold())
+        result[_unquote_identifier(match.group("name")).casefold()] = columns
+    return result
+
+
+def _catalog_is_available(schema_info: dict | None) -> bool:
+    return isinstance(schema_info, dict) and bool(
+        schema_info.get("catalog_available")
+        or (isinstance(schema_info.get("tables"), list) and schema_info["tables"])
+    )
+
+
+def _column_exists_in_entry(column: str, entry: dict[str, Any]) -> bool:
+    return column.casefold() in entry["columns"]
+
+
+def _unqualified_column_is_supported(
+    column: str,
+    source_entries: list[dict[str, Any]],
+) -> bool:
+    folded = column.casefold()
+    if not source_entries:
+        return False
+    matches = [entry for entry in source_entries if folded in entry["columns"]]
+    if len(source_entries) == 1:
+        return len(matches) == 1
+    if any(not entry["columns_complete"] for entry in source_entries):
+        return False
+    return len(matches) == 1
+
+
+def _qualified_columns_are_supported(sql: str, query: str, schema_info: dict | None) -> bool:
+    """Validate candidate table and column references against the available catalog.
+
+    A missing catalog leaves the deterministic rewrite checks as the only source of
+    trust. Once a catalog is present, every physical source and every column in the
+    candidate must be resolved without relying on a table basename guess.
+    """
+    if not _catalog_is_available(schema_info):
+        return True
+    if schema_info.get("tables_complete") is False:
+        return False
+
+    catalog = _schema_tables(schema_info)
+    candidate_context = _query_reference_context(sql)
+    original_context = _query_reference_context(query)
+    original_entries: list[dict[str, Any]] = []
+    for source in original_context["sources"]:
+        if source["is_cte"]:
+            continue
+        entry = _catalog_source_entry(source, catalog)
+        if entry is None:
+            return False
+        original_entries.append(entry)
+
+    candidate_entries: list[dict[str, Any]] = []
+    candidate_identities: list[tuple[str, str]] = []
+    alias_entries: dict[str, dict[str, Any]] = {}
+    cte_columns = _cte_output_columns(sql)
+    for source in candidate_context["sources"]:
+        alias = str(source.get("alias") or source.get("table") or "").casefold()
+        if source["is_cte"]:
+            columns = cte_columns.get(str(source["table"]).casefold())
+            if columns is None:
+                return False
+            alias_entries[alias] = {
+                "schema": "<cte>", "table": str(source["table"]), "columns": columns,
+                "columns_complete": True,
+            }
+            continue
+        entry = _catalog_source_entry(source, catalog)
+        if entry is None:
+            return False
+        candidate_entries.append(entry)
+        candidate_identities.append(_schema_identity(entry))
+        alias_entries[alias] = entry
+
+    original_identities = [_schema_identity(entry) for entry in original_entries]
+    if set(candidate_identities) != set(original_identities):
+        return False
+
+    # Include CTE outputs in bare-column resolution. Their names are known from
+    # the candidate projection, while physical columns remain catalog-backed.
+    candidate_source_entries = list(candidate_entries)
+    for source in candidate_context["sources"]:
+        if not source["is_cte"]:
+            continue
+        cte_name = str(source["table"]).casefold()
+        columns = cte_columns.get(cte_name)
+        if columns is None:
+            return False
+        candidate_source_entries.append({
+            "schema": "<cte>", "table": cte_name, "columns": columns,
+            "columns_complete": True,
+        })
+
+    masked = _mask_sql_literals_and_comments(sql)
+    occupied_spans = [match.span() for match in _QUERY_SOURCE.finditer(masked)]
+    occupied_spans.extend(match.span("name") for match in _CTE_DECLARATION.finditer(masked))
+    schema_names = {entry["schema"].casefold() for entry in catalog["entries"] if entry["schema"]}
+    projection_aliases = {
+        _unquote_identifier(match.group("alias")).casefold()
+        for match in re.finditer(rf"\bAS\s+(?P<alias>{_SQL_IDENTIFIER})", masked, re.IGNORECASE)
+    }
+
+    qualified_spans: list[tuple[int, int]] = []
+    qualified_star_pattern = rf"(?<![\w$]){_SQL_IDENTIFIER}(?:\s*\.\s*{_SQL_IDENTIFIER}){{0,2}}\s*\.\s*\*"
+    for match in re.finditer(qualified_star_pattern, masked):
+        span = match.span()
+        parts = [_unquote_identifier(part) for part in re.findall(_SQL_IDENTIFIER, match.group(0))]
+        if len(parts) == 1:
+            if parts[0].casefold() not in alias_entries:
+                return False
+        elif len(parts) == 2 and parts[0].casefold() in schema_names:
+            identity = (parts[0].casefold(), parts[1].casefold())
+            if identity not in candidate_identities:
+                return False
+        elif len(parts) == 3:
+            identity = (parts[0].casefold(), parts[1].casefold())
+            if identity not in candidate_identities:
+                return False
+        else:
+            return False
+        qualified_spans.append(span)
+        occupied_spans.append(span)
+
+    qualified_pattern = rf"(?<![\w$]){_SQL_IDENTIFIER}(?:\s*\.\s*{_SQL_IDENTIFIER}){{1,2}}"
+    for match in re.finditer(qualified_pattern, masked):
+        span = match.span()
+        qualified_spans.append(span)
+        if any(start <= span[0] and span[1] <= end for start, end in occupied_spans):
+            continue
+        parts = [_unquote_identifier(part) for part in re.findall(_SQL_IDENTIFIER, match.group(0))]
+        if len(parts) == 3:
+            schema, table, column = (part.casefold() for part in parts)
+            entries = catalog["by_identity"].get((schema, table), [])
+            entry = _unique_schema_entry(entries)
+            if (
+                entry is None
+                or _schema_identity(entry) not in candidate_identities
+                or not _column_exists_in_entry(column, entry)
+            ):
+                return False
+        elif len(parts) == 2:
+            qualifier, column = (part.casefold() for part in parts)
+            if qualifier in alias_entries:
+                if not _column_exists_in_entry(column, alias_entries[qualifier]):
+                    return False
+            elif qualifier in schema_names:
+                # Outside a FROM/JOIN source, schema.table is not a supported
+                # column reference and must not be mistaken for alias.column.
+                return False
+            else:
+                return False
+
+    alias_declaration_spans = [
+        match.span("alias")
+        for match in re.finditer(rf"\bAS\s+(?P<alias>{_SQL_IDENTIFIER})", masked, re.IGNORECASE)
+    ]
+    clause_matches = list(re.finditer(
+        r"\b(SELECT|FROM|WHERE|GROUP\s+BY|HAVING|ORDER\s+BY|LIMIT|OFFSET|ON|JOIN)\b",
+        masked,
+        re.IGNORECASE,
+    ))
+    for statement in sqlparse.parse(masked):
+        offset = 0
+        flat_tokens = list(statement.flatten())
+        for token_index, token in enumerate(flat_tokens):
+            start, end = offset, offset + len(token.value)
+            offset = end
+            if token.ttype not in sql_tokens.Name:
+                continue
+            name = _unquote_identifier(token.value)
+            folded = name.casefold()
+            if not folded or folded in _SQL_RESERVED:
+                continue
+            if any(left <= start and end <= right for left, right in occupied_spans):
+                continue
+            if any(left <= start and end <= right for left, right in qualified_spans):
+                continue
+            if any(left <= start and end <= right for left, right in alias_declaration_spans):
+                continue
+            next_index = token_index + 1
+            while next_index < len(flat_tokens) and flat_tokens[next_index].is_whitespace:
+                next_index += 1
+            if next_index < len(flat_tokens) and flat_tokens[next_index].value == "(":
+                continue
+            if folded in projection_aliases:
+                preceding_clauses = [match for match in clause_matches if match.start() < start]
+                current_clause = (
+                    re.sub(r"\s+", " ", preceding_clauses[-1].group(1)).upper()
+                    if preceding_clauses else ""
+                )
+                if current_clause in {"GROUP BY", "HAVING", "ORDER BY"}:
+                    continue
+            if not _unqualified_column_is_supported(
+                name, candidate_source_entries
+            ):
+                return False
+    return True
 
 
 def _sanitise_schema_info(schema_info: dict | None) -> dict[str, Any]:
     if not isinstance(schema_info, dict):
-        return {"dialect": "MySQL", "tables": [], "catalog_available": False}
+        return {
+            "dialect": "MySQL", "tables": [], "catalog_available": False,
+            "tables_truncated": False, "tables_complete": False,
+            "schema_header_truncated": False, "schema_complete": False, "indexes_truncated": False,
+            "complete_index_catalog_available": False,
+        }
+    schema_header_truncated = _was_clipped(schema_info.get("dialect")) or _was_clipped(schema_info.get("version"))
+    raw_tables = schema_info.get("tables")
+    raw_tables = raw_tables if isinstance(raw_tables, list) else []
+    tables_truncated = len(raw_tables) > 20
     tables = []
-    for entry in schema_info.get("tables", [])[:20] if isinstance(schema_info.get("tables"), list) else []:
+    invalid_table_entries = False
+    for entry in raw_tables[:20]:
         if not isinstance(entry, dict):
+            invalid_table_entries = True
             continue
-        columns = entry.get("columns")
-        indexes = entry.get("indexes")
-        columns = columns if isinstance(columns, list) else []
-        indexes = indexes if isinstance(indexes, list) else []
+        raw_columns = entry.get("columns")
+        columns_are_list = isinstance(raw_columns, list)
+        raw_columns = raw_columns if columns_are_list else []
+        columns_truncated = len(raw_columns) > 200
+        columns_fields_truncated = any(
+            _was_clipped(column.get("name") if isinstance(column, dict) else column)
+            for column in raw_columns
+        )
+        invalid_columns = any(
+            not str((column.get("name") if isinstance(column, dict) else column) or "").strip()
+            for column in raw_columns
+        )
+        indexes_raw = entry.get("indexes")
+        indexes_are_list = isinstance(indexes_raw, list)
+        indexes_raw = indexes_raw if indexes_are_list else []
+        indexes_truncated = len(indexes_raw) > 30
+        index_columns_truncated = False
+        index_fields_truncated = False
+        invalid_indexes = False
+        indexes = []
+        for index in indexes_raw[:30]:
+            if not isinstance(index, dict):
+                invalid_indexes = True
+                continue
+            index_columns = index.get("columns")
+            if not isinstance(index_columns, list):
+                invalid_indexes = True
+                index_columns = []
+            if not str(index.get("name") or "").strip() or any(
+                not str(column or "").strip() for column in index_columns
+            ):
+                invalid_indexes = True
+            if len(index_columns) > 20:
+                index_columns_truncated = True
+            if _was_clipped(index.get("name")) or any(_was_clipped(column) for column in index_columns):
+                index_fields_truncated = True
+            indexes.append({
+                "name": _clip(index.get("name")),
+                "columns": [_clip(column) for column in index_columns[:20]],
+                "unique": bool(index.get("unique")),
+            })
+
+        indexes_truncated = indexes_truncated or not indexes_are_list or invalid_indexes
+
+        table_reference_truncated = any(
+            _was_clipped(entry.get(field)) for field in ("schema", "table", "alias")
+        )
+        table_reference_complete = bool(str(entry.get("table") or "").strip()) and not table_reference_truncated
+        columns_truncated = (
+            columns_truncated or columns_fields_truncated or not columns_are_list
+            or invalid_columns or not raw_columns
+        )
+        columns_complete = (
+            bool(entry.get("columns_complete"))
+            and columns_are_list
+            and bool(raw_columns)
+            and not columns_truncated
+            and not columns_fields_truncated
+            and not invalid_columns
+        )
+        index_catalog_truncated = (
+            indexes_truncated or index_columns_truncated or index_fields_truncated
+        )
+        indexes_complete = (
+            bool(entry.get("index_catalog_available"))
+            and indexes_are_list
+            and not index_catalog_truncated
+            and not invalid_indexes
+            and table_reference_complete
+        )
         tables.append({
             "schema": _clip(entry.get("schema")),
             "table": _clip(entry.get("table")),
             "alias": _clip(entry.get("alias")),
             "columns": [
                 _clip(column.get("name") if isinstance(column, dict) else column)
-                for column in columns[:200]
+                for column in raw_columns[:200]
             ],
-            "indexes": [
-                {
-                    "name": _clip(index.get("name")),
-                    "columns": [
-                        _clip(column) for column in index.get("columns", [])[:20]
-                    ] if isinstance(index.get("columns"), list) else [],
-                    "unique": bool(index.get("unique")),
-                }
-                for index in indexes[:30]
-                if isinstance(index, dict)
-            ],
-            "index_catalog_available": bool(entry.get("index_catalog_available")),
+            "columns_complete": columns_complete,
+            "columns_truncated": columns_truncated,
+            "table_reference_truncated": table_reference_truncated,
+            "table_reference_complete": table_reference_complete,
+            "indexes": indexes,
+            "indexes_truncated": indexes_truncated,
+            "index_columns_truncated": index_columns_truncated,
+            "index_fields_truncated": index_fields_truncated,
+            "indexes_complete": indexes_complete,
+            "index_catalog_available": indexes_complete,
         })
+    tables_complete = bool(tables) and not tables_truncated and not invalid_table_entries and all(
+        table["table_reference_complete"] for table in tables
+    )
+    tables_truncated = tables_truncated or invalid_table_entries
+    schema_complete = (
+        tables_complete and all(table["columns_complete"] for table in tables)
+        and not schema_header_truncated
+    )
+    indexes_truncated = any(
+        table["indexes_truncated"] or table["index_columns_truncated"] or table["index_fields_truncated"]
+        for table in tables
+    )
+    complete_index_catalog_available = bool(tables) and tables_complete and all(
+        table["index_catalog_available"] and table["indexes_complete"] for table in tables
+    )
     return {
         "dialect": _clip(schema_info.get("dialect") or "MySQL"),
         "version": _clip(schema_info.get("version")),
         "tables": tables,
         "catalog_available": bool(tables),
+        "tables_truncated": tables_truncated,
+        "tables_complete": tables_complete,
+        "schema_header_truncated": schema_header_truncated,
+        "schema_complete": schema_complete,
+        "indexes_truncated": indexes_truncated,
+        "complete_index_catalog_available": complete_index_catalog_available,
     }
-
-
-def _qualified_columns_are_supported(sql: str, query: str, schema_info: dict | None) -> bool:
-    catalog = _schema_tables(schema_info)
-    if not catalog:
-        return True
-    context = _query_reference_context(query)
-    alias_to_table = {str(alias).casefold(): str(table).casefold() for alias, table in context["alias_to_table"].items()}
-    entries = {id(entry): entry for entry in catalog.values()}.values()
-    schema_names = {str(entry["schema"]).casefold() for entry in entries if entry["schema"]}
-    table_names = {str(entry["table"]).casefold() for entry in entries}
-    parts_pattern = rf"{_SQL_IDENTIFIER}(?:\s*\.\s*{_SQL_IDENTIFIER}){{1,2}}"
-    for match in re.finditer(parts_pattern, _mask_sql_literals_and_comments(sql)):
-        parts = [_unquote_identifier(part) for part in re.findall(_SQL_IDENTIFIER, match.group(0))]
-        if len(parts) == 2:
-            qualifier, column = (part.casefold() for part in parts)
-            if qualifier in alias_to_table:
-                entry = catalog.get(alias_to_table[qualifier])
-                if entry and column not in entry["columns"]:
-                    return False
-                continue
-            if qualifier in schema_names and column in table_names:
-                # A schema.table qualifier, not a table.column reference.
-                continue
-            entry = catalog.get(qualifier)
-            if entry and column not in entry["columns"]:
-                return False
-        elif len(parts) == 3:
-            schema, table, column = (part.casefold() for part in parts)
-            entry = catalog.get(f"{schema}.{table}") or catalog.get(table)
-            if entry and column not in entry["columns"]:
-                return False
-    return True
 
 
 def _validated_suggested_query(
@@ -1334,15 +1796,19 @@ def _validated_suggested_query(
             and isinstance(candidate.get("sql"), str)
             and _sql_token_signature(sql) == _sql_token_signature(candidate["sql"])
         ):
-            if schema_info and not _qualified_columns_are_supported(query, query, schema_info):
+            if _unmatched_table_references(sql, query, plan_tables, schema_info):
+                return None
+            if not _qualified_columns_are_supported(sql, query, schema_info):
                 return None
             return candidate
     return None
 
 
-def _compact_tree(tree: dict | None) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+def _compact_tree(
+    tree: dict | None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], bool]:
     if not isinstance(tree, dict):
-        return [], []
+        return [], [], False
     nodes = []
     dead_ends = []
     stack = [tree]
@@ -1350,12 +1816,20 @@ def _compact_tree(tree: dict | None) -> tuple[list[dict[str, Any]], list[dict[st
         node = stack.pop()
         if not isinstance(node, dict):
             continue
-        details = _clip(node.get("details"))
+        raw_details = node.get("details")
+        details = _clip(raw_details)
         table_match = re.search(r"\bon\s+(?:`?[\w$]+`?\.)?`?([\w$]+)`?", details, re.IGNORECASE)
+        if not table_match:
+            table_match = re.search(r"\b([\w$]+)\.[\w$]+\b", details)
         entry = {
+            "node_ref": f"plan_node_{len(nodes) + 1}",
             "type": _clip(node.get("operator")),
             "table": _clip(table_match.group(1) if table_match else ""),
+            "details_truncated": _was_clipped(raw_details),
+            "node_fields_truncated": _was_clipped(node.get("operator")) or _was_clipped(raw_details),
         }
+        if details:
+            entry["details"] = details
         index_match = re.search(r"\busing\s+`?([\w$]+)`?", details, re.IGNORECASE)
         if index_match:
             entry["index_used"] = _clip(index_match.group(1))
@@ -1369,6 +1843,8 @@ def _compact_tree(tree: dict | None) -> tuple[list[dict[str, Any]], list[dict[st
             ("actual_rows_per_loop", "actual_rows"),
             ("loops", "loops"),
             ("actual_rows_total", "rows_total"),
+            ("first_row_time_ms", "time_first_ms"),
+            ("last_row_time_ms_per_loop", "time_last_ms"),
             ("elapsed_ms_total", "time_total_ms"),
             ("self_time_ms", "self_time_ms"),
             ("self_time_pct", "self_time_pct"),
@@ -1384,7 +1860,7 @@ def _compact_tree(tree: dict | None) -> tuple[list[dict[str, Any]], list[dict[st
         children = node.get("children")
         if isinstance(children, list):
             stack.extend(reversed(children))
-    return nodes, dead_ends
+    return nodes, dead_ends, bool(stack)
 
 
 def _response_json(text: str) -> dict[str, Any]:
@@ -1460,14 +1936,265 @@ def _index_candidate_warning(warnings: list[dict]) -> dict | None:
             warning for warning in warnings
             if isinstance(warning, dict)
             and (warning.get("code") or warning.get("type")) in {"FILTER_DISCARDS_MOST", "INNER_SCAN_IN_LOOP"}
+            and _trusted_warning_classification(warning) == "investigate"
+            and str(warning.get("severity") or "").casefold() in _WARNING_SEVERITIES
         ),
         None,
     )
 
 
+def _trusted_warning_classification(warning: dict) -> str | None:
+    code = str(warning.get("code") or warning.get("type") or "").upper()
+    expected = _AI_WARNING_CLASSIFICATION.get(code)
+    classification = str(warning.get("classification") or "").casefold()
+    severity = str(warning.get("severity") or "").casefold()
+    if expected is None or classification != expected or severity not in _WARNING_SEVERITIES:
+        return None
+    return expected
+
+
+def _server_generated_warnings(tree_summary: dict | None) -> list[dict]:
+    """Rebuild warning data from a plan tree and retain only warnings tied to its nodes."""
+    if not isinstance(tree_summary, dict):
+        return []
+    nodes = list(_plan_nodes(tree_summary))
+    node_ids = []
+    for node in nodes:
+        node_id = node.get("id")
+        if isinstance(node_id, bool) or not isinstance(node_id, (str, int)) or not str(node_id).strip():
+            return []
+        node_ids.append(str(node_id))
+    if not nodes or len(node_ids) != len(set(node_ids)):
+        return []
+
+    try:
+        generated = _analyze_plan_rules(tree_summary)
+    except (AttributeError, KeyError, OverflowError, RecursionError, TypeError, ValueError):
+        return []
+
+    actual_node_ids = set(node_ids)
+    trusted = []
+    for warning in generated:
+        if not isinstance(warning, dict):
+            continue
+        code = str(warning.get("code") or warning.get("type") or "").upper()
+        if (
+            str(warning.get("node_id") or "") not in actual_node_ids
+            or _AI_WARNING_CLASSIFICATION.get(code) != warning.get("classification")
+            or str(warning.get("severity") or "").casefold() not in _WARNING_SEVERITIES
+            or not all(
+                isinstance(warning.get(field), str) and warning[field].strip()
+                for field in ("title", "message", "evidence")
+            )
+        ):
+            continue
+        trusted.append(warning)
+    return trusted
+
+
+def _warning_evidence_codes(warnings: list[dict]) -> set[str]:
+    return {
+        str(warning.get("code") or warning.get("type")).upper()
+        for warning in warnings
+        if isinstance(warning, dict) and _trusted_warning_classification(warning)
+    }
+
+
+def _unsupported_warning_claim(text: str, warnings: list[dict], tree_summary: dict | None) -> bool:
+    lowered = text.casefold()
+    codes = _warning_evidence_codes(warnings)
+    severity_claim = re.search(r"\b(high|medium|low|info)[-\s]+(?:severity|priority|risk)\b", lowered)
+    if severity_claim:
+        severity_context = lowered[max(0, severity_claim.start() - 90):severity_claim.end() + 40]
+        related_codes = set()
+        if re.search(r"\b(?:estimate|predicted rows|actual rows)\b", severity_context):
+            related_codes.add("ESTIMATE_MISMATCH")
+        if re.search(r"\b(?:hotspot|largest measured share|most measured time)\b", severity_context):
+            related_codes.add("HOTSPOT")
+        if re.search(r"\b(?:full scan|table scan|scan)\b", severity_context):
+            related_codes.update({"FULL_SCAN", "INNER_SCAN_IN_LOOP"})
+        if re.search(r"\b(?:temporary table|temporary storage)\b", severity_context):
+            related_codes.add("TEMP_TABLE")
+        if re.search(r"\b(?:sort|filesort)\b", severity_context):
+            related_codes.add("LARGE_SORT")
+        if not any(
+            isinstance(warning, dict)
+            and _trusted_warning_classification(warning)
+            and (not related_codes or str(warning.get("code") or warning.get("type") or "").upper() in related_codes)
+            and str(warning.get("severity") or "").casefold() == severity_claim.group(1)
+            for warning in warnings
+        ):
+            return True
+    if re.search(
+        r"\b(?:estimate mismatch|far more rows than (?:expected|estimated)|much more than (?:estimated|predicted)|"
+        r"row estimate is (?:wrong|inaccurate|off))\b",
+        text,
+        re.IGNORECASE,
+    ) and "ESTIMATE_MISMATCH" not in codes:
+        return True
+    if re.search(r"\b(?:hotspot|largest measured share|most measured time)\b", lowered) and "HOTSPOT" not in codes:
+        return True
+    categorical_problem = re.search(
+        r"\b(?:(?:full\s+)?table\s+scan|full\s+scan)\b.{0,80}\b(?:is|means|proves|makes|causes|always|automatically)\b.{0,40}"
+        r"\b(?:bad|slow|inefficient|wasteful|a problem|a performance problem|a bottleneck|poor performance)\b|"
+        r"\b(?:temporary table|temporary storage|sort(?:ing)?)\b.{0,80}\b(?:is|means|proves|causes|always|automatically)\b.{0,40}"
+        r"\b(?:bad|slow|inefficient|wasteful|a problem|a performance problem|a bottleneck|disk spill|disk writes)\b",
+        text,
+        re.IGNORECASE,
+    )
+    categorical_negation = re.search(
+        r"\b(?:full\s+)?(?:table\s+)?scan\b.{0,45}\bnot\b.{0,30}\b(?:always|automatically|inherently|slow|inefficient|bad|wasteful|a performance problem|a bottleneck)\b|"
+        r"\b(?:temporary table|temporary storage|sort(?:ing)?)\b.{0,45}\bnot\b.{0,30}\b(?:always|automatically|inherently|slow|inefficient|bad|wasteful|a performance problem|a bottleneck|disk spill|disk writes)\b",
+        text,
+        re.IGNORECASE,
+    )
+    if categorical_problem and not categorical_negation:
+        return True
+
+    observation_driven_change = re.search(
+        r"\b(?:avoid|eliminate|remove|replace|fix|optimi[sz]e)\b.{0,70}\b(?:(?:full\s+)?table\s+scan|full\s+scan)\b|"
+        r"\b(?:(?:full\s+)?table\s+scan|full\s+scan)\b.{0,70}\b(?:avoid|eliminate|remove|replace|fix|optimi[sz]e)\b|"
+        r"\b(?:avoid|eliminate|remove|replace|fix|optimi[sz]e)\b.{0,70}\b(?:temporary table|sort(?:ing)?)\b",
+        text,
+        re.IGNORECASE,
+    )
+    negated_change = re.search(
+        r"\b(?:do not|don't|never|not to)\b.{0,35}\b(?:avoid|eliminate|remove|replace|fix|optimi[sz]e)\b",
+        lowered,
+    )
+    if observation_driven_change and not negated_change:
+        repeated_scan_is_evidenced = (
+            "INNER_SCAN_IN_LOOP" in codes
+            and re.search(r"\b(?:inner|repeated|loop)\b", lowered)
+        )
+        measured_temp_hotspot = (
+            "TEMP_TABLE" in codes and "HOTSPOT" in codes
+            and _measured_temporary_table_hotspot(warnings, tree_summary)
+        )
+        if not (repeated_scan_is_evidenced or measured_temp_hotspot):
+            return True
+
+    operation_concern = re.search(
+        r"\b(?:full\s+scan|table\s+scan|scan|temporary table|temporary storage|sort|filesort|"
+        r"filter|join|nested loop)\b.{0,70}\b(?:slow|inefficient|wasteful|expensive|bad|bottleneck|"
+        r"performance problem|performance issue|too much work)\b|"
+        r"\b(?:slow|inefficient|wasteful|expensive|bad|bottleneck|performance problem|performance issue)\b.{0,70}"
+        r"\b(?:full\s+scan|table\s+scan|scan|temporary table|temporary storage|sort|filesort|filter|join|nested loop)\b",
+        text,
+        re.IGNORECASE,
+    )
+    if operation_concern:
+        concern_text = operation_concern.group(0).casefold()
+        relevant_codes = set()
+        if re.search(r"\b(?:scan|table scan|full scan)\b", concern_text):
+            relevant_codes.update({"INNER_SCAN_IN_LOOP"})
+        if re.search(r"\b(?:temporary table|temporary storage)\b", concern_text):
+            relevant_codes.update({"TEMP_TABLE", "HOTSPOT"})
+        if re.search(r"\b(?:sort|filesort)\b", concern_text):
+            relevant_codes.update({"LARGE_SORT", "HOTSPOT"})
+        if re.search(r"\bfilter\b", concern_text):
+            relevant_codes.update({"FILTER_DISCARDS_MOST", "ESTIMATE_MISMATCH"})
+        if re.search(r"\b(?:join|nested loop)\b", concern_text):
+            relevant_codes.update({"INNER_SCAN_IN_LOOP", "ESTIMATE_MISMATCH"})
+        relevant_investigation = any(
+            isinstance(warning, dict)
+            and str(warning.get("code") or warning.get("type") or "").upper() in relevant_codes
+            and _trusted_warning_classification(warning) == "investigate"
+            for warning in warnings
+        )
+        hedged = bool(re.search(r"\b(?:may|might|could|possible|possibly|if|only if|investigate|check)\b", lowered))
+        if not relevant_investigation or not hedged:
+            return True
+
+    assertive_performance = re.search(
+        r"\b(?:the query|this query|the plan|this operation|this step)\b.{0,55}"
+        r"\b(?:is slow|is inefficient|is a performance problem|has poor performance|is a bottleneck|needs optimization)\b|"
+        r"\b(?:will|does|always)\s+(?:make|cause)\s+(?:the query|performance)\s+(?:slow|worse)\b",
+        text,
+        re.IGNORECASE,
+    )
+    conditional_performance = bool(re.search(
+        r"\bif\b.{0,35}\b(?:query|plan|operation|step)\b.{0,25}\b(?:slow|inefficient|problem)\b",
+        text,
+        re.IGNORECASE,
+    ))
+    if assertive_performance and not conditional_performance:
+        # EXPLAIN ANALYZE warnings identify work to inspect; they do not establish
+        # that the whole query is slow without a target or comparable baseline.
+        return True
+
+    if re.search(r"\b(?:estimate mismatch|far more rows than (?:expected|estimated))\b", lowered):
+        return "ESTIMATE_MISMATCH" not in codes
+    if re.search(r"\b(?:repeated inner scan|inner scan in a loop|repeated scan)\b", lowered):
+        return "INNER_SCAN_IN_LOOP" not in codes
+    if re.search(r"\b(?:filter discarded most|filter kept (?:only )?a small share)\b", lowered):
+        return "FILTER_DISCARDS_MOST" not in codes
+    if re.search(r"\b(?:never executed|did not run|skipped this operation)\b", lowered):
+        return "NEVER_EXECUTED" not in codes and not any(
+            node.get("never_executed") for node in _plan_nodes(tree_summary)
+        )
+    if re.search(r"\b(?:dead end|no rows were produced|step returned no rows)\b", lowered):
+        return "DEAD_END" not in codes and not any(
+            node.get("dead_end") for node in _plan_nodes(tree_summary)
+        )
+    return False
+
+
+def _recommendation_has_warning_support(text: str, warnings: list[dict]) -> bool:
+    if not re.search(
+        r"\b(?:check|inspect|review|verify|consider|add|create|rewrite|change|remove|optimi[sz]e|"
+        r"avoid|use|run|update|analy[sz]e|compare|investigate|enable|disable)\b",
+        text,
+        re.IGNORECASE,
+    ):
+        return True
+
+    codes = _warning_evidence_codes(warnings)
+    lowered = text.casefold()
+    expected_codes = None
+    if re.search(r"\b(?:statistic|cardinality|estimate|estimated rows|row estimate)\b", lowered):
+        expected_codes = {"ESTIMATE_MISMATCH"}
+    elif re.search(r"\bindex(?:es)?\b", lowered):
+        expected_codes = {"FILTER_DISCARDS_MOST", "INNER_SCAN_IN_LOOP", "FULL_SCAN"}
+    elif re.search(r"\b(?:group by|temporary table|temporary storage)\b", lowered):
+        expected_codes = {"TEMP_TABLE", "HOTSPOT"}
+    elif re.search(r"\b(?:sort|filesort|ordering)\b", lowered):
+        expected_codes = {"LARGE_SORT", "HOTSPOT"}
+    elif re.search(r"\b(?:inner scan|repeated scan|nested loop)\b", lowered):
+        expected_codes = {"INNER_SCAN_IN_LOOP"}
+    elif re.search(r"\b(?:filter|selective predicate)\b", lowered):
+        expected_codes = {"FILTER_DISCARDS_MOST", "ESTIMATE_MISMATCH"}
+    elif re.search(r"\b(?:table scan|full scan)\b", lowered):
+        expected_codes = {"FULL_SCAN", "INNER_SCAN_IN_LOOP"}
+    elif re.search(r"\b(?:dead end|never executed|no rows|empty result)\b", lowered):
+        expected_codes = {"DEAD_END", "NEVER_EXECUTED"}
+    else:
+        expected_codes = {
+            code for code in codes
+            if _AI_WARNING_CLASSIFICATION.get(code) == "investigate"
+        }
+    if not expected_codes or not (expected_codes & codes):
+        return False
+
+    active_support = any(
+        isinstance(warning, dict)
+        and str(warning.get("code") or warning.get("type") or "").upper() in expected_codes
+        and _trusted_warning_classification(warning) == "investigate"
+        and str(warning.get("severity") or "").casefold() in {"high", "medium", "low"}
+        for warning in warnings
+    )
+    if not active_support and not re.search(
+        r"\b(?:if|only if|when|unless|may|might|could|consider checking)\b",
+        lowered,
+    ):
+        return False
+    return True
+
+
 def _measured_temporary_table_hotspot(warnings: list[dict], tree_summary: dict | None) -> bool:
     if not isinstance(tree_summary, dict):
         return False
+    warnings = _server_generated_warnings(tree_summary)
     temporary_ids = set()
     stack = [tree_summary]
     while stack:
@@ -1483,74 +2210,332 @@ def _measured_temporary_table_hotspot(warnings: list[dict], tree_summary: dict |
     hotspot_ids = {
         str(warning.get("node_id"))
         for warning in warnings
-        if isinstance(warning, dict) and (warning.get("code") or warning.get("type")) == "HOTSPOT"
+        if isinstance(warning, dict)
+        and (warning.get("code") or warning.get("type")) == "HOTSPOT"
+        and _trusted_warning_classification(warning) == "investigate"
+        and str(warning.get("severity") or "").casefold() in {"high", "medium", "low"}
     }
     return bool(temporary_ids & hotspot_ids)
 
 
-def _unsupported_metric_claim(text: str, tree_summary: dict | None) -> bool:
-    estimated_rows = set()
-    actual_rows_per_loop = set()
-    actual_rows_total = set()
-    loops = set()
-    times = set()
-    self_times = set()
-    percentages = set()
-    stack = [tree_summary] if isinstance(tree_summary, dict) else []
-    fields = (
-        ("estimated_rows", estimated_rows), ("actual_rows", actual_rows_per_loop),
-        ("rows_total", actual_rows_total),
-        ("loops", loops), ("time_first_ms", times), ("time_last_ms", times),
-        ("time_total_ms", times), ("self_time_ms", self_times), ("self_time_pct", percentages),
-    )
-    while stack:
-        node = stack.pop()
-        if not isinstance(node, dict):
-            continue
-        for field, values in fields:
-            value = _plan_number(node, field)
-            if value is not None:
-                values.add(float(value))
-        children = node.get("children")
-        if isinstance(children, list):
-            stack.extend(children)
+_METRIC_NUMBER = re.compile(
+    r"(?<![\w.])(?P<value>[+-]?\d[\d,]*(?:\.\d+)?(?:[eE][+-]?\d+)?)"
+    r"\s*(?P<unit>milliseconds?|ms|seconds?|secs?|s|rows?|records?|tuples?|loops?|times?|percent|%)?(?![A-Za-z])",
+    re.IGNORECASE,
+)
 
-    pattern = re.compile(
-        r"(?P<value>\d[\d,]*(?:\.\d+)?)\s*(?P<unit>milliseconds?|ms|seconds?|secs?|s|rows?|loops?|times?|percent|%)"
-        r"(?![A-Za-z])",
-        re.IGNORECASE,
-    )
-    for match in pattern.finditer(text):
-        try:
-            value = float(match.group("value").replace(",", ""))
-        except ValueError:
-            return True
-        unit = match.group("unit").casefold()
-        if unit in {"row", "rows"}:
-            prefix = text[max(0, match.start() - 60):match.start()].casefold()
-            suffix = text[match.end():match.end() + 60].casefold()
-            if any(word in prefix for word in ("estimate", "estimated", "predict", "predicted")):
-                allowed = estimated_rows
-            elif "per loop" in suffix or "per-loop" in suffix:
-                allowed = actual_rows_per_loop
-            elif "across loops" in suffix or "total" in prefix:
-                allowed = actual_rows_total
-            else:
-                allowed = actual_rows_total
-        elif unit in {"loop", "loops"}:
-            allowed = loops
-        elif unit in {"time", "times"}:
-            allowed = set()
-        elif unit in {"ms", "millisecond", "milliseconds"}:
-            prefix = text[max(0, match.start() - 40):match.start()].casefold()
-            allowed = self_times if "self" in prefix else times
-        elif unit in {"s", "sec", "secs", "second", "seconds"}:
-            value *= 1000
-            prefix = text[max(0, match.start() - 40):match.start()].casefold()
-            allowed = self_times if "self" in prefix else times
+
+def _metric_sentence(text: str, position: int) -> tuple[str, int]:
+    start = 0
+    for match in re.finditer(r"(?<=[.!?])\s+|[;\n]", text[:position]):
+        start = match.end()
+    end_match = re.search(r"[.!?](?=\s|$)|[;\n]", text[position:])
+    end = position + end_match.start() if end_match else len(text)
+    return text[start:end], start
+
+
+def _metric_claim_context(sentence: str, value_start: int, value_end: int) -> tuple[str, int]:
+    """Return the local clause around one value, excluding neighboring claims."""
+    start = 0
+    end = len(sentence)
+    for boundary in re.finditer(r",|;|\b(?:and|but|while|then)\b", sentence, re.IGNORECASE):
+        if boundary.start() < value_end and boundary.end() > value_start:
+            continue
+        if boundary.end() <= value_start:
+            start = boundary.end()
+        elif boundary.start() >= value_end:
+            end = boundary.start()
+            break
+    return sentence[start:end], start
+
+
+def _metric_kind(unit: str, sentence: str, value_start: int, value_end: int) -> str | None:
+    before = sentence[:max(0, value_start)].casefold().replace("_", " ")
+    after = sentence[value_end:].casefold().replace("_", " ")
+    context = f"{before} {after}"
+    time_units = {"ms", "millisecond", "milliseconds", "s", "sec", "secs", "second", "seconds"}
+    if unit in {"percent", "%"} or (not unit and re.search(r"\b(?:percent(?:age)?|share|%)\b", context)):
+        return "self_time_pct" if re.search(r"\bself\s+time\b|\bself[- ]time\s+share\b", context) else None
+    if unit in time_units or (not unit and re.search(r"\btime\b", context)):
+        if re.search(r"\bself\s+time\b|\bself[- ]time\b", before):
+            return "self_time_ms"
+        if re.search(r"\b(first[- ]row|time\s+to\s+first\s+row|first\s+row\s+time)\b", context):
+            return "time_first_ms"
+        if re.search(r"\b(last[- ]row|time\s+to\s+(?:last|all)\s+rows?|(?:last|all)\s+rows?\s+time)\b", context):
+            return "time_last_ms"
+        if re.search(r"\binclusive\b|\b(?:total|overall|execution|elapsed)\s+(?:execution\s+)?time\b|\btime\s+(?:total|overall|elapsed)\b", context):
+            return "time_total_ms"
+        return None
+    if unit in {"row", "rows", "record", "records", "tuple", "tuples"} or (
+        not unit and re.search(r"\b(?:rows?|records?|tuples?)\b", context)
+    ):
+        row_markers = list(re.finditer(
+            r"\b(estimated?|predicted?|expected|actual|measured|returned|produced|total(?:ed|ing)?|overall|across\s+loops?)\b",
+            before,
+        ))
+        recent = row_markers[-1].group(1) if row_markers else ""
+        if recent.startswith(("estimate", "predict", "expect")) or (
+            not recent and re.search(r"\b(?:estimated|predicted|expected)\b.{0,25}\b(?:rows?|records?|tuples?)\b", context)
+        ):
+            return "estimated_rows"
+        if re.search(r"\bper[- ]loop\b", context):
+            return "actual_rows_per_loop"
+        return "actual_rows_total"
+    if unit in {"loop", "loops"} or (not unit and re.search(r"\bloops?\b", context)):
+        return "loops"
+    if unit in {"time", "times"}:
+        return "loops" if re.search(r"\b(?:loop|executed|repeated)\b", context) else None
+    return None
+
+
+def _nearest_metric_node_matches(
+    matches: list[tuple[int, int, int]], position: int
+) -> list[int]:
+    preceding = [match for match in matches if match[1] <= position]
+    if preceding:
+        nearest_end = max(match[1] for match in preceding)
+        return sorted({index for start, end, index in preceding if end == nearest_end})
+    following = [match for match in matches if match[0] >= position]
+    if following:
+        nearest_start = min(match[0] for match in following)
+        return sorted({index for start, end, index in following if start == nearest_start})
+    return []
+
+
+def _node_metric_targets(
+    sentence: str,
+    nodes: list[dict[str, Any]],
+    position: int | None = None,
+    claim_context: tuple[str, int] | None = None,
+) -> list[int]:
+    if not nodes:
+        return []
+    if position is None:
+        position = len(sentence)
+    if claim_context is None:
+        claim_context = _metric_claim_context(sentence, position, position)
+    local_text, local_start = claim_context
+    scopes = [(local_text, position - local_start), (sentence, position)]
+
+    def explicit_reference_matches(text: str) -> list[tuple[int, int, int | None]]:
+        known_refs = {
+            str(node.get("node_ref") or "").casefold(): index
+            for index, node in enumerate(nodes)
+            if node.get("node_ref")
+        }
+        return [
+            (match.start(), match.end(), known_refs.get(match.group(0).casefold()))
+            for match in re.finditer(r"\bplan_node_\d+\b", text, re.IGNORECASE)
+        ]
+
+    def nearest_explicit_reference(
+        matches: list[tuple[int, int, int | None]], text_position: int
+    ) -> list[int] | None:
+        if not matches:
+            return None
+        preceding = [match for match in matches if match[1] <= text_position]
+        if preceding:
+            nearest_end = max(match[1] for match in preceding)
+            nearest = [match for match in preceding if match[1] == nearest_end]
         else:
-            allowed = percentages
-        if not any(abs(value - known) <= max(0.02, abs(known) * 0.001) for known in allowed):
+            following = [match for match in matches if match[0] >= text_position]
+            if not following:
+                return []
+            nearest_start = min(match[0] for match in following)
+            nearest = [match for match in following if match[0] == nearest_start]
+        if any(index is None for _start, _end, index in nearest):
+            return []
+        return sorted({index for _start, _end, index in nearest if index is not None})
+
+    def natural_node_matches(
+        text: str,
+    ) -> tuple[list[int], list[tuple[int, int, int]], bool]:
+        operator_nodes: set[int] = set()
+        table_nodes: set[int] = set()
+        occurrences: list[tuple[int, int, int]] = []
+        for index, node in enumerate(nodes):
+            operator = str(node.get("operator") or "").strip()
+            table = str(node.get("table") or "").strip()
+            operator_aliases = [operator]
+            for prefix in ("single-row ", "covering "):
+                if operator.casefold().startswith(prefix):
+                    operator_aliases.append(operator[len(prefix):])
+            if "aggregate" in operator.casefold():
+                operator_aliases.extend(("aggregate", "aggregation"))
+            if "index lookup" in operator.casefold():
+                operator_aliases.append("index lookup")
+            if "index scan" in operator.casefold():
+                operator_aliases.append("index scan")
+            if "nested loop" in operator.casefold():
+                if "inner join" in operator.casefold():
+                    operator_aliases.append("inner join")
+                elif "left join" in operator.casefold():
+                    operator_aliases.append("left join")
+            for alias in dict.fromkeys(alias for alias in operator_aliases if alias):
+                for match in re.finditer(
+                    rf"(?<!\w){re.escape(alias)}(?!\w)", text, re.IGNORECASE
+                ):
+                    operator_nodes.add(index)
+                    occurrences.append((match.start(), match.end(), index))
+            if table:
+                for match in re.finditer(
+                    rf"(?<![\w$]){re.escape(table)}(?![\w$])", text, re.IGNORECASE
+                ):
+                    table_nodes.add(index)
+                    occurrences.append((match.start(), match.end(), index))
+
+        if operator_nodes:
+            targets = sorted(operator_nodes & table_nodes) if table_nodes else sorted(operator_nodes)
+        elif table_nodes:
+            targets = sorted(table_nodes)
+        else:
+            targets = []
+        return targets, occurrences, bool(operator_nodes or table_nodes)
+
+    for scope, scope_position in scopes:
+        explicit = nearest_explicit_reference(explicit_reference_matches(scope), scope_position)
+        if explicit is not None:
+            return explicit
+        targets, occurrences, has_natural_reference = natural_node_matches(scope)
+        if targets:
+            scoped_occurrences = [item for item in occurrences if item[2] in targets]
+            nearest = _nearest_metric_node_matches(scoped_occurrences, scope_position)
+            return nearest or targets
+        if has_natural_reference:
+            return []
+        if re.search(
+            r"\b(?:table\s+scan|index\s+(?:scan|lookup|range)|scan|lookup|filter|sort|aggregate|aggregation|"
+            r"nested\s+loop|join|materiali[sz]e|filesort|temporary\s+table|window|limit)\b|"
+            r"\b[\w$]+\s+table\b",
+            scope,
+            re.IGNORECASE,
+        ):
+            # A node-like reference that is absent from the plan must not fall
+            # through to the root node and inherit its coincidentally equal value.
+            return []
+
+    # An unqualified plan-wide metric refers to the root operation. A named but
+    # unmatched node is rejected above instead of borrowing the root's metrics.
+    return [0]
+
+
+def _reported_number_matches(value: Decimal, known_value: int | float) -> bool:
+    try:
+        known = Decimal(str(known_value))
+        quantum = Decimal(1).scaleb(value.as_tuple().exponent)
+        return known.quantize(quantum, rounding=ROUND_HALF_UP) == value
+    except (InvalidOperation, ValueError):
+        return False
+
+
+def _unsupported_metric_claim(text: str, tree_summary: dict | None) -> bool:
+    nodes = []
+    for node in _plan_nodes(tree_summary):
+        details = str(node.get("details") or "")
+        table_match = re.search(r"\bon\s+(?:`?[\w$]+`?\.)?`?([\w$]+)`?", details, re.IGNORECASE)
+        if not table_match:
+            table_match = re.search(r"\b([\w$]+)\.[\w$]+\b", details)
+        nodes.append({
+            "node_ref": f"plan_node_{len(nodes) + 1}",
+            "operator": str(node.get("operator") or ""),
+            "details": details,
+            "table": table_match.group(1) if table_match else "",
+            "source": node,
+        })
+
+    for match in _METRIC_NUMBER.finditer(text):
+        unit = (match.group("unit") or "").casefold()
+        sentence, sentence_start = _metric_sentence(text, match.start())
+        # Ignore ordinary SQL constants and identifiers; validate numbers only
+        # when a plan metric is explicitly named near the value.
+        sentence_value_start = match.start() - sentence_start
+        sentence_value_end = match.end() - sentence_start
+        claim_context, claim_start = _metric_claim_context(
+            sentence, sentence_value_start, sentence_value_end
+        )
+        claim_value_start = sentence_value_start - claim_start
+        claim_value_end = sentence_value_end - claim_start
+        prefix = claim_context[:claim_value_start].casefold()
+        suffix = claim_context[claim_value_end:].casefold()
+        metric_prefix = re.search(
+            r"\b(?:(?:estimated|estimate|predicted|expected|actual|measured|total|overall)\s+)?"
+            r"(?:rows?|records?|tuples?)(?:\s+count)?(?:\s+per[- ]loop)?\s*(?:is|are|was|were|of|=|:)?\s*$|"
+            r"\b(?:loops?|loop count|executions?)\s*(?:is|are|was|were|of|=|:)?\s*$|"
+            r"\b(?:first[- ]row|last[- ]row|inclusive|self)\s+(?:execution\s+)?time\s*(?:is|was|=|:)?\s*$|"
+            r"\bself\s+time\s+(?:percentage|percent|share)\s*(?:is|was|=|:)?\s*$|"
+            r"\btime\s+to\s+(?:first|last|all)\s+rows?\s*(?:is|was|=|:)?\s*$|"
+            r"\b(?:total|overall|execution|elapsed)\s+(?:execution\s+)?time\s*(?:is|was|=|:)?\s*$|"
+            r"\b(?:estimated|estimate|optimizer)\s+cost\s*(?:is|was|=|:)?\s*$|"
+            r"\b(?:estimated|estimate|predicted|expected|actual|measured)\s*$",
+            prefix,
+        )
+        metric_suffix = re.match(
+            r"\s*(?:estimated|predicted|expected|actual|measured|total)\s+(?:rows?|records?|tuples?)\b|"
+            r"\s*(?:per[- ]loop|across\s+loops?)\b",
+            suffix,
+        )
+        metric_cue = bool(unit or metric_prefix or metric_suffix)
+        if not metric_cue:
+            continue
+        kind = _metric_kind(
+            unit,
+            claim_context,
+            claim_value_start,
+            claim_value_end,
+        )
+        if kind is None:
+            return True
+        try:
+            raw_value = match.group("value")
+            unsigned = raw_value.lstrip("+-")
+            if "," in unsigned and not re.fullmatch(
+                r"\d{1,3}(?:,\d{3})+(?:\.\d+)?(?:[eE][+-]?\d+)?", unsigned
+            ):
+                return True
+            value = Decimal(raw_value.replace(",", ""))
+        except InvalidOperation:
+            return True
+        if unit in {"s", "sec", "secs", "second", "seconds"}:
+            value *= Decimal(1000)
+        targets = _node_metric_targets(
+            sentence,
+            nodes,
+            sentence_value_start,
+            (claim_context, claim_start),
+        )
+        if re.search(r"\binput\s+rows?\b", sentence, re.IGNORECASE):
+            child_targets = []
+            for index in targets:
+                children = nodes[index]["source"].get("children")
+                if isinstance(children, list):
+                    for child in children:
+                        child_index = next(
+                            (i for i, item in enumerate(nodes) if item["source"] is child), None
+                        )
+                        if child_index is not None:
+                            child_targets.append(child_index)
+            if child_targets:
+                targets = child_targets
+        if not targets:
+            return True
+        supported = []
+        for index in targets:
+            field = {
+                "estimated_rows": "estimated_rows",
+                "actual_rows_per_loop": "actual_rows",
+                "actual_rows_total": "rows_total",
+                "loops": "loops",
+                "time_first_ms": "time_first_ms",
+                "time_last_ms": "time_last_ms",
+                "time_total_ms": "time_total_ms",
+                "self_time_ms": "self_time_ms",
+                "self_time_pct": "self_time_pct",
+            }[kind]
+            known = _plan_number(nodes[index]["source"], field)
+            supported.append(known is not None and _reported_number_matches(value, known))
+        # Ambiguous operation names are accepted only when every matching node
+        # independently supports the number and the metric being claimed.
+        if not supported or not all(supported):
             return True
     return False
 
@@ -1629,6 +2614,8 @@ def _normalise_ai_response(
             continue
         if _unsupported_plan_claim(suggestion, warnings, tree_summary):
             continue
+        if _unsupported_warning_claim(suggestion, warnings, tree_summary):
+            continue
         if _direct_index_recommendation(suggestion):
             if not candidate_warning:
                 continue
@@ -1641,6 +2628,8 @@ def _normalise_ai_response(
                 "Why it might help: the temporary-table step is also the plan's measured hotspot. "
                 "When it is worth doing: only if the query is slow; changing grouping columns can change the result."
             )
+        if not _recommendation_has_warning_support(suggestion, warnings):
+            continue
         key = suggestion.casefold()
         if key not in seen:
             seen.add(key)
@@ -1655,18 +2644,20 @@ def _normalise_ai_response(
         not finding
         or _unsupported_metric_claim(finding, tree_summary)
         or _unsupported_plan_claim(finding, warnings, tree_summary)
+        or _unsupported_warning_claim(finding, warnings, tree_summary)
     ):
         finding = _fallback_finding(warnings)
     learning_point = (result.get("learning_point") or "").strip()
     if _unsupported_metric_claim(learning_point, tree_summary) or _unsupported_plan_claim(
         learning_point, warnings, tree_summary
-    ):
+    ) or _unsupported_warning_claim(learning_point, warnings, tree_summary):
         learning_point = ""
     summary = result["summary"].strip()
     if (
         not summary
         or _unsupported_metric_claim(summary, tree_summary)
         or _unsupported_plan_claim(summary, warnings, tree_summary)
+        or _unsupported_warning_claim(summary, warnings, tree_summary)
     ):
         summary = _query_summary(query, tree_summary)
     proposed_rewrite = result.get("suggested_query")
@@ -1674,18 +2665,15 @@ def _normalise_ai_response(
         proposed_rewrite = {"sql": result["fix"]}
     if not isinstance(proposed_rewrite, dict):
         proposed_rewrite = safe_candidate
-    trusted_sql = safe_candidate.get("sql") if isinstance(safe_candidate, dict) else None
     if (
         isinstance(proposed_rewrite, dict)
         and proposed_rewrite.get("sql")
-        and trusted_sql
-        and _sql_token_signature(str(proposed_rewrite["sql"])) != _sql_token_signature(trusted_sql)
         and _unmatched_table_references(
             str(proposed_rewrite.get("sql") or ""), query,
             {str(node.get("table") or "").casefold() for node in _compact_tree(tree_summary)[0]},
         )
     ):
-        print("WARNING: AI suggested an unrecognized table reference; the rewrite was omitted.")
+        print("WARNING: AI hallucinated a table name or suggested an unrecognized table reference; rewrite omitted.")
     suggested_query = _validated_suggested_query(
         proposed_rewrite,
         safe_candidate,
@@ -1744,9 +2732,12 @@ def get_ai_explanation(
     schema_info: dict | None = None,
 ) -> dict[str, Any]:
     """Return validated Gemini insights via REST, or safe rule-based fallback."""
+    warnings = _server_generated_warnings(tree_summary)
     api_key = os.getenv("GEMINI_API_KEY", "").strip()
     if not api_key:
-        return _fallback_result(query, warnings, tree_summary, error, api_key, "API key missing")
+        return _fallback_result(
+            query, warnings, tree_summary, error, api_key, "API key missing", schema_info
+        )
 
     safe_schema_info = _sanitise_schema_info(schema_info)
     key = _cache_key(query, warnings, error, tree_summary, safe_schema_info)
@@ -1760,8 +2751,14 @@ def get_ai_explanation(
             "ai_status": "success",
         }
 
-    nodes, dead_ends = _compact_tree(tree_summary)
-    safe_candidate = None if error else _safe_distinct_star_rewrite(query, warnings, tree_summary)
+    nodes, dead_ends, nodes_truncated = _compact_tree(tree_summary)
+    node_details_truncated = any(node.get("details_truncated") for node in nodes)
+    node_fields_truncated = any(node.get("node_fields_truncated") for node in nodes)
+    warnings_truncated = len(warnings) > 20
+    warning_fields_truncated = False
+    safe_candidate = _safe_offline_rewrite(
+        query, warnings, tree_summary, error=error, schema_info=safe_schema_info
+    )
     plan_tables = {str(node["table"]).casefold() for node in nodes if node.get("table")}
     query_context = _query_reference_context(query)
     observed_indexes = []
@@ -1782,21 +2779,76 @@ def get_ai_explanation(
         for item in warnings[:20]
         if isinstance(item, dict) and (item.get("code") or item.get("type"))
     ))
-    warning_context = [
-        {
+    warning_context = []
+    warning_fields = ("code", "classification", "severity", "title", "message", "evidence", "suggestion")
+    for item in warnings[:20]:
+        if not isinstance(item, dict):
+            continue
+        clipped_fields = [
+            field for field in warning_fields
+            if item.get(field) is not None and _was_clipped(item.get(field))
+        ]
+        warning_fields_truncated = warning_fields_truncated or bool(clipped_fields)
+        context_item = {
             field: _clip(item.get(field))
-            for field in ("code", "classification", "severity", "title", "message", "evidence", "suggestion")
+            for field in warning_fields
             if item.get(field) is not None
         }
-        for item in warnings[:20]
-        if isinstance(item, dict)
-    ]
+        context_item["fields_truncated"] = clipped_fields
+        context_item["complete"] = not clipped_fields
+        warning_context.append(context_item)
+
+    query_truncated = len(str(query)) > 5000
+    database_error_truncated = isinstance(error, dict) and any(
+        _was_clipped(error.get(field)) for field in ("code", "message")
+    )
+    schema_fields_truncated = safe_schema_info["schema_header_truncated"] or any(
+        table["table_reference_truncated"]
+        or table["columns_truncated"]
+        or table["index_fields_truncated"]
+        for table in safe_schema_info["tables"]
+    )
+    schema_tables_truncated = bool(safe_schema_info["tables_truncated"])
+    schema_indexes_truncated = bool(safe_schema_info["indexes_truncated"])
+    evidence_limitations = []
+    if nodes_truncated:
+        evidence_limitations.append("the execution-plan node list was limited")
+    if node_details_truncated:
+        evidence_limitations.append("one or more execution-plan node details were clipped")
+    if warnings_truncated:
+        evidence_limitations.append("the warning list was limited")
+    if warning_fields_truncated:
+        evidence_limitations.append("one or more warning fields were clipped")
+    if schema_tables_truncated:
+        evidence_limitations.append("the schema table list was limited")
+    if schema_fields_truncated:
+        evidence_limitations.append("one or more schema header, table, column, or index fields were omitted or clipped")
+    if schema_indexes_truncated:
+        evidence_limitations.append("one or more schema index lists were limited")
+    if query_truncated:
+        evidence_limitations.append("the SQL text was clipped")
+    if database_error_truncated:
+        evidence_limitations.append("one or more database error fields were clipped")
+    evidence_complete = not evidence_limitations
+    evidence_notice = ""
+    if evidence_limitations:
+        evidence_notice = (
+            "The supplied evidence is partial because "
+            + "; ".join(evidence_limitations)
+            + ". Omitted evidence may change the interpretation. Treat affected evidence as incomplete, "
+            "do not infer that omitted items do not exist, and do not describe the supplied evidence as complete."
+        )
     payload = {
         "sql": str(query)[:5000],
+        "query_truncated": query_truncated,
         "parsed_plan": {
             "nodes": nodes,
             "dead_end_nodes": dead_ends,
             "total_elapsed_ms": _plan_number(tree_summary or {}, "time_total_ms"),
+            "nodes_truncated": nodes_truncated,
+            "node_details_truncated": node_details_truncated,
+            "node_fields_truncated": node_fields_truncated,
+            "complete": not nodes_truncated and not node_fields_truncated,
         },
         "schema_info": {
             **safe_schema_info,
@@ -1804,10 +2856,15 @@ def get_ai_explanation(
             "references_in_query": sorted(query_context["references"]),
             "tables_seen_in_plan": sorted(plan_tables),
             "indexes_observed_in_plan": observed_indexes,
-            "complete_index_catalog_available": bool(safe_schema_info["tables"])
-            and all(table["index_catalog_available"] for table in safe_schema_info["tables"]),
+            "complete_index_catalog_available": safe_schema_info["complete_index_catalog_available"],
         },
         "warnings": warning_context,
+        "warnings_truncated": warnings_truncated,
+        "warning_fields_truncated": warning_fields_truncated,
+        "warnings_complete": not warnings_truncated and not warning_fields_truncated,
+        "database_error_truncated": database_error_truncated,
+        "evidence_complete": evidence_complete,
+        "evidence_notice": evidence_notice,
         "rule_flags": rule_flags,
         "eligible_rewrite_candidate": safe_candidate,
         "database_error": {
@@ -1828,14 +2885,12 @@ def get_ai_explanation(
         "category must be measured_optimization only when supplied plan evidence identifies the measured work being "
         "removed; otherwise use alternative_formulation. performance_expectation must say measured, expected, or unknown, "
         "and must not call a candidate measured unless comparative measurements for that candidate are supplied. "
-        "Evaluate possible equivalent forms including correlated AVG subqueries versus partitioned window functions, "
-        "subqueries versus joins, redundant DISTINCT, nested SELECTs, repeated calculations, CTEs versus derived tables, "
-        "EXISTS versus IN only when NULL semantics are preserved, redundant expressions, and safe filter/projection changes. "
-        "These are candidates to assess, not transformations to force. Return complete executable SQL only when the result "
-        "equivalence is established by the query and supplied evidence. If equivalence is uncertain, omit it. Do not remove "
-        "conditions, change join types, grouping, projection, or NULL behavior without proving equivalence. Keep every base "
-        "table and input column grounded in the supplied SQL and catalog. Never put index DDL in suggested_query; discuss "
-        "index checks separately. The server independently validates SQL and only accepts deterministic, proven rewrite "
+        "A suggested SQL rewrite is allowed only when its SQL exactly matches eligible_rewrite_candidate, which the server "
+        "constructed from a deterministic safe rewrite family: removing DISTINCT from a single-table SELECT * with primary-key "
+        "evidence, rewriting one supported same-table correlated AVG as a window expression, or removing a constant TRUE or "
+        "proven redundant numeric predicate. Never invent another rewrite family or claim equivalence based on your own reasoning. "
+        "If eligible_rewrite_candidate is null, return suggested_query null. Keep every table and column grounded in the query "
+        "and catalog. Never put index DDL in suggested_query; discuss index checks separately. The server independently validates SQL and only accepts "
         "candidates. For each suggestion, state what to check or change, why "
         "it may help, and when it is worth doing. If no optimization is justified, use exactly this "
         f"suggestion: {_NO_CHANGE!r}.\n"
@@ -1843,6 +2898,10 @@ def get_ai_explanation(
         "operations without implying a problem; worth-investigating findings are possible concerns only; "
         "action recommended is reserved for a specific change proved by the available evidence. Do not "
         "force a change because a warning exists.\n"
+        "Each parsed_plan node has a node_ref. When making a numerical claim about a particular operation, identify its "
+        "operation/table or node_ref so its metrics cannot be confused with another node. Use estimated rows, actual rows per loop, "
+        "actual rows across loops, first-row time, last-row time per loop, inclusive execution time, and self time only for their "
+        "matching labels. Do not call an unqualified time value inclusive, self, first-row, or last-row time. "
         "Ground every statement in the query, plan, warnings, or schema information provided. Do not "
         "invent tables, columns, indexes, row counts, estimates, loops, or timings. Distinguish estimated "
         "rows from actual rows per loop; total actual rows are approximately rows per loop multiplied by "
@@ -1854,7 +2913,9 @@ def get_ai_explanation(
         "Do not recommend changing GROUP BY keys without a specific "
         "supported problem.\n"
         "Index catalog completeness is stated in schema_info. Use only indexes listed there or observed in "
-        "the plan. Never claim an index is absent or recommend creating one if the catalog is incomplete. Never recommend creating an "
+        "the plan. Treat schema_complete, tables_complete, each table's columns_complete and indexes_complete, and "
+        "complete_index_catalog_available as authoritative; false means the relevant catalog evidence is partial. "
+        "Never claim an index is absent or recommend creating one if the catalog is incomplete. Never recommend creating an "
         "index without checking selectivity, existing indexes, and plan evidence. If a filter or join appears "
         "selective and the query may be slow, suggest checking whether an existing index covers it; only "
         "consider a new index after confirming the full index list and predicate selectivity. Mention "
@@ -1862,7 +2923,12 @@ def get_ai_explanation(
         "primary-key column already used by the plan. If evidence is insufficient, state that clearly.\n"
         "A suggested SQL statement is never executed here. Clearly say when result equivalence or expected "
         "benefit is uncertain, and avoid promising a speedup without comparable measurements.\n"
-        "Only claim an index is absent when the full index catalog is available.\n"
+        "Only claim an index is absent when the full index catalog is available. "
+        "If evidence_notice is non-empty, treat all evidence as partial. Never infer that omitted nodes or warnings do not exist, "
+        "and never call the supplied plan or warning list complete.\n"
+        "Treat parsed_plan, warning, and schema completeness flags as authoritative. If node details or warning fields are clipped, "
+        "do not make precise claims that depend on the missing text. If schema table or index lists are truncated, "
+        "complete_index_catalog_available must be false and you must not claim an index is absent.\n"
         "DATA:\n"
         + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     )
@@ -1874,6 +2940,7 @@ def get_ai_explanation(
             error,
             api_key,
             "request data contained a credential",
+            schema_info,
         )
 
     try:
@@ -1904,7 +2971,7 @@ def get_ai_explanation(
             break
 
         if response is None:
-            return _fallback_result(query, warnings, tree_summary, error, api_key, "Gemini request failed")
+            return _fallback_result(query, warnings, tree_summary, error, api_key, "Gemini request failed", schema_info)
         status_code = int(response.status_code)
         if status_code < 200 or status_code >= 300:
             if status_code == 429:
@@ -1915,30 +2982,30 @@ def get_ai_explanation(
                 reason = "Gemini authentication failed"
             else:
                 reason = f"Gemini HTTP {status_code}"
-            return _fallback_result(query, warnings, tree_summary, error, api_key, reason)
+            return _fallback_result(query, warnings, tree_summary, error, api_key, reason, schema_info)
 
         response_data = response.json()
         if not isinstance(response_data, dict):
             raise ValueError("invalid Gemini response")
         prompt_feedback = response_data.get("promptFeedback") or {}
         if isinstance(prompt_feedback, dict) and prompt_feedback.get("blockReason"):
-            return _fallback_result(query, warnings, tree_summary, error, api_key, "Gemini blocked the prompt")
+            return _fallback_result(query, warnings, tree_summary, error, api_key, "Gemini blocked the prompt", schema_info)
         candidates = response_data.get("candidates")
         if not isinstance(candidates, list) or not candidates:
-            return _fallback_result(query, warnings, tree_summary, error, api_key, "Gemini returned no candidates")
+            return _fallback_result(query, warnings, tree_summary, error, api_key, "Gemini returned no candidates", schema_info)
         candidate = candidates[0]
         if not isinstance(candidate, dict) or candidate.get("finishReason") != "STOP":
-            return _fallback_result(query, warnings, tree_summary, error, api_key, "Gemini response incomplete")
+            return _fallback_result(query, warnings, tree_summary, error, api_key, "Gemini response incomplete", schema_info)
         content = candidate.get("content") or {}
         parts = content.get("parts") if isinstance(content, dict) else None
         if not isinstance(parts, list) or not parts or not isinstance(parts[0], dict):
-            return _fallback_result(query, warnings, tree_summary, error, api_key, "Gemini returned no text")
+            return _fallback_result(query, warnings, tree_summary, error, api_key, "Gemini returned no text", schema_info)
         generated_text = parts[0].get("text")
         if not isinstance(generated_text, str) or (api_key and api_key in generated_text):
-            return _fallback_result(query, warnings, tree_summary, error, api_key, "invalid Gemini response")
+            return _fallback_result(query, warnings, tree_summary, error, api_key, "invalid Gemini response", schema_info)
         result = _response_json(generated_text)
         if api_key and api_key in json.dumps(result, ensure_ascii=False):
-            return _fallback_result(query, warnings, tree_summary, error, api_key, "invalid Gemini response")
+            return _fallback_result(query, warnings, tree_summary, error, api_key, "invalid Gemini response", schema_info)
         result = _normalise_ai_response(
             result, query, warnings, tree_summary, safe_candidate, api_key,
             schema_info=schema_info, error=error,
@@ -1953,17 +3020,18 @@ def get_ai_explanation(
             error,
             api_key,
             "Gemini API timed out. Using offline fallback.",
+            schema_info,
         )
     except requests.exceptions.ConnectionError:
-        return _fallback_result(query, warnings, tree_summary, error, api_key, "network blocked")
+        return _fallback_result(query, warnings, tree_summary, error, api_key, "network blocked", schema_info)
     except requests.exceptions.RequestException:
-        return _fallback_result(query, warnings, tree_summary, error, api_key, "Gemini request failed")
+        return _fallback_result(query, warnings, tree_summary, error, api_key, "Gemini request failed", schema_info)
     except (ValueError, TypeError, KeyError, AttributeError):
-        return _fallback_result(query, warnings, tree_summary, error, api_key, "invalid Gemini response")
+        return _fallback_result(query, warnings, tree_summary, error, api_key, "invalid Gemini response", schema_info)
     except Exception as e:
         safe_error = _safe_exception_message(e, api_key).casefold()
         reason = "network blocked" if "10013" in safe_error else "Gemini request failed"
-        return _fallback_result(query, warnings, tree_summary, error, api_key, reason)
+        return _fallback_result(query, warnings, tree_summary, error, api_key, reason, schema_info)
 
 
 def _query_summary(query: str, tree_summary: dict | None) -> str:
@@ -2003,8 +3071,15 @@ def _query_summary(query: str, tree_summary: dict | None) -> str:
 
 def _fallback_finding(warnings: list[dict]) -> str:
     ordered_warnings = sorted(
-        (warning for warning in warnings if isinstance(warning, dict)),
-        key=lambda warning: 0 if warning.get("classification") == "investigate" else 1,
+        (
+            warning for warning in warnings
+            if isinstance(warning, dict)
+            and _trusted_warning_classification(warning) == "investigate"
+            and str(warning.get("severity") or "").casefold() in {"high", "medium", "low"}
+        ),
+        key=lambda warning: {"high": 0, "medium": 1, "low": 2}.get(
+            str(warning.get("severity") or "").casefold(), 3
+        ),
     )
     for warning in ordered_warnings:
         message = str(warning.get("message") or "").strip()
@@ -2034,12 +3109,19 @@ def _rule_based_recommendations(warnings: list[dict]) -> list[str]:
         if not isinstance(warning, dict):
             continue
         code = warning.get("code") or warning.get("type")
+        if _trusted_warning_classification(warning) is None:
+            continue
         suggestion = str(warning.get("suggestion") or "").strip()
         if not suggestion:
             continue
-        if code in {"FULL_SCAN", "LARGE_SORT", "TEMP_TABLE", "NEVER_EXECUTED"}:
+        if code in {"FULL_SCAN", "LARGE_SORT", "TEMP_TABLE"}:
             continue
-        if code in {"INNER_SCAN_IN_LOOP", "FILTER_DISCARDS_MOST"}:
+        if code == "NEVER_EXECUTED":
+            recommendation = (
+                f"What to check/change: {suggestion} Why it might help: {str(warning.get('message') or '').strip()} "
+                "When it is worth doing: only if you expected this step to run."
+            )
+        elif code in {"INNER_SCAN_IN_LOOP", "FILTER_DISCARDS_MOST"}:
             when = "only if the query is slow or should return a small subset"
             recommendation = (
                 f"What to check/change: {suggestion} Why it might help: {str(warning.get('message') or '').strip()} "
@@ -2050,7 +3132,7 @@ def _rule_based_recommendations(warnings: list[dict]) -> list[str]:
                 f"What to check/change: {suggestion} Why it might help: {str(warning.get('message') or '').strip()} "
                 "When it is worth doing: investigate only if the overall query is slow; this finding alone does not prove a problem."
             )
-        elif code in {"DEAD_END", "NEVER_EXECUTED"}:
+        elif code == "DEAD_END":
             recommendation = (
                 f"What to check/change: {suggestion} Why it might help: {str(warning.get('message') or '').strip()} "
                 "When it is worth doing: only if you expected this query to return rows or this step to run."
@@ -2071,15 +3153,19 @@ def get_rule_based_explanation(
     warnings: list[dict],
     tree_summary: dict | None = None,
     error: dict | None = None,
+    schema_info: dict | None = None,
 ) -> dict[str, Any]:
     """Build concise beginner guidance from the current plan warnings."""
+    warnings = _server_generated_warnings(tree_summary)
     summary = _query_summary(query, tree_summary)
     finding = _fallback_finding(warnings)
     suggestions = _rule_based_recommendations(warnings)
     learning_point = _learning_point(warnings)
     codes = {item.get("code") or item.get("type") for item in warnings if isinstance(item, dict)}
     has_dead_end = bool(error or "DEAD_END" in codes or (isinstance(tree_summary, dict) and tree_summary.get("dead_end")))
-    suggested_query = _safe_distinct_star_rewrite(query, warnings, tree_summary) if not error else None
+    suggested_query = _safe_offline_rewrite(
+        query, warnings, tree_summary, error=error, schema_info=schema_info
+    )
     if suggested_query and suggestions == [_NO_CHANGE]:
         suggestions = [
             "What to check/change: Compare the suggested query's results and measured runtime with the original. "

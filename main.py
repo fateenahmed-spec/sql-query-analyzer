@@ -630,7 +630,7 @@ def get_ai_insights(id: str, http_request: Request):
     text, _source = load_plan_text(id)
     tree = parse_explain_analyze(text)
     warnings = analyze_rules(tree)
-    return get_rule_based_explanation(query["sql"], warnings)
+    return get_rule_based_explanation(query["sql"], warnings, tree_summary=tree)
 
 class AnalyzeRequest(BaseModel):
     query: constr(max_length=5000)
@@ -749,20 +749,29 @@ def get_live_ai_insights(request: AIRequest, http_request: Request):
     limited = _public_rate_limit(http_request, "ai")
     if limited:
         return limited
+    # Warnings in the request body are caller-controlled. Rebuild them from
+    # the supplied execution plan before passing evidence to AI Insights.
+    tree = request.tree if isinstance(request.tree, dict) else None
+    try:
+        warnings = analyze_rules(tree) if tree is not None else []
+    except (AttributeError, KeyError, RecursionError, TypeError, ValueError):
+        tree = None
+        warnings = []
     try:
         explanation = get_ai_explanation(
             request.query,
-            request.warnings,
-            tree_summary=request.tree,
+            warnings,
+            tree_summary=tree,
             error=request.error,
             schema_info=request.schema_info,
         )
         if request.error and not (isinstance(explanation.get("fix"), str) and explanation["fix"].strip()):
             explanation["fix"] = get_rule_based_explanation(
                 request.query,
-                request.warnings,
-                tree_summary=request.tree,
+                warnings,
+                tree_summary=tree,
                 error=request.error,
+                schema_info=request.schema_info,
             )["fix"]
         is_live = explanation.get("ai_status") == "success"
         return {
@@ -773,9 +782,10 @@ def get_live_ai_insights(request: AIRequest, http_request: Request):
     except Exception:
         explanation = get_rule_based_explanation(
             request.query,
-            request.warnings,
-            tree_summary=request.tree,
+            warnings,
+            tree_summary=tree,
             error=request.error,
+            schema_info=request.schema_info,
         )
         return {
             **explanation,
