@@ -155,10 +155,17 @@ def main() -> int:
             timeout=25,
         )
         ai_error = ai_error_response.json()
-        passed = ai_error_response.status_code == 200 and isinstance(ai_error.get("fix"), str) and bool(ai_error["fix"].strip())
-        report("6. AI response for a MySQL error includes a suggested fix", passed)
+        passed = (
+            ai_error_response.status_code == 200
+            and isinstance(ai_error.get("summary"), str)
+            and isinstance(ai_error.get("finding"), str)
+            and isinstance(ai_error.get("suggestion"), str)
+            and "fix" not in ai_error
+            and "suggested_query" not in ai_error
+        )
+        report("6. AI response for a MySQL error uses plain-English insights", passed)
     except (requests.RequestException, ValueError) as exc:
-        report("6. AI response for a MySQL error includes a suggested fix", False, str(exc))
+        report("6. AI response for a MySQL error uses plain-English insights", False, str(exc))
 
     run_csv_checks()
 

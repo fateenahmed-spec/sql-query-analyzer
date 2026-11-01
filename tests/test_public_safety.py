@@ -209,8 +209,8 @@ def test_public_query_ai_and_upload_limits_return_429(monkeypatch):
         "get_ai_explanation",
         lambda *_args, **_kwargs: {
             "summary": "Fallback explanation",
+            "suggestion": "No meaningful query change is needed based on the current execution plan.",
             "suggestions": [],
-            "fix": None,
             "ai_status": "fallback",
             "reason": "API key missing",
         },

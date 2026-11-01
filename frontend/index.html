@@ -176,25 +176,16 @@
           <div class="ai-card-heading"><div class="ai-icon" aria-hidden="true">✦</div><div><p class="eyebrow">QUERY REVIEW</p><h2>AI Insights</h2></div><span id="ai-source" class="ai-source">Preparing</span></div>
           <div id="ai-loading" class="ai-loading"><span class="spinner"></span><span>Reviewing the plan and query…</span></div>
           <div id="ai-content" hidden>
-            <section class="ai-summary-block"><h3>Summary</h3><p id="ai-summary"></p></section>
-            <section id="ai-finding-block" class="ai-summary-block" hidden><h3>Main finding</h3><p id="ai-finding"></p></section>
-            <section class="ai-suggestions-block"><h3>What to do next</h3><ol id="ai-suggestions"></ol></section>
-            <section id="ai-learning-block" class="ai-summary-block" hidden><h3>Learning point</h3><p id="ai-learning-point"></p></section>
-            <section id="ai-index-actions" class="ai-index-actions" hidden><h3>What-if index</h3><div id="ai-index-buttons" class="ai-index-buttons"></div></section>
-            <section id="ai-suggested-query-block" class="ai-fix-block" hidden>
-              <h3 id="ai-suggested-query-title">Suggested improved query</h3>
-              <p id="ai-no-suggested-query" class="muted" hidden>No safe, meaningful SQL rewrite was identified from the available evidence.</p>
-              <div id="ai-suggested-query-content" hidden>
-                <p><strong>Suggested SQL</strong></p>
-                <pre id="ai-suggested-query"></pre>
-                <p><strong>Why it may help:</strong> <span id="ai-query-why"></span></p>
-                <p><strong>What changed:</strong> <span id="ai-query-changes"></span></p>
-                <p><strong>Expected benefit and limitations:</strong> <span id="ai-query-limitations"></span></p>
-              </div>
+            <section class="ai-summary-block"><h3>What does this query do?</h3><p id="ai-summary"></p></section>
+            <section id="ai-finding-block" class="ai-summary-block"><h3>What did MySQL find?</h3><p id="ai-finding"></p></section>
+            <section class="ai-suggestion-block">
+              <h3>AI Suggestion</h3>
+              <p id="ai-suggestion"></p>
             </section>
             <p id="ai-note" class="ai-note" hidden></p>
             <p id="ai-error" class="ai-error" hidden></p>
           </div>
+          <section id="ai-index-actions" class="ai-index-actions" hidden><h3>What-if index</h3><div id="ai-index-buttons" class="ai-index-buttons"></div></section>
           <section id="index-simulation-panel" class="index-simulation-panel" aria-live="polite" hidden>
             <div class="index-simulation-heading"><div><p class="eyebrow">WHAT-IF ANALYSIS</p><h3>Index simulation</h3></div></div>
             <p id="index-simulation-loading" class="index-simulation-loading" hidden><span class="spinner" aria-hidden="true"></span><span>Simulating...</span></p>

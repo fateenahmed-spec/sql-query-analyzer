@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 
+from core.parser import parse_explain_analyze
 from row_flow import build_row_flow
 
 
@@ -62,10 +63,10 @@ def _node(node_id, operator, details="", children=(), rows=0):
     }
 
 
-def _run(query, plan, samples, final_rows=None):
-    plan["_flow_query"] = query
+def _run(query, plan, samples, final_rows=None, schema_info=None, flow_query=None):
+    plan["_flow_query"] = flow_query or query
     connection = FakeConnection()
-    steps = build_row_flow(plan, connection, samples, final_rows)
+    steps = build_row_flow(plan, connection, samples, final_rows, schema_info=schema_info)
     records = {}
     for step in steps:
         records.update(step["row_data"])
@@ -89,6 +90,25 @@ def test_simple_select_uses_original_result_and_keeps_source_sample():
     assert scan["source_sample_rids"]
     assert records[scan["output_rids"][0]]["values"] == {"id": 2, "name": "B"}
     assert records[scan["source_sample_rids"][0]]["values"] == source[0]
+
+
+def test_simple_select_limit_keeps_source_rows_and_physical_limit_flow():
+    source = [{"employee_id": 1}, {"employee_id": 2}, {"employee_id": 3}]
+    scan = _node("scan", "Table scan", "on up_employees_test", rows=3)
+    plan = _node("limit", "Limit", "limit: 10 rows", [scan], rows=3)
+    steps, records, _ = _run(
+        "SELECT employee_id FROM up_employees_test LIMIT 10",
+        plan,
+        {"up_employees_test": source},
+        source,
+    )
+
+    source_step = _step(steps, "scan")
+    limit = _step(steps, "limit")
+    assert source_step["output_rids"] == ["up_employees_test#1", "up_employees_test#2", "up_employees_test#3"]
+    assert limit["input_rids"] == source_step["output_rids"]
+    assert limit["exactness"] == "actual_query_result"
+    assert [records[rid]["values"] for rid in source_step["output_rids"]] == source
 
 
 def test_where_filters_rows_instead_of_scaling_from_plan_counts():
@@ -415,16 +435,184 @@ def test_unknown_operator_does_not_infer_survivors_from_plan_counts():
     assert "No output rows were inferred" in unknown["note"]
 
 
-def test_materialize_with_deduplication_is_not_mislabeled_as_passthrough():
-    scan = _node("scan", "Table scan", "on t", rows=2)
-    plan = _node("materialize", "Materialize with deduplication", children=[scan], rows=1)
-    steps, _, _ = _run(
-        "SELECT DISTINCT id FROM items t",
+def test_distinct_materialization_deduplicates_projected_sample_values():
+    scan = _node("source", "Table scan", "on up_employees_test", rows=5)
+    deduplicate = _node("deduplicate", "Materialize with deduplication", children=[scan], rows=3)
+    plan = _node("temp_scan", "Table scan", "on <temporary>", children=[deduplicate], rows=3)
+    source_rows = [
+        {"employee_id": 7, "department": "A"},
+        {"employee_id": 7, "department": "B"},
+        {"employee_id": None, "department": "A"},
+        {"employee_id": None, "department": "B"},
+        {"employee_id": 9, "department": "A"},
+    ]
+    steps, records, _ = _run(
+        "SELECT DISTINCT employee_id FROM up_employees_test",
         plan,
-        {"t (sql_analyzer_test.items)": [{"id": 1}, {"id": 1}]},
+        {"up_employees_test": source_rows},
+        [{"employee_id": 7}, {"employee_id": None}, {"employee_id": 9}],
     )
 
-    materialize = _step(steps, "materialize")
-    assert materialize["op"] == "other"
-    assert materialize["output_rids"] == []
-    assert materialize["exactness"] == "not_evaluable"
+    source = _step(steps, "source")
+    distinct = _step(steps, "deduplicate")
+    temporary = _step(steps, "temp_scan")
+    assert distinct["op"] == "deduplicate"
+    assert distinct["input_rids"] == source["output_rids"]
+    assert distinct["row_results"] == {
+        "up_employees_test#1": True,
+        "up_employees_test#2": False,
+        "up_employees_test#3": True,
+        "up_employees_test#4": False,
+        "up_employees_test#5": True,
+    }
+    assert [records[rid]["values"] for rid in distinct["output_rids"]] == [
+        {"employee_id": 7}, {"employee_id": None}, {"employee_id": 9},
+    ]
+    assert distinct["output_source_rids"] == {
+        distinct["output_rids"][0]: "up_employees_test#1",
+        distinct["output_rids"][1]: "up_employees_test#3",
+        distinct["output_rids"][2]: "up_employees_test#5",
+    }
+    assert distinct["exactness"] == "sampled_simulation"
+    assert "not a replay of the full MySQL query" in distinct["note"]
+    assert temporary["input_rids"] == distinct["output_rids"]
+    assert _step(steps, "temp_scan")["exactness"] == "actual_query_result"
+    assert [records[rid]["values"] for rid in temporary["output_rids"]] == [
+        {"employee_id": 7}, {"employee_id": None}, {"employee_id": 9},
+    ]
+
+
+def test_distinct_with_unverifiable_text_comparison_is_explicitly_unsupported():
+    scan = _node("source", "Table scan", "on employees", rows=2)
+    plan = _node("deduplicate", "Materialize with deduplication", children=[scan], rows=1)
+    steps, _, _ = _run(
+        "SELECT DISTINCT name FROM employees",
+        plan,
+        {"employees": [{"name": "Alice"}, {"name": "alice"}]},
+    )
+
+    distinct = _step(steps, "deduplicate")
+    assert distinct["output_rids"] == []
+    assert distinct["exactness"] == "not_evaluable"
+    assert "type or collation comparison cannot be established safely" in distinct["note"]
+
+
+def test_distinct_with_unmapped_filter_grouping_order_or_limit_is_rejected():
+    queries = [
+        "SELECT DISTINCT employee_id FROM employees WHERE employee_id > 1",
+        "SELECT DISTINCT employee_id FROM employees GROUP BY employee_id",
+        "SELECT DISTINCT employee_id FROM employees ORDER BY employee_id",
+        "SELECT DISTINCT employee_id FROM employees LIMIT 0",
+        "SELECT DISTINCT employee_id FROM employees LIMIT 2",
+        "SELECT DISTINCT employee_id FROM employees OFFSET 1",
+    ]
+    for query in queries:
+        scan = _node("source", "Table scan", "on employees", rows=2)
+        plan = _node("deduplicate", "Materialize with deduplication", children=[scan], rows=1)
+        steps, _, _ = _run(
+            query,
+            plan,
+            {"employees": [{"employee_id": 1}, {"employee_id": 2}]},
+        )
+
+        distinct = _step(steps, "deduplicate")
+        assert distinct["output_rids"] == [], query
+        assert distinct["exactness"] == "not_evaluable", query
+        assert "DISTINCT duplicate elimination was not simulated" in distinct["note"], query
+
+
+def test_runtime_primary_index_scan_maps_distinct_without_inventing_an_operator():
+    query = "SELECT DISTINCT employee_id FROM up_employees_test"
+    resolved_query = "SELECT DISTINCT employee_id FROM `analyzer_uploads`.`up_employees_test`"
+    raw_plan = (
+        "-> Covering index scan on up_employees_test using PRIMARY  "
+        "(cost=1.25 rows=10) (actual time=0.0268..0.0335 rows=10 loops=1)"
+    )
+    plan = parse_explain_analyze(raw_plan)
+    source_rows = [{"employee_id": value, "department": f"dept-{value % 2}"} for value in range(1, 11)]
+    actual_rows = [{"employee_id": value} for value in range(1, 11)]
+    schema_info = {"tables": [{
+        "schema": "analyzer_uploads",
+        "table": "up_employees_test",
+        "alias": "up_employees_test",
+        "columns": ["employee_id", "employee_name", "department", "salary", "age", "city", "joining_date"],
+        "columns_complete": True,
+        "indexes": [{"name": "PRIMARY", "columns": ["employee_id"], "unique": True}],
+        "index_catalog_available": True,
+    }]}
+
+    steps, records, _ = _run(
+        query,
+        plan,
+        {"up_employees_test (analyzer_uploads.up_employees_test)": source_rows},
+        actual_rows,
+        schema_info=schema_info,
+        flow_query=resolved_query,
+    )
+
+    root = steps[0]
+    assert root["operator"] == "Covering index scan"
+    assert plan["details"] == "on up_employees_test using PRIMARY"
+    assert root["child_ids"] == []
+    assert root["distinct_noop_column"] == "employee_id"
+    assert root["source_sample_rids"] == [f"up_employees_test#{index}" for index in range(1, 11)]
+    assert root["input_rids"] == []
+    assert root["output_rids"] == [f"query_result#{index}" for index in range(1, 11)]
+    assert [records[rid]["values"] for rid in root["output_rids"]] == actual_rows
+    assert "did not execute a separate DISTINCT operator" in root["note"]
+
+
+def test_primary_index_scan_does_not_claim_distinct_noop_without_complete_unique_key_evidence():
+    query = "SELECT DISTINCT employee_id FROM up_employees_test"
+    resolved_query = "SELECT DISTINCT employee_id FROM `analyzer_uploads`.`up_employees_test`"
+    plan = parse_explain_analyze(
+        "-> Covering index scan on up_employees_test using PRIMARY "
+        "(cost=1.25 rows=2) (actual time=0.01..0.02 rows=2 loops=1)"
+    )
+    schema_info = {"tables": [{
+        "schema": "analyzer_uploads",
+        "table": "up_employees_test",
+        "alias": "up_employees_test",
+        "columns": ["employee_id"],
+        "columns_complete": True,
+        "indexes": [],
+        "index_catalog_available": False,
+    }]}
+
+    steps, records, _ = _run(
+        query,
+        plan,
+        {"up_employees_test (analyzer_uploads.up_employees_test)": [{"employee_id": 1}, {"employee_id": 2}]},
+        [{"employee_id": 1}, {"employee_id": 2}],
+        schema_info=schema_info,
+        flow_query=resolved_query,
+    )
+
+    root = steps[0]
+    assert root.get("distinct_noop_column") is None
+    assert "does not expose a safely mapped duplicate-elimination operation" in root["note"]
+    assert root["source_sample_rids"]
+    assert all(rid in records for rid in root["source_sample_rids"])
+
+
+def test_unsupported_distinct_keeps_source_sample_and_explains_actual_result_fallback():
+    scan = _node("source", "Table scan", "on employees", rows=2)
+    deduplicate = _node("deduplicate", "Materialize with deduplication", children=[scan], rows=1)
+    plan = _node("temp_scan", "Table scan", "on <temporary>", children=[deduplicate], rows=1)
+    steps, records, _ = _run(
+        "SELECT DISTINCT name FROM employees",
+        plan,
+        {"employees": [{"name": "Alice"}, {"name": "alice"}]},
+        [{"name": "Alice"}],
+    )
+
+    source = _step(steps, "source")
+    distinct = _step(steps, "deduplicate")
+    root = _step(steps, "temp_scan")
+    assert source["output_rids"]
+    assert all(rid in records for rid in source["output_rids"])
+    assert distinct["output_rids"] == []
+    assert "DISTINCT duplicate elimination was not simulated" in distinct["note"]
+    assert root["output_rids"] == ["query_result#1"]
+    assert "Intermediate DISTINCT visualization is unavailable" in root["note"]
+    assert "type or collation comparison cannot be established safely" in root["note"]

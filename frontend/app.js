@@ -590,6 +590,10 @@ function currentStepStates(step) {
 
 function currentIntermediateRids(step) {
   if (!step || currentRowIndex < 0 || step.never_executed) return [];
+  if (step.op === "deduplicate") {
+    const processed = new Set(flowInputRids(step).slice(0, Math.min(currentRowIndex + 1, flowInputRids(step).length)));
+    return (step.output_rids || []).filter((rid) => processed.has(step.output_source_rids?.[rid]));
+  }
   if (["sampled_simulation", "actual_query_result"].includes(step.exactness) || step.branch_join) {
     const outputs = step.output_rids || [];
     return outputs.slice(0, Math.min(currentRowIndex + 1, outputs.length));
@@ -606,7 +610,7 @@ function sourceScanGroups() {
   const byAlias = new Map();
   const records = globalData?.row_records || {};
   animSteps.forEach((step, scanIndex) => {
-    if (step.op !== "scan") return;
+    if (step.op !== "scan" && !(Array.isArray(step.source_sample_rids) && step.source_sample_rids.length)) return;
     const rids = (step.source_sample_rids || step.output_rids || []).filter((rid) => records[rid]);
     const rowRecord = records[rids[0]] || Object.values(step.row_data || {})[0] || null;
     if (!rowRecord) return;
@@ -679,6 +683,9 @@ function joinStatesForGroup(group, step) {
 function sourceGroupStates(group) {
   if (currentIndex < 0) return {};
   const currentStep = animSteps[currentIndex];
+  if (currentStep?.distinct_noop_column) {
+    return Object.fromEntries(group.rids.map((rid) => [rid, "row-pass"]));
+  }
   if (currentStep?.op === "join") return joinStatesForGroup(group, currentStep);
   const currentRids = new Set(flowInputRids(currentStep));
   if (currentStep?.op === "scan" && currentIndex === group.scanIndex) return currentStepStates(currentStep);
@@ -724,6 +731,15 @@ function renderSourceTables() {
   }
 
   const rids = flowInputRids(step);
+  if (!rids.length && !step.never_executed && groups.length) {
+    container.replaceChildren();
+    groups.forEach((group, index) => {
+      renderFlowRows(container, `Source table: ${group.table}${group.alias ? ` (${group.alias})` : ""}`,
+        group.rids, sourceGroupStates(group), index === 0 ? (step.note || "Original base-table sample") : "",
+        { append: true, alias: group.alias });
+    });
+    return;
+  }
   const firstRecord = (globalData?.row_records || {})[rids[0]];
   const sourceAlias = firstRecord?.alias ? ` (${firstRecord.alias})` : "";
   const title = firstRecord?.table
@@ -743,7 +759,7 @@ function renderIntermediateStats() {
     renderJoinIntermediate(container, step);
     return;
   }
-  if (step && !step.never_executed && !flowInputRids(step).length) {
+  if (step && !step.never_executed && !flowInputRids(step).length && !step.distinct_noop_column) {
     appendEmpty(container, step.note || noSampleRowsMessage);
     return;
   }
@@ -752,7 +768,9 @@ function renderIntermediateStats() {
     return;
   }
 
-  const badge = step.exactness === "sampled_simulation" ? "Calculated over sampled inputs" : step.evaluable ? "" : "Sample unavailable";
+  const badge = step.distinct_noop_column
+    ? `Actual query output from MySQL; DISTINCT is redundant because ${step.distinct_noop_column} is the PRIMARY key`
+    : step.exactness === "sampled_simulation" ? "Calculated over sampled inputs" : step.evaluable ? "" : "Sample unavailable";
   const outputRids = currentIntermediateRids(step);
   const outputStates = Object.fromEntries(outputRids.map((rid) => [rid, "row-pass row-move"]));
   renderFlowRows(container, `Output rows - ${step.label}`, outputRids, outputStates, badge, {
@@ -1445,6 +1463,8 @@ function applyAnimationEvent(eventIndex, writeLog = true, joinPhase = "highlight
       appendProcessLog(`Limit: ${rid} ${passed ? "retained" : "cut from"} the sample.`);
     } else if (step.op === "sort") {
       appendProcessLog(`Sort ${step.label}: placed ${rid} in the sampled order.`);
+    } else if (step.op === "deduplicate") {
+      appendProcessLog(`DISTINCT ${passed ? "kept" : "removed a duplicate of"} sampled row ${rid}.`);
     } else {
       appendProcessLog(`${step.label}: processed sample row ${rid}${passed ? " into the output" : " as a failed sample"}.`);
     }
@@ -1808,7 +1828,7 @@ function indexSuggestions(explanation) {
     return suffixMatches.length === 1 ? suffixMatches[0] : null;
   }
 
-  const body = [explanation.summary, ...(Array.isArray(explanation.suggestions) ? explanation.suggestions : []), explanation.fix]
+  const body = [explanation.summary, ...(Array.isArray(explanation.suggestions) ? explanation.suggestions : [])]
     .filter((value) => typeof value === "string")
     .join("\n");
   const parsed = [];
@@ -1934,42 +1954,12 @@ function renderAiExplanation(explanation) {
   aiLoading.hidden = true;
   aiContent.hidden = false;
   setText("#ai-summary", explanation.summary || "No summary was returned.");
-  const finding = explanation.finding || "";
+  const finding = explanation.finding || "No execution-plan finding is available.";
   setText("#ai-finding", finding);
-  document.querySelector("#ai-finding-block").hidden = !finding;
-  const learningPoint = explanation.learning_point || "";
-  setText("#ai-learning-point", learningPoint);
-  document.querySelector("#ai-learning-block").hidden = !learningPoint;
-  const suggestions = document.querySelector("#ai-suggestions");
-  suggestions.replaceChildren();
-  const items = Array.isArray(explanation.suggestions) ? explanation.suggestions : [];
-  if (!items.length) {
-    const item = document.createElement("li");
-    item.textContent = explanation.suggested_query
-      ? "Compare the suggested query's results and measured runtime with the original before adopting it."
-      : "No immediate change is recommended based on the available evidence. If the query becomes slow as the data grows, investigate its measured execution time and the operations processing the most rows.";
-    suggestions.append(item);
-  } else {
-    for (const suggestion of items) {
-      const item = document.createElement("li");
-      item.textContent = suggestion;
-      suggestions.append(item);
-    }
-  }
-  const rewrite = explanation.suggested_query;
-  const rewriteBlock = document.querySelector("#ai-suggested-query-block");
-  const hasRewrite = Boolean(rewrite && typeof rewrite.sql === "string");
-  rewriteBlock.hidden = false;
-  document.querySelector("#ai-no-suggested-query").hidden = hasRewrite;
-  document.querySelector("#ai-suggested-query-content").hidden = !hasRewrite;
   setText(
-    "#ai-suggested-query-title",
-    rewrite?.kind === "simplification" ? "Suggested query simplification" : "Suggested improved query",
+    "#ai-suggestion",
+    explanation.suggestion || "No meaningful query change is needed based on the current execution plan.",
   );
-  setText("#ai-suggested-query", rewrite?.sql || "");
-  setText("#ai-query-why", rewrite?.why_it_may_help || "");
-  setText("#ai-query-changes", rewrite?.what_changed || "");
-  setText("#ai-query-limitations", rewrite?.limitations || "");
   const source = document.querySelector("#ai-source");
   const sourceName = explanation.ai_status === "success" ? "gemini" : explanation.source;
   source.textContent = sourceName === "gemini" ? "Gemini" : "Rule-based (offline)";
@@ -2018,7 +2008,8 @@ async function loadAiInsights() {
   } catch (error) {
     renderAiExplanation({
       summary: error.message,
-      suggestions: [],
+      finding: "No execution-plan finding is available.",
+      suggestion: "No meaningful query change is needed based on the current execution plan.",
       source: "fallback",
       error: error.message,
     });

@@ -686,7 +686,13 @@ def run_live(request: LiveQueryRequest, http_request: Request):
     tree["_flow_query"] = result.get("query") or request.query
     flow_conn = get_connection()
     try:
-        row_flow = build_row_flow(tree, flow_conn, result["source_samples"], result["rows"])
+        row_flow = build_row_flow(
+            tree,
+            flow_conn,
+            result["source_samples"],
+            result["rows"],
+            schema_info=result.get("schema_info"),
+        )
     finally:
         flow_conn.close()
         tree.pop("_flow_query", None)
@@ -765,14 +771,6 @@ def get_live_ai_insights(request: AIRequest, http_request: Request):
             error=request.error,
             schema_info=request.schema_info,
         )
-        if request.error and not (isinstance(explanation.get("fix"), str) and explanation["fix"].strip()):
-            explanation["fix"] = get_rule_based_explanation(
-                request.query,
-                warnings,
-                tree_summary=tree,
-                error=request.error,
-                schema_info=request.schema_info,
-            )["fix"]
         is_live = explanation.get("ai_status") == "success"
         return {
             **explanation,

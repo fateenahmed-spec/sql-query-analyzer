@@ -107,7 +107,9 @@ def _action(operator: str) -> str:
         return "sort"
     if normalized == "limit":
         return "limit"
-    if normalized.startswith("materialize") and "deduplic" not in normalized and "deduplication" not in normalized:
+    if normalized.startswith("materialize") and ("deduplic" in normalized or "deduplication" in normalized):
+        return "deduplicate"
+    if normalized.startswith("materialize"):
         return "materialize"
     if normalized == "hash":
         return "hash"
@@ -822,6 +824,197 @@ def _record_column(record: dict, expression: str):
     return (value, True) if key is not None and not matches else (None, False)
 
 
+def _distinct_projection(query: str):
+    """Return a narrowly supported DISTINCT projection, or explain why it is unsafe."""
+    scopes = _select_scope_texts(query)
+    if len(scopes) != 1:
+        return None, "only a single top-level SELECT is supported"
+    parts = _outer_query_parts(scopes[0])
+    if not parts:
+        return None, "the SELECT projection could not be isolated"
+    match = re.match(r"(?is)^\s*DISTINCT(?:ROW)?\s+([\s\S]+?)\s*$", parts["select_list"])
+    if not match:
+        return None, "the plan's deduplication node does not map to a top-level SELECT DISTINCT"
+    if parts["where"] or parts["group"] or parts["having"] or parts["order"] or parts["limit"]:
+        return None, "filters, grouping, ordering, and limits are not mapped to this deduplication node"
+    if any(word[0] == "OFFSET" and word[3] == 0 for word in _sql_words(query)):
+        return None, "OFFSET is not mapped to this deduplication node"
+
+    identifier = r"(?:`(?:``|[^`])+`|[\w$]+)"
+    table_reference = rf"{identifier}(?:\s*\.\s*{identifier})?"
+    if not re.fullmatch(rf"(?is)FROM\s+{table_reference}(?:\s+(?:AS\s+)?{identifier})?", parts["from"]):
+        return None, "only one base table without joins or derived tables is supported"
+    try:
+        if len(query_source_references(query)) != 1:
+            return None, "only one base table without joins or derived tables is supported"
+    except Exception:
+        return None, "the source table could not be mapped safely"
+
+    projections = []
+    output_names = set()
+    simple_column = re.compile(rf"(?is)^(?:{identifier})(?:\s*\.\s*{identifier})*$")
+    for expression in _split_sql_list(match.group(1)):
+        source_expression, output_name = _expression_alias(expression)
+        if not simple_column.fullmatch(source_expression):
+            return None, "only simple column projections can be deduplicated safely"
+        if output_name.casefold() in output_names:
+            return None, "duplicate output column names cannot be represented safely"
+        output_names.add(output_name.casefold())
+        projections.append((source_expression, output_name))
+    if not projections:
+        return None, "the DISTINCT projection is empty"
+    return projections, None
+
+
+def _proven_primary_key_distinct_column(query: str, node: dict, metadata: dict, schema_info: dict | None):
+    """Return the column when a single-column DISTINCT is proven redundant by the plan and catalog."""
+    if not isinstance(schema_info, dict) or schema_info.get("tables_complete") is False:
+        return None
+    if str(node.get("operator") or "").casefold() != "covering index scan":
+        return None
+    if node.get("children") or not re.search(r"\busing\s+`?PRIMARY`?(?:\s|$)", str(node.get("details") or ""), re.I):
+        return None
+
+    projections, error = _distinct_projection(query)
+    if error or not projections or len(projections) != 1:
+        return None
+    expression = projections[0][0].strip()
+    column_match = re.fullmatch(r"`((?:``|[^`])+)`|([\w$]+)", expression)
+    if not column_match:
+        return None
+    column = _ident(column_match.group(1) or column_match.group(2))
+
+    try:
+        sources = query_source_references(query)
+    except Exception:
+        return None
+    if len(sources) != 1:
+        return None
+    source = sources[0]
+    if str(source.get("table") or "").casefold() != str(metadata.get("table") or "").casefold():
+        return None
+    source_schema = str(source.get("schema") or "").casefold()
+    if source_schema and source_schema != str(metadata.get("schema") or "").casefold():
+        return None
+
+    catalog_tables = schema_info.get("tables")
+    if not isinstance(catalog_tables, list):
+        return None
+    matching_tables = [
+        entry for entry in catalog_tables
+        if isinstance(entry, dict)
+        and str(entry.get("table") or "").casefold() == str(metadata.get("table") or "").casefold()
+        and str(entry.get("schema") or "").casefold() == str(metadata.get("schema") or "").casefold()
+    ]
+    if len(matching_tables) != 1:
+        return None
+    table = matching_tables[0]
+    if (
+        table.get("columns_complete") is not True
+        or table.get("index_catalog_available") is not True
+        or table.get("indexes_complete") is False
+        or any(table.get(flag) for flag in ("indexes_truncated", "index_columns_truncated", "index_fields_truncated"))
+    ):
+        return None
+    raw_columns = table.get("columns")
+    raw_indexes = table.get("indexes")
+    if not isinstance(raw_columns, list) or not isinstance(raw_indexes, list):
+        return None
+    columns = {
+        str(item.get("name") if isinstance(item, dict) else item).casefold()
+        for item in raw_columns
+    }
+    if column.casefold() not in columns:
+        return None
+    primary_keys = [
+        index for index in raw_indexes
+        if isinstance(index, dict) and str(index.get("name") or "").casefold() == "primary"
+    ]
+    if len(primary_keys) != 1 or primary_keys[0].get("unique") is not True:
+        return None
+    primary_columns = [
+        str(item.get("name") if isinstance(item, dict) else item).casefold()
+        for item in primary_keys[0].get("columns", [])
+    ]
+    if primary_columns != [column.casefold()]:
+        return None
+
+    sampled_values = []
+    for item in metadata.get("sample", []):
+        values = item.get("values") if isinstance(item, dict) else None
+        if not isinstance(values, dict):
+            return None
+        value, key = _column_value(values, column)
+        if key is None or type(value) is not int:
+            return None
+        sampled_values.append(value)
+    if len(sampled_values) != len(set(sampled_values)):
+        return None
+    return column
+
+
+def _distinct_sample(query: str, input_rids: list[str], records: dict, node_id: str):
+    projections, error = _distinct_projection(query)
+    if error:
+        return [], {}, {}, False, (
+            "DISTINCT duplicate elimination was not simulated: "
+            f"{error}. No output rows were inferred."
+        )
+
+    seen = set()
+    output = []
+    row_results = {}
+    output_sources = {}
+    for rid in input_rids:
+        record = records.get(rid)
+        if record is None:
+            return [], {}, {}, False, "DISTINCT input rows are missing from the sample records. No output rows were inferred."
+        key = []
+        values = {}
+        for expression, output_name in projections:
+            value, found = _record_column(record, expression)
+            if not found:
+                return [], {}, {}, False, (
+                    f"DISTINCT projection column '{expression}' is missing or ambiguous in the sample rows. "
+                    "No output rows were inferred."
+                )
+            # The source sample catalog does not include column type/collation metadata.
+            # Integer and NULL equality is unambiguous here; text, floating point,
+            # temporal, and other values could use MySQL comparison rules not captured
+            # by Python's sample values, so fail closed for those projections.
+            if value is not None and type(value) is not int:
+                return [], {}, {}, False, (
+                    "DISTINCT duplicate elimination was not simulated because the sampled "
+                    "projection contains values whose MySQL type or collation comparison "
+                    "cannot be established safely. No output rows were inferred."
+                )
+            key.append(value)
+            values[output_name] = value
+
+        distinct_key = tuple(key)
+        if distinct_key in seen:
+            row_results[rid] = False
+            continue
+        seen.add(distinct_key)
+        row_results[rid] = True
+        output_rid = f"{node_id}#sample{len(output) + 1}"
+        output_sources[output_rid] = rid
+        output.append({"rid": output_rid, "record": {
+            "table": "Sample DISTINCT output",
+            "alias": "distinct",
+            "source_aliases": [],
+            "qualified_values": {},
+            "qualifier_aliases": {},
+            "values": values,
+            "sample_origin": "duplicate elimination over sampled input rows",
+        }})
+
+    return output[:10], row_results, output_sources, True, (
+        f"Applied DISTINCT to {len(input_rids)} sampled input rows and kept "
+        f"{min(len(output), 10)} sampled projection rows; this is not a replay of the full MySQL query."
+    )
+
+
 def _aggregate_value(function: str, values: list):
     non_null = [value for value in values if value is not None]
     name = function.casefold()
@@ -1014,6 +1207,7 @@ def build_row_flow(
     conn,
     source_samples: dict | None = None,
     final_rows: list[dict] | None = None,
+    schema_info: dict | None = None,
 ) -> list[dict]:
     query = str(plan_tree.get("_flow_query") or "")
     samples = source_samples or {}
@@ -1058,12 +1252,13 @@ def build_row_flow(
                 for child in child_nodes
             ]
             input_rids = list(dict.fromkeys(rid for branch in branches for rid in branch["output_rids"]))
-            output_rids, row_results, matched_pairs = [], {}, []
+            output_rids, row_results, matched_pairs, output_sources = [], {}, [], {}
             output_schema = []
             evaluable, exactness = False, "not_evaluable"
             note = ""
             never_executed = bool(node.get("never_executed"))
             table_count = 0
+            distinct_noop_column = None
 
             if never_executed:
                 note = "Never executed: MySQL reported that this physical operator had no input rows."
@@ -1090,6 +1285,28 @@ def build_row_flow(
                         },
                     }]
                     note = f"Source rows sampled from {metadata['schema']}.{metadata['table']} as {metadata['alias']}; this is a source sample, not a claim about rows consumed by this physical scan."
+                    if node_id == str(plan_tree.get("id") or "") and not child_nodes:
+                        distinct_noop_column = _proven_primary_key_distinct_column(
+                            query, node, metadata, schema_info,
+                        )
+                    if distinct_noop_column:
+                        note = (
+                            f"MySQL used a covering PRIMARY index scan. DISTINCT on {distinct_noop_column} "
+                            "is redundant because the schema catalog confirms it is the single-column PRIMARY key; "
+                            "the plan has no separate duplicate-elimination operator."
+                        )
+                elif (
+                    re.search(r"\bon\s+<(?:temporary|subquery\d+)>", str(node.get("details") or ""), re.I)
+                    and len(branches) == 1
+                    and _action(branches[0]["operator"]) == "deduplicate"
+                    and branches[0]["exactness"] != "not_evaluable"
+                ):
+                    output_rids = list(branches[0]["output_rids"])
+                    output_schema = list(branches[0].get("schema", []))
+                    row_results = {rid: True for rid in output_rids}
+                    evaluable = True
+                    exactness = branches[0]["exactness"]
+                    note = "Read the sampled rows produced by the mapped temporary or subquery input; this does not replay the full physical execution."
                 else:
                     note = "This physical scan refers to a temporary or derived input that is not a base table sample. Its logical input is shown by its child nodes when available."
             elif action == "filter":
@@ -1224,6 +1441,25 @@ def build_row_flow(
                         records[item["rid"]] = item["record"]
                     exactness = "sampled_simulation"
                     output_schema = list(branches[0].get("schema", [])) if branches else []
+            elif action == "deduplicate":
+                if len(branches) != 1 or branches[0]["exactness"] == "not_evaluable":
+                    note = "DISTINCT requires one evaluable sampled input branch. No output rows were inferred."
+                else:
+                    deduplicated, row_results, output_sources, evaluable, note = _distinct_sample(
+                        query, input_rids, records, node_id,
+                    )
+                    if evaluable:
+                        for item in deduplicated:
+                            output_rids.append(item["rid"])
+                            records[item["rid"]] = item["record"]
+                        exactness = "sampled_simulation"
+                        if output_rids:
+                            output_schema = [{
+                                "alias": "distinct",
+                                "table": "Sample DISTINCT output",
+                                "columns": list(records[output_rids[0]]["values"]),
+                                "qualifier_aliases": {},
+                            }]
             elif action == "empty":
                 output_rids = []
                 evaluable = True
@@ -1255,6 +1491,8 @@ def build_row_flow(
                 logical_op = "GROUP BY and aggregation"
             elif action == "window":
                 logical_op = "Window calculation"
+            elif action == "deduplicate":
+                logical_op = "DISTINCT duplicate elimination"
             elif action == "sort":
                 logical_op = "ORDER BY"
             elif action == "limit":
@@ -1263,6 +1501,8 @@ def build_row_flow(
                 logical_op = "Physical wrapper around child rows"
             else:
                 logical_op = "Physical-only or unmapped operation"
+            if distinct_noop_column:
+                logical_op = f"DISTINCT pass-through proven by PRIMARY key ({distinct_noop_column})"
             step = {
                 "step": len(steps) + 1,
                 "node_id": node_id,
@@ -1279,7 +1519,8 @@ def build_row_flow(
                 "output_schema": output_schema,
                 "input_rids": input_rids,
                 "output_rids": output_rids,
-                "event_rids": input_rids if action in {"filter", "limit", "sort"} else output_rids,
+                "event_rids": input_rids if action in {"filter", "limit", "sort", "deduplicate"} else output_rids,
+                "output_source_rids": output_sources if action == "deduplicate" else {},
                 "matched_pairs": matched_pairs,
                 "branch_join": action == "join",
                 "matched_input_rids": sorted({rid for pair in matched_pairs for rid in pair if rid}) if action == "join" else [],
@@ -1292,6 +1533,7 @@ def build_row_flow(
                 "loops": node.get("loops"),
                 "table_row_count": table_count,
                 "never_executed": never_executed,
+                "distinct_noop_column": distinct_noop_column,
                 "note": note,
             }
             steps.append(step)
@@ -1326,6 +1568,25 @@ def build_row_flow(
         root_step["exactness"] = "actual_query_result"
         root_step["evaluable"] = True
         root_step["note"] = f"Final output comes from the original query execution ({len(final_rids)} sampled result rows)."
+        if root_step.get("distinct_noop_column"):
+            root_step["note"] += (
+                f" MySQL did not execute a separate DISTINCT operator: {root_step['distinct_noop_column']} "
+                "is proven unique by the PRIMARY key and the plan shows a covering PRIMARY index scan."
+            )
+        elif not root_step["input_rids"]:
+            unsupported_distinct = next((
+                step for step in steps
+                if step["op"] == "deduplicate" and not step["evaluable"]
+            ), None)
+            if unsupported_distinct:
+                root_step["note"] += f" Intermediate DISTINCT visualization is unavailable: {unsupported_distinct['note']}"
+            else:
+                query_parts = _outer_query_parts(query)
+                if query_parts and re.match(r"(?is)^\s*DISTINCT(?:ROW)?\s+", query_parts["select_list"]):
+                    root_step["note"] += (
+                        " Intermediate DISTINCT visualization is unavailable because the execution plan "
+                        "does not expose a safely mapped duplicate-elimination operation. No intermediate rows were inferred."
+                    )
         root_step["logical_op"] = "Final SELECT result"
         root_step["op"] = "result"
     return steps
